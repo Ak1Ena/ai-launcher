@@ -60,6 +60,15 @@ ok "account sync copies trust"  'jq -e ".projects[\"$HOME/repo/a\"].hasTrustDial
 ok "account sync keeps other fields" '[ "$(jq -r .oauthAccount.emailAddress "$CLA_ROOT/two/.claude.json")" = two@example.com ]'
 ok "account sync keeps permissions" '[ "$(ls -l "$CLA_ROOT/two/.claude.json" | cut -c1-10)" = "-rw-------" ]'
 
+# ── Windows (Git Bash), faked with uname / cygpath functions ──
+mkdir -p "$HOME/repo/w"
+printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$HOME/repo/w" >> "$CODEX_HOME/config.toml"
+ok "windows: trust sharing is off" '( uname() { echo MINGW64_NT-10.0; }; _ai_trust_share "$HOME/repo/w"; ! _ai_trust_claude_has "$HOME/repo/w" )'
+ok "windows: native paths for agents" '( cygpath() { echo "C:/fake$2"; }; [ "$(native_path /x/y)" = C:/fake/x/y ] )'
+ok "elsewhere: paths unchanged" '[ "$(native_path /x/y)" = /x/y ]'
+ok "scripts keep LF endings"    '! grep -lq $'"'"'\r'"'"' "$REPO"/bin/ai "$REPO"/lib/*.sh "$REPO"/plugins/*.sh'
+ok ".cmd files use CRLF"        'grep -q $'"'"'\r$'"'"' "$REPO/bin/ai.cmd"'
+
 # ── status line script ──
 echo '{"rate_limits":{"five_hour":{"used_percentage":5}},"x":"next"}' |
   CLAUDE_CONFIG_DIR=$T/sl bash "$REPO/scripts/statusline-usage.sh" jq -r .x > "$T/sl.out"

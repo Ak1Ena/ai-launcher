@@ -1,0 +1,4 @@
+# Scripts must keep LF endings, or bash breaks on Windows checkouts (core.autocrlf).
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.png binary

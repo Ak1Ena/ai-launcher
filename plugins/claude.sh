@@ -27,14 +27,14 @@ cla_main() {
     ls)
       for dir in "$root"/*/; do
         [ -d "$dir" ] || continue; dir=${dir%/}
-        echo "${dir##*/}: $(CLAUDE_CONFIG_DIR=$dir claude auth status 2>&1 | grep -iom1 '[^ ]*@[^ ",]*' || echo 'not logged in')"
+        echo "${dir##*/}: $(CLAUDE_CONFIG_DIR=$(native_path "$dir") claude auth status 2>&1 | grep -iom1 '[^ ]*@[^ ",]*' || echo 'not logged in')"
       done ;;
     add)
       [ -n "${2:-}" ] || { echo "usage: cla add <name>"; return 1; }
-      _cla_init "$root/$2" && CLAUDE_CONFIG_DIR=$root/$2 claude auth login ;;
+      _cla_init "$root/$2" && CLAUDE_CONFIG_DIR=$(native_path "$root/$2") claude auth login ;;
     rm)
       [ -n "${2:-}" ] && [ -d "$root/$2" ] || { echo "no account: ${2:-}"; return 1; }
-      CLAUDE_CONFIG_DIR=$root/$2 claude auth logout; rm -rf "${root:?}/$2" && echo "removed $2" ;;
+      CLAUDE_CONFIG_DIR=$(native_path "$root/$2") claude auth logout; rm -rf "${root:?}/$2" && echo "removed $2" ;;
     mv)
       [ -n "${2:-}" ] && [ -n "${3:-}" ] && [ -d "$root/$2" ] || { echo "usage: cla mv <old> <new>"; return 1; }
       [ -e "$root/$3" ] && { echo "'$3' already exists"; return 1; }
@@ -56,7 +56,7 @@ cla_main() {
       [ -d "$root/$1" ] || { echo "no account '$1'. run: cla add $1"; return 1; }
       dir=$root/$1; shift
       _ai_trust_share "$PWD"; _cla_trust_sync "$dir"
-      export CLAUDE_CONFIG_DIR=$dir
+      CLAUDE_CONFIG_DIR=$(native_path "$dir"); export CLAUDE_CONFIG_DIR
       if [ "${1:-}" = team ]; then shift; _cla_team "$@"
       else _ai_exec "$(_ai_cmd claude claude)" "$@"; fi ;;
   esac
@@ -84,8 +84,8 @@ _cla_team() {
 }
 _cla_pick() {
   local out
-  out=$(_ai_claude_rows | _ai_choose ' ✻ Claude accounts ' \
-    "$(pad account 9) $(pad email 26)  $(pad '5-hour limit' 34)weekly limit") || return 1
+  out=$(_ai_choose ' ✻ Claude accounts ' \
+    "$(pad account 9) $(pad email 26)  $(pad '5-hour limit' 34)weekly limit" "" "$(_ai_claude_rows)") || return 1
   out=${out#*"$NL"}; out=${out#*"$TAB"}; printf '%s\n' "${out%%"$TAB"*}"
 }
 

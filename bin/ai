@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # ai: one command for every AI coding agent. Run `ai help`.
 # Plain bash 3.2+, so it works with the bash built into macOS, Linux and WSL.
-# bin/cla and bin/cla-team are links to this file; the name picks the command.
 src=${BASH_SOURCE[0]}
 while [ -L "$src" ]; do  # follow links (e.g. ~/.local/bin/ai -> repo) to find the repo
   dir=$(cd -P "$(dirname "$src")" && pwd); src=$(readlink "$src")
@@ -11,8 +10,4 @@ AI_HOME=$(cd -P "$(dirname "$src")/.." && pwd)
 . "$AI_HOME/lib/core.sh"
 . "$AI_HOME/lib/trust.sh"
 for f in "$AI_HOME"/plugins/*.sh; do [ -e "$f" ] && . "$f"; done
-case ${0##*/} in
-  cla) set -- cla "$@" ;;
-  cla-team) set -- cla-team "$@" ;;
-esac
 ai_main "$@"

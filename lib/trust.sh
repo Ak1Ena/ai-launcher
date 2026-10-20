@@ -9,6 +9,8 @@ AI_TRUST="claude codex gemini qwen agy"
 
 _ai_trust_share() {
   has jq || return 0
+  # shortcut: off on Windows until each agent's Windows path format (C:/ vs C:\\) is verified there
+  is_windows && return 0
   local d n hit=
   d=$(cd "$1" 2>/dev/null && pwd -P) || return 0  # agents store the resolved path (getcwd)
   case $d in *'"'*|*'\'*) return 0 ;; esac          # keep TOML/JSON quoting simple

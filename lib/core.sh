@@ -8,6 +8,10 @@ TAB=$'\t'
 NL=$'\n'
 
 has() { command -v "$1" >/dev/null 2>&1; }
+# Git Bash on Windows (MSYS/MinGW) or Cygwin
+is_windows() { case $(uname -s) in MINGW*|MSYS*|CYGWIN*) return 0 ;; esac; return 1; }
+# path for native (non-bash) programs: C:/Users/... on Windows, unchanged elsewhere
+native_path() { if has cygpath; then cygpath -m "$1"; else printf '%s\n' "$1"; fi; }
 is_fn() { [ "$(type -t "$1")" = function ]; }
 _ai_default_label() {
   case $1 in
@@ -28,7 +32,7 @@ ai_main() {
   while :; do
     _ai_seed
     [ -s "$AI_PROVIDERS" ] || { echo "no providers. add one: ai add <name> [command]"; return 1; }
-    out=$(_ai_rows | _ai_choose ' ✻ AI agents ' 'enter launch · ctrl-t claude team · ctrl-a add · ctrl-e edit · ctrl-x delete' keys) || return 0
+    out=$(_ai_choose ' ✻ AI agents ' 'enter launch · ctrl-t claude team · ctrl-a add · ctrl-e edit · ctrl-x delete' keys "$(_ai_rows)") || return 0
     key=${out%%"$NL"*}; row=${out#*"$NL"}
     name=${row%%"$TAB"*}; id=${row#*"$TAB"}; id=${id%%"$TAB"*}
     case $key in
@@ -84,8 +88,8 @@ _ai_cmd() { local c; c=$(_ai_get "$1" 2); printf '%s\n' "${c:-$2}"; }
 # ask with the current value shown; Enter keeps it (bash 3.2 has no prefilled input)
 _ai_ask() {
   local ans
-  if [ -n "$2" ]; then read -r -p "$1 [$2]: " ans </dev/tty || return 1
-  else read -r -p "$1: " ans </dev/tty || return 1; fi
+  if [ -n "$2" ]; then read -r -p "$1 [$2]: " ans || return 1
+  else read -r -p "$1: " ans || return 1; fi
   printf '%s\n' "${ans:-$2}"
 }
 
@@ -118,7 +122,7 @@ _ai_edit() {
 _ai_rm() {
   local n=${1:-} ans
   [ -n "$n" ] && [ -n "$(_ai_get "$n" 1)" ] || { echo "no provider '$n'. see: ai ls"; return 1; }
-  read -r -p "delete provider '$n'? [y/N] " ans </dev/tty
+  read -r -p "delete provider '$n'? [y/N] " ans
   case $ans in y|Y|yes) _ai_put "$n" && echo "deleted $n (bring back: ai add $n)" ;; *) return 1 ;; esac
 }
 
@@ -160,8 +164,10 @@ pad() {
 }
 
 # ── picker: fzf when installed, else a numbered menu ──────
-# _ai_choose <title> <hint> [keys]; rows on stdin. Prints "<action>\n<row>",
+# _ai_choose <title> <hint> <keys|""> <rows>. Prints "<action>\n<row>",
 # action = "" (launch) | team | add | edit | delete. Fails on cancel.
+# Rows come as an argument, not stdin, so the menu can read the answer from the terminal
+# on stdin and draw on stderr: no /dev/tty needed (unreliable in Git Bash on Windows).
 _ai_choose() {
   if has fzf; then _ai_fzf "$@"; else _ai_menu "$@"; fi
 }
@@ -172,7 +178,7 @@ _ai_fzf() {
       --border-label="$1" --prompt='  ' --pointer='▶' --info=hidden --no-scrollbar \
       --header=$'\033[2m'"$2"$'\033[0m' \
       --color='border:#d97757,label:#d97757:bold,pointer:#d97757,prompt:#d97757,hl:#d97757,hl+:#d97757' \
-      ${extra[@]+"${extra[@]}"}) || return 1
+      ${extra[@]+"${extra[@]}"} <<<"$4") || return 1
   [ -n "${3:-}" ] || { printf '\n%s\n' "$out"; return; }
   key=${out%%"$NL"*}
   case $key in ctrl-t) key=team ;; ctrl-a) key=add ;; ctrl-e) key=edit ;; ctrl-x) key=delete ;; esac
@@ -180,7 +186,7 @@ _ai_fzf() {
 }
 _ai_menu() {
   local rows=() line i=0 ans act n
-  while IFS= read -r line; do rows+=("$line"); done
+  while IFS= read -r line; do [ -n "$line" ] && rows+=("$line"); done <<<"$4"
   {
     printf '\n  \033[1;38;5;173m%s\033[0m\n\n' "$1"
     for line in ${rows[@]+"${rows[@]}"}; do
@@ -189,8 +195,8 @@ _ai_menu() {
     if [ -n "${3:-}" ]; then dim "  number = launch · t N = claude team · a = add · e N = edit · x N = delete · q = quit"
     else dim "  number = choose · q = quit"; fi
     printf '\n'
-  } >/dev/tty
-  read -r -p "  › " ans </dev/tty || return 1
+  } >&2
+  read -r -p "  › " ans || return 1
   set -- $ans
   case ${1:-q} in
     q) return 1 ;;

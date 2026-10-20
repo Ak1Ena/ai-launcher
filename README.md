@@ -10,16 +10,28 @@ One command for all your AI coding agents. Type `ai` to see every agent and acco
 - **Trust a folder once.** If any agent trusts the folder, every agent you start through `ai` trusts it too, so they stop asking.
 - **No API calls.** Usage comes from files the agents already write on your machine.
 
-Works on macOS, Linux and Windows through WSL. Nothing to install: it's plain bash.
+Works on macOS, Linux and Windows (PowerShell, CMD or WSL). Nothing extra to install: it's plain bash.
 
 ## Install
 
-Nothing to install first. It's plain bash, which is built into macOS, Linux and WSL, and it works from any shell (zsh, bash, fish).
+Nothing to install first. It's plain bash, which is built into macOS and Linux, and comes with Git for Windows (Claude Code on Windows needs Git anyway). It works from any shell.
+
+**macOS / Linux / WSL**
 
 ```bash
 git clone https://github.com/Ak1Ena/ai-launcher ~/code/ai-launcher
 echo 'export PATH="$HOME/code/ai-launcher/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
 ```
+
+**Windows (PowerShell)**
+
+```powershell
+git clone https://github.com/Ak1Ena/ai-launcher $HOME\code\ai-launcher
+$p = [Environment]::GetEnvironmentVariable('Path', 'User')
+[Environment]::SetEnvironmentVariable('Path', "$p;$HOME\code\ai-launcher\bin", 'User')
+```
+
+`ai.cmd`, `cla.cmd` and `cla-team.cmd` run the same script with Git Bash, so `ai` works from PowerShell, CMD or Git Bash. If Git is installed somewhere unusual, set `CLAUDE_CODE_GIT_BASH_PATH` to its `bash.exe`, the same variable Claude Code uses.
 
 Open a new terminal and type `ai`.
 
@@ -29,14 +41,17 @@ Open a new terminal and type `ai`.
 | --- | --- | --- |
 | [fzf](https://github.com/junegunn/fzf) | Arrow-key picker with search. Without it you get a numbered menu. | — |
 | [jq](https://jqlang.org) | Usage bars and shared folder trust | macOS 15+ |
-| tmux | Claude team mode (`ctrl-t`, `cla-team`) | — |
+| tmux | Claude team mode (`ctrl-t`, `cla-team`). Not on native Windows. | — |
 
 ```bash
 brew install fzf tmux            # macOS (jq is built in on macOS 15+, else: brew install jq)
 sudo apt install fzf jq tmux     # Linux / WSL
+winget install junegunn.fzf jqlang.jq   # Windows (no tmux, so no team mode outside WSL)
 ```
 
-On Windows, run it inside WSL. Native PowerShell is not supported.
+**Windows notes:**
+- Folder-trust sharing between different agents is off on native Windows for now, because each agent's Windows path format still has to be verified. Sharing trust between Claude accounts still works.
+- `cla add` copies your settings into a new account instead of linking them, because Git Bash can't make links by default.
 
 ### Show Claude usage
 

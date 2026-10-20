@@ -4,9 +4,9 @@ This file is for AI agents working on this repo. Humans should start with README
 
 ## What this is
 
-A bash command-line tool. `bin/ai` shows a picker of coding-agent CLIs with plan usage, then starts the chosen one in the current folder. `bin/cla` and `bin/cla-team` are symlinks to `bin/ai`, and the name it was called by picks the command. There is no build step and no package manager.
+A bash command-line tool. `bin/ai` shows a picker of coding-agent CLIs with plan usage, then starts the chosen one in the current folder. `bin/cla` and `bin/cla-team` are tiny scripts that call `bin/ai cla…`. They are not symlinks, because Git on Windows turns symlinks into text files. `bin/*.cmd` start the same scripts with Git Bash from PowerShell or CMD. There is no build step and no package manager.
 
-**Hard requirement: nothing to install.** The tool must run on the bash built into macOS (3.2), Linux and WSL. fzf, jq and tmux are optional, and every feature that needs one must degrade gracefully when it is missing.
+**Hard requirement: nothing to install.** The tool must run on the bash built into macOS (3.2), Linux and WSL, and on Git Bash on Windows. fzf, jq and tmux are optional, and every feature that needs one must degrade gracefully when it is missing.
 
 ## Layout
 
@@ -50,6 +50,12 @@ Use `date +%s` for the current time. Use `${arr[@]+"${arr[@]}"}` to expand array
 - **No network calls.** Usage must come from local files the agents already write.
 - **Portable.** Guard optional or OS-specific commands with `has <cmd>`: fzf, jq, tmux, `caffeinate`, `security`. For dates use `date -r` with a `date -d @` fallback. Don't use `stat` (its flags differ between macOS and Linux).
 - **Rows run in parallel** (background jobs in `_ai_rows`). Row functions must not prompt, and must finish quickly even when files are missing.
+- **Windows (Git Bash):**
+  - Paths handed to native programs go through `native_path`, which turns them into `C:/...`.
+  - Never read `/dev/tty`. Pickers draw on stderr and read from stdin.
+  - Keep LF endings in scripts and CRLF in `.cmd` files (see `.gitattributes`).
+  - Check for Windows with `is_windows`.
+  - Cross-agent trust sharing is off there until each agent's Windows path format is verified.
 - **Width:** pad shown text with `pad` (counts characters and ignores color codes), not `printf %-Ns`, which counts bytes.
 
 ## Verify a change
