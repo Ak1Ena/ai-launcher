@@ -10,23 +10,30 @@ One command for all your AI coding agents. Type `ai` to see every agent and acco
 - **Trust a folder once.** If any agent trusts the folder, every agent you start through `ai` trusts it too, so they stop asking.
 - **No API calls.** Usage comes from files the agents already write on your machine.
 
-Works on macOS, Linux and Windows through WSL.
+Works on macOS, Linux and Windows through WSL. Nothing to install: it's plain bash.
 
 ## Install
 
-You need zsh, [fzf](https://github.com/junegunn/fzf) and [jq](https://jqlang.org). Team mode also needs tmux.
-
-```bash
-# macOS
-brew install fzf jq tmux
-# Linux / WSL
-sudo apt install zsh fzf jq tmux
-```
+Nothing to install first. It's plain bash, which is built into macOS, Linux and WSL, and it works from any shell (zsh, bash, fish).
 
 ```bash
 git clone https://github.com/Ak1Ena/ai-launcher ~/code/ai-launcher
-echo 'source ~/code/ai-launcher/ai.zsh' >> ~/.zshrc
-source ~/.zshrc
+echo 'export PATH="$HOME/code/ai-launcher/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
+```
+
+Open a new terminal and type `ai`.
+
+**Optional extras.** Each one turns on more features. Without them, everything else still works:
+
+| Tool | Adds | Built into |
+| --- | --- | --- |
+| [fzf](https://github.com/junegunn/fzf) | Arrow-key picker with search. Without it you get a numbered menu. | — |
+| [jq](https://jqlang.org) | Usage bars and shared folder trust | macOS 15+ |
+| tmux | Claude team mode (`ctrl-t`, `cla-team`) | — |
+
+```bash
+brew install fzf tmux            # macOS (jq is built in on macOS 15+, else: brew install jq)
+sudo apt install fzf jq tmux     # Linux / WSL
 ```
 
 On Windows, run it inside WSL. Native PowerShell is not supported.
@@ -54,13 +61,13 @@ ai                 # pick an agent and start it here
 ai --resume        # extra arguments go to the agent
 ```
 
-| Key in the picker | What it does |
-| --- | --- |
-| `enter` | Start the selected agent |
-| `ctrl-t` | Start Claude in team mode (teammates in tmux split panes) |
-| `ctrl-a` | Add an agent |
-| `ctrl-e` | Edit the selected agent |
-| `ctrl-x` | Delete the selected agent |
+| With fzf | Without fzf | What it does |
+| --- | --- | --- |
+| `enter` | `2` | Start the selected agent |
+| `ctrl-t` | `t 2` | Start Claude in team mode (teammates in tmux split panes) |
+| `ctrl-a` | `a` | Add an agent |
+| `ctrl-e` | `e 2` | Edit the selected agent |
+| `ctrl-x` | `x 2` | Delete the selected agent |
 
 ### Manage agents
 
@@ -68,7 +75,7 @@ ai --resume        # extra arguments go to the agent
 | --- | --- |
 | `ai ls` | List agents with their launch command and label |
 | `ai add [name] [command] [label]` | Add an agent. It asks for anything you leave out. |
-| `ai edit <name> [command] [label]` | Change the command or label. It asks, prefilled with the current values. |
+| `ai edit <name> [command] [label]` | Change the command or label. It asks, showing the current value. Press Enter to keep it. |
 | `ai rm <name>` | Delete an agent, after asking you to confirm. `ai add <name>` brings it back. |
 
 ```bash
@@ -76,7 +83,7 @@ ai add aider "aider --model sonnet" "Aider"
 ai edit claude "claude --model opus"
 ```
 
-Agents are saved in `~/.config/ai-launcher/providers`, one per line as `name<TAB>command<TAB>label`. On first run, the file is filled with the agents you have installed.
+Agents are saved in `~/.config/ai-launcher/providers`, one per line as `name<TAB>command<TAB>label`. On first run, the file is filled with the agents you have installed. A command runs like a shell alias, so quotes and `VAR=value` prefixes work.
 
 ### Several Claude accounts
 
@@ -104,21 +111,22 @@ Accounts live in `~/.claude-accounts/<name>`. Set `CLA_ROOT` to use another fold
 
 ## Add usage bars for another agent
 
-An agent with no plugin gets a plain row. To show usage, create `plugins/<name>.zsh`, where `<name>` is the agent's name in `ai ls`:
+An agent with no plugin gets a plain row. To show usage, create `plugins/<name>.sh`, where `<name>` is the agent's name in `ai ls`:
 
-```zsh
+```bash
 _ai_mytool_rows() {                      # print one picker row per account
   _ai_row mytool <id> <shown-name> "<label>" "$(_ai_bar 5h <percent> '<reset time>')"
 }
 _ai_mytool_run() { shift; _ai_exec "$(_ai_cmd mytool mytool)" "$@"; }   # optional; $1 = row id
 ```
 
-To share folder trust with another agent, add its name to `AI_TRUST` and define `_ai_trust_<name>_has` and `_ai_trust_<name>_add` in `trust.zsh`.
+To share folder trust with another agent, add its name to `AI_TRUST` and define `_ai_trust_<name>_has` and `_ai_trust_<name>_add` in `lib/trust.sh`.
 
 ## Test
 
 ```bash
-zsh tests/check.zsh
+bash tests/check.sh
+/bin/bash tests/check.sh     # on macOS: also check with the built-in bash 3.2
 ```
 
 This runs every feature against a throwaway home folder and never touches your real configs.
