@@ -3,6 +3,7 @@
 # Optional: fzf (nicer picker), jq (usage bars + shared trust), tmux (Claude team mode).
 
 AI_PROVIDERS=${AI_PROVIDERS:-${XDG_CONFIG_HOME:-$HOME/.config}/ai-launcher/providers}
+AI_ACCOUNTS=${AI_ACCOUNTS:-$HOME/.ai-accounts}
 AI_DEFAULT_ORDER="claude codex gemini agy kimi opencode qwen"
 TAB=$'\t'
 NL=$'\n'
@@ -19,6 +20,17 @@ _ai_default_label() {
     agy) echo "Antigravity" ;; kimi) echo "Kimi Code" ;; opencode) echo "OpenCode" ;;
     qwen) echo "Qwen Code" ;; *) echo "$1" ;;
   esac
+}
+# env var that moves an agent's config (and login) to another folder. Claude has its own accounts (cla).
+_ai_account_env() { case $1 in codex) echo CODEX_HOME ;; gemini) echo GEMINI_CLI_HOME ;; esac; }
+# the CLI a provider runs: first word of its command after any VAR=value, without its folder
+_ai_agent() {
+  _ai_get "$1" 2 | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {n = split($i, p, "/"); print p[n]; exit}}'
+}
+# a provider's own login folder, if it has one. `ai add` makes it for the 2nd+ provider of the same CLI.
+_ai_account_dir() {
+  local a; a=$(_ai_agent "$1")
+  [ -n "$(_ai_account_env "$a")" ] && [ -d "$AI_ACCOUNTS/$a/$1" ] && echo "$AI_ACCOUNTS/$a/$1"
 }
 
 ai_main() {
@@ -50,7 +62,8 @@ _ai_help() {
 ai                               pick an agent (with plan usage) and start it in this folder
 ai [agent args]                  same, extra args go to the agent
 ai ls                            list agents
-ai add  [name] [command] [label] add an agent (asks for anything left out)
+ai add  [name] [command] [label] add an agent (asks for anything left out). A 2nd codex or
+                                 gemini gets its own login: ai add work codex
 ai edit <name> [command] [label] change its command / label
 ai rm   <name>                   delete an agent
 cla [name] [team] [args]         Claude accounts: pick or start one   (cla add|ls|rm|mv)
@@ -105,12 +118,25 @@ _ai_add() {
   _ai_seed
   local n=${1:-} c=${2:-} l=${3:-}
   [ -n "$n" ] || n=$(_ai_ask "name") || return 1
-  case $n in ''|*[[:space:]]*) echo "name must be one word"; return 1 ;; esac
+  case $n in ''|.|..|*[!A-Za-z0-9._-]*) echo "name must be one word (letters, digits, . _ -)"; return 1 ;; esac
   [ -n "$(_ai_get "$n" 1)" ] && { echo "'$n' exists. change it: ai edit $n"; return 1; }
   [ -n "$c" ] || c=$(_ai_ask "command" "$n") || return 1
   [ -n "$l" ] || l=$(_ai_ask "label" "$(_ai_default_label "$n")") || return 1
   [ -n "$c" ] || { echo "command is required"; return 1; }
   _ai_put "$n" "$c" "$l" && echo "added $n -> $c"
+  _ai_add_login "$n"
+}
+# Another provider already runs this CLI: give this one its own login folder, so it is a
+# separate account. Kept on delete, so re-adding the same name gets the same login back.
+_ai_add_login() {
+  local a o d; a=$(_ai_agent "$1")
+  [ -n "$(_ai_account_env "$a")" ] || return 0
+  for o in $(_ai_names); do
+    [ "$o" != "$1" ] && [ "$(_ai_agent "$o")" = "$a" ] && [ -z "$(_ai_account_dir "$o")" ] || continue
+    d=$AI_ACCOUNTS/$a/$1
+    mkdir -p "$d" && echo "separate $a login in $d. start $1 to log in."
+    return 0
+  done
 }
 _ai_edit() {
   local n=${1:-} c=${2:-} l=${3:-}
@@ -129,12 +155,14 @@ _ai_rm() {
 # ── rows ───────────────────────────────────────────────────
 # every provider's rows, fetched in parallel, kept in providers-file order
 _ai_rows() {
-  local i=0 n
+  local i=0 n r
   {
     for n in $(_ai_names); do
       i=$((i + 1))
-      if is_fn "_ai_${n}_rows" && has jq; then
-        _ai_"${n}"_rows | sed "s/^/$i$TAB/" &
+      r=_ai_${n}_rows  # else the plugin of the CLI it runs, for codex / gemini logins
+      is_fn "$r" || { [ -n "$(_ai_account_env "$(_ai_agent "$n")")" ] && r=_ai_$(_ai_agent "$n")_rows; }
+      if is_fn "$r" && has jq; then
+        "$r" "$n" | sed "s/^/$i$TAB/" &
       else
         _ai_row "$n" "$n" "$n" "$(_ai_get "$n" 3)" "$(dim 'no usage data')" | sed "s/^/$i$TAB/"
       fi
@@ -213,7 +241,8 @@ _ai_menu() {
 
 # ── launch ─────────────────────────────────────────────────
 _ai_run() {
-  local n=$1 id=$2; shift 2
+  local n=$1 id=$2 d; shift 2
+  d=$(_ai_account_dir "$n") && export "$(_ai_account_env "$(_ai_agent "$n")")=$(native_path "$d")"
   [ "$n" = claude ] || _ai_trust_share "$PWD"  # claude rows go through cla, which shares too
   if is_fn "_ai_${n}_run"; then "_ai_${n}_run" "$id" "$@"
   else _ai_exec "$(_ai_cmd "$n" "$n")" "$@"; fi

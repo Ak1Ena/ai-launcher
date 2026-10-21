@@ -68,9 +68,9 @@ _ai_trust_codex_add() {
 }
 
 # Gemini / Qwen: trustedFolders.json {"<dir>": "TRUST_FOLDER" | "TRUST_PARENT" | "DO_NOT_TRUST"}
-_ai_trust_gemini_has() { _ai_trust_gem_has "$HOME/.gemini/trustedFolders.json" "$1"; }
+_ai_trust_gemini_has() { _ai_trust_gem_has "${GEMINI_CLI_HOME:-$HOME}/.gemini/trustedFolders.json" "$1"; }
 _ai_trust_qwen_has()   { _ai_trust_gem_has "$HOME/.qwen/trustedFolders.json" "$1"; }
-_ai_trust_gemini_add() { _ai_trust_gem_add "$HOME/.gemini/trustedFolders.json" "$1"; }
+_ai_trust_gemini_add() { _ai_trust_gem_add "${GEMINI_CLI_HOME:-$HOME}/.gemini/trustedFolders.json" "$1"; }
 _ai_trust_qwen_add()   { _ai_trust_gem_add "$HOME/.qwen/trustedFolders.json" "$1"; }
 # TRUST_PARENT on a child also means <dir> is trusted
 _ai_trust_gem_has() {

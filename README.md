@@ -111,11 +111,23 @@ Agents are saved in `~/.config/ai-launcher/providers`, one per line as `name<TAB
 
 Accounts live in `~/.claude-accounts/<name>`. Set `CLA_ROOT` to use another folder.
 
+### Several Codex or Gemini accounts
+
+Add another agent that runs the same CLI. The first one uses your normal login; every one after it gets its own:
+
+```bash
+ai add personal codex "Codex personal"   # codex is already listed, so this is a separate login
+```
+
+Start it from `ai` and log in. Each one gets its own row with its own usage bars (Codex). Logins live in `~/.ai-accounts/<cli>/<name>`, which the CLI gets as `CODEX_HOME` or `GEMINI_CLI_HOME`. Set `AI_ACCOUNTS` to use another folder. A new login starts with fresh settings: nothing is copied from the main one. `ai rm` keeps the folder, so adding the same name again gets the same login back.
+
+Antigravity (`agy`) can't have several accounts yet: it always reads `~/.gemini/antigravity-cli` and has no setting to move it.
+
 ## How it works
 
 **Usage.** Nothing is fetched from the internet:
 - **Claude:** reads `<account>/usage/usage.json`, written by `scripts/statusline-usage.sh`. The numbers are from that account's last session. Rows older than 10 minutes show their age, and a limit whose reset time has passed shows 0%.
-- **Codex:** reads the rate limits saved in the newest `~/.codex/sessions` log.
+- **Codex:** reads the rate limits saved in the newest `sessions` log of `~/.codex`, or of that agent's own login folder.
 - **Other agents** don't save usage, so they show "no usage data".
 
 **Folder trust.** When you start an agent through `ai` or `cla`, it checks whether the folder is trusted by any of Claude (main config and every account), Codex, Gemini, Qwen or Antigravity. If one trusts it, the folder is marked trusted in the others too.

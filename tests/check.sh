@@ -3,7 +3,7 @@
 #   bash tests/check.sh        exit 0 = all passed   (also run it with /bin/bash on macOS: bash 3.2)
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 T=$(cd "$(mktemp -d)" && pwd -P); trap 'rm -rf "$T"' EXIT   # resolved path: agents store getcwd()
-export HOME=$T/home CLA_ROOT=$T/home/acc CODEX_HOME=$T/home/.codex AI_PROVIDERS=$T/cfg/providers
+export HOME=$T/home CLA_ROOT=$T/home/acc CODEX_HOME=$T/home/.codex AI_PROVIDERS=$T/cfg/providers AI_ACCOUNTS=$T/home/.ai-accounts
 mkdir -p "$HOME" "$CLA_ROOT/one/usage" "$CLA_ROOT/two/usage" "$CODEX_HOME/sessions/2026/01/01" \
   "$HOME/.gemini/antigravity-cli" "$HOME/repo/a" "$HOME/repo/b"
 . "$REPO/lib/core.sh"; . "$REPO/lib/trust.sh"; for f in "$REPO"/plugins/*.sh; do . "$f"; done
@@ -37,12 +37,32 @@ ok "no login shows label"       'case $(echo "$rows" | line 2) in *"not logged i
 ok "columns line up"            '[ "$(echo "$rows" | line 1 | cut -c1-40 | wc -m)" = "$(echo "$rows" | line 2 | cut -c1-40 | wc -m)" ]'
 echo "{\"payload\":{\"rate_limits\":{\"primary\":{\"used_percent\":41.0,\"window_minutes\":300,\"resets_at\":$((now+60))},\"plan_type\":\"plus\"}}}" > "$CODEX_HOME/sessions/2026/01/01/r.jsonl"
 codex() { :; }; export -f codex 2>/dev/null
-ok "codex row reads session log" 'case $(_ai_codex_rows | cut -f3 | plain) in *"plus plan"*5h*41%*) true;; *) false;; esac'
+_ai_put codex codex "Codex CLI"
+ok "codex row reads session log" 'case $(_ai_codex_rows | cut -f3 | plain) in *"Codex CLI · plus"*5h*41%*) true;; *) false;; esac'
 unset -f codex
 printf 'claude\tclaude\tClaude Code\nfoo\tfoo --x\tFoo Tool\n' > "$AI_PROVIDERS"
 rows=$(_ai_rows | cut -f1,2)
 ok "rows keep providers order"  '[ "$(echo "$rows" | cut -f1 | uniq | tr "\n" " ")" = "claude foo " ]'
 ok "plain provider row"         '[ "$(echo "$rows" | tail -1)" = "foo${TAB}foo" ]'
+
+# ── several codex / gemini logins through ai add ──
+mkdir -p "$T/bin"; printf '#!/bin/sh\nprintf %%s "$CODEX_HOME"\n' > "$T/bin/codex"; chmod +x "$T/bin/codex"  # stub: never start the real agent
+printf 'codex\tcodex\tCodex CLI\n' > "$AI_PROVIDERS"
+ok "first codex keeps the main login" '[ -z "$(_ai_account_dir codex)" ]'
+_ai_add work "FOO=1 $T/bin/codex --x" "Codex work" >/dev/null
+ok "2nd codex gets its own login" '[ "$(_ai_agent work)" = codex ] && [ "$(_ai_account_dir work)" = "$AI_ACCOUNTS/codex/work" ]'
+mkdir -p "$AI_ACCOUNTS/codex/work/sessions/2026/01/02"
+echo "{\"payload\":{\"rate_limits\":{\"primary\":{\"used_percent\":7.0,\"window_minutes\":300,\"resets_at\":$((now+60))}}}}" > "$AI_ACCOUNTS/codex/work/sessions/2026/01/02/r.jsonl"
+rows=$( PATH=$T/bin:$PATH; _ai_rows )
+ok "each login has its own usage row" '[ "$(echo "$rows" | cut -f2 | tr "\n" " ")" = "codex work " ] && case $(echo "$rows" | line 2 | cut -f3 | plain) in *5h*7%*) true;; *) false;; esac'
+ok "launch points codex at its login" '[ "$(_ai_run work work)" = "$(native_path "$AI_ACCOUNTS/codex/work")" ]'
+_ai_put codex "$T/bin/codex"
+ok "main login stays the default" '[ "$(_ai_run codex codex)" = "$CODEX_HOME" ]'
+_ai_add other "aider" >/dev/null <<<""
+ok "other CLIs never get a login folder" '[ ! -e "$AI_ACCOUNTS/aider" ]'
+ok "names must be path-safe"    '! _ai_add .. codex x >/dev/null && ! _ai_add a/b codex x >/dev/null'
+_ai_put work; _ai_add work codex "Codex work" >/dev/null
+ok "re-adding a name keeps its login" '[ "$(_ai_account_dir work)" = "$AI_ACCOUNTS/codex/work" ]'
 
 # ── shared folder trust ──
 echo '{"projects":{}}' > "$HOME/.claude.json"
