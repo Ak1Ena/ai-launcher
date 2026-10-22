@@ -419,6 +419,12 @@ pub fn add_claude_account(paths: &Paths, name: &str) -> std::io::Result<PathBuf>
                 Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
                 _ => {}
             }
+            // Windows can't link without admin rights: copy the settings files, as `cla add` does there.
+            // shortcut: folders (skills, plugins, ...) are not copied on Windows; copy them if users miss them.
+            #[cfg(not(unix))]
+            if from.is_file() {
+                fs::copy(&from, &to)?;
+            }
         }
     }
     // the accounts show up through the `claude` provider
