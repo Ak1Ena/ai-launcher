@@ -1,0 +1,16 @@
+{
+  "name": "ai-launcher",
+  "version": "0.0.0",
+  "description": "Launcher for AI coding CLIs",
+  "license": "MIT",
+  "bin": { "ai": "bin/ai.js" },
+  "files": ["bin"],
+  "engines": { "node": ">=16" },
+  "optionalDependencies": {
+    "ai-launcher-darwin-arm64": "0.0.0",
+    "ai-launcher-darwin-x64": "0.0.0",
+    "ai-launcher-linux-x64": "0.0.0",
+    "ai-launcher-linux-arm64": "0.0.0",
+    "ai-launcher-win32-x64": "0.0.0"
+  }
+}

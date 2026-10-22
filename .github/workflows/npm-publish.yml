@@ -1,0 +1,38 @@
+name: npm-publish
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. v0.1.0)
+        required: true
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Skip without token
+        if: env.NPM_TOKEN == ''
+        run: echo "::notice::NPM_TOKEN not set; skipping npm publish."
+      - uses: actions/checkout@v4
+        if: env.NPM_TOKEN != ''
+      - uses: actions/setup-node@v4
+        if: env.NPM_TOKEN != ''
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Pack and publish
+        if: env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          gh release download "$TAG" --dir assets --pattern 'ai-launcher-*'
+          bash scripts/npm-pack.sh "${TAG#v}" assets out
+          for d in out/ai-launcher-*; do (cd "$d" && npm publish --access public); done
+          (cd out/ai-launcher && npm publish --access public)
