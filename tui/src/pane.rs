@@ -2,7 +2,7 @@
 //! terminal queries CLIs wait on at startup (cursor position, device attributes, colors),
 //! since no real terminal sits behind it.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -155,7 +155,49 @@ impl Pane {
             .write_all(bytes);
     }
 
+    /// Mouse in the pane at (col, row), 0-based. A CLI that asked for the mouse gets it;
+    /// otherwise the wheel scrolls back through its output.
+    pub fn mouse(&self, kind: MouseEventKind, col: u16, row: u16) {
+        let mut p = self.screen.lock().unwrap_or_else(|e| e.into_inner());
+        let s = p.screen_mut();
+        let wants = s.mouse_protocol_mode() != vt100::MouseProtocolMode::None;
+        let sgr = s.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr;
+        if !wants {
+            let at = s.scrollback();
+            match kind {
+                MouseEventKind::ScrollUp => s.set_scrollback(at + 3),
+                MouseEventKind::ScrollDown => s.set_scrollback(at.saturating_sub(3)),
+                _ => {}
+            }
+            return;
+        }
+        drop(p);
+        let (button, release) = match kind {
+            MouseEventKind::Down(b) => (mouse_button(b), false),
+            MouseEventKind::Up(b) => (mouse_button(b), true),
+            MouseEventKind::Drag(b) => (mouse_button(b) + 32, false),
+            MouseEventKind::ScrollUp => (64, false),
+            MouseEventKind::ScrollDown => (65, false),
+            _ => return,
+        };
+        let (x, y) = (col + 1, row + 1);
+        if sgr {
+            self.write(
+                format!("\x1b[<{button};{x};{y}{}", if release { 'm' } else { 'M' }).as_bytes(),
+            );
+        } else if x < 223 && y < 223 {
+            let b = if release { 3 } else { button };
+            self.write(&[0x1b, b'[', b'M', 32 + b as u8, 32 + x as u8, 32 + y as u8]);
+        }
+    }
+
     pub fn key(&self, key: KeyEvent) {
+        // typing jumps back to the live screen
+        self.screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .screen_mut()
+            .set_scrollback(0);
         let app_cursor = self
             .screen
             .lock()
@@ -196,6 +238,14 @@ impl Drop for Pane {
         if self.exited().is_none() {
             self.kill();
         }
+    }
+}
+
+fn mouse_button(b: MouseButton) -> u16 {
+    match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
     }
 }
 

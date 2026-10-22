@@ -3,9 +3,12 @@
 
 use crate::config::{self, Entry, Kind, Paths};
 use crate::failover::{self, Split};
+use crate::form::{Confirm, Form, Outcome, Purpose};
 use crate::pane::Pane;
+use crate::ui::{Button, Hits};
 use crate::usage::{self, Usage};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -47,6 +50,11 @@ pub struct Tab {
     done: bool,
 }
 
+pub enum Modal {
+    Form(Form),
+    Confirm(Confirm),
+}
+
 pub struct Row {
     pub entry: Entry,
     /// 1-based failover priority, for members.
@@ -72,6 +80,9 @@ pub struct App {
     base_config: Option<PathBuf>,
     mod_dir: PathBuf,
     next_handoff: usize,
+    pub modal: Option<Modal>,
+    /// a short message under the sidebar, and when it goes away
+    pub flash: Option<(String, Instant)>,
 }
 
 impl App {
@@ -95,6 +106,8 @@ impl App {
             value_flags: None,
             mod_dir,
             next_handoff: 0,
+            modal: None,
+            flash: None,
         };
         app.refresh();
         app
@@ -172,6 +185,22 @@ impl App {
     // ── keys ──────────────────────────────────────────────
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        if self.modal.is_some() {
+            return self.modal_key(key);
+        }
+        // alt-1..9 and alt-← → switch tabs from anywhere, even while typing in a CLI
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char(c @ '1'..='9') => return self.show_tab(c as usize - '1' as usize),
+                KeyCode::Left if !self.tabs.is_empty() => {
+                    return self.show_tab((self.current + self.tabs.len() - 1) % self.tabs.len());
+                }
+                KeyCode::Right if !self.tabs.is_empty() => {
+                    return self.show_tab((self.current + 1) % self.tabs.len());
+                }
+                _ => {}
+            }
+        }
         // ctrl-\ moves between the sidebar and the running CLI
         // terminals send it as 0x1c, which crossterm reads as ctrl-4
         if matches!(key.code, KeyCode::Char('\\' | '4'))
@@ -237,6 +266,9 @@ impl App {
                 }
             }
             KeyCode::Char('x') => self.close_tab(),
+            KeyCode::Char('a') => self.modal = Some(Modal::Form(Form::add())),
+            KeyCode::Char('e') => self.start_edit(),
+            KeyCode::Char('d') => self.start_delete(),
             KeyCode::Tab => {
                 if !self.tabs.is_empty() {
                     self.current = (self.current + 1) % self.tabs.len();
@@ -290,6 +322,260 @@ impl App {
                 if let Some(p) = &tab.pane {
                     p.key(key);
                 }
+            }
+        }
+    }
+
+    fn show_tab(&mut self, n: usize) {
+        if n < self.tabs.len() {
+            self.current = n;
+            self.focus = Focus::Pane;
+        }
+    }
+
+    pub fn say(&mut self, text: impl Into<String>) {
+        self.flash = Some((text.into(), Instant::now() + Duration::from_secs(4)));
+    }
+
+    // ── add / edit / delete ───────────────────────────────
+
+    fn start_edit(&mut self) {
+        let Some(r) = self.rows.get(self.selected) else {
+            return;
+        };
+        let e = &r.entry;
+        let form = if e.id.starts_with("claude/") {
+            let label = config::providers(&self.paths)
+                .into_iter()
+                .find(|p| p.name == "claude")
+                .map(|p| p.label);
+            Form::edit(
+                "claude",
+                &label.unwrap_or_else(|| "Claude Code".into()),
+                &e.command,
+                true,
+            )
+        } else {
+            Form::edit(&e.id, &e.label, &e.command, false)
+        };
+        self.modal = Some(Modal::Form(form));
+    }
+
+    fn start_delete(&mut self) {
+        let Some(r) = self.rows.get(self.selected) else {
+            return;
+        };
+        let what = match r.entry.id.strip_prefix("claude/") {
+            Some(acct) => format!(
+                "Its folder moves to {}/.trash/{acct}-… (login, history and settings stay there).",
+                self.paths.cla_root.display()
+            ),
+            None => "It leaves the list. A Codex or Gemini login folder is kept, so adding it again logs back in.".into(),
+        };
+        self.modal = Some(Modal::Confirm(Confirm {
+            id: r.entry.id.clone(),
+            what,
+        }));
+    }
+
+    fn modal_key(&mut self, key: KeyEvent) {
+        match self.modal.take() {
+            Some(Modal::Confirm(c)) => match key.code {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.delete(&c.id),
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {}
+                _ => self.modal = Some(Modal::Confirm(c)),
+            },
+            Some(Modal::Form(mut f)) => match f.key(key) {
+                Outcome::Open => self.modal = Some(Modal::Form(f)),
+                Outcome::Cancel => {}
+                Outcome::Save => {
+                    if let Err(e) = self.save_form(&f) {
+                        f.error = Some(e);
+                        self.modal = Some(Modal::Form(f));
+                    }
+                }
+            },
+            None => {}
+        }
+        self.refresh();
+    }
+
+    fn save_form(&mut self, f: &Form) -> Result<(), String> {
+        let (label, command) = (f.get("Label"), f.get("Command"));
+        match &f.purpose {
+            Purpose::Edit(id) => {
+                if command.is_empty() {
+                    return Err("The command can't be empty.".into());
+                }
+                config::put_provider(&self.paths, id, Some((&command, &label)))
+                    .map_err(|e| e.to_string())?;
+                self.say(format!("Saved {id}."));
+            }
+            Purpose::Add => {
+                let name = f.get("Name");
+                if !config::valid_name(&name) {
+                    return Err("Name: one word of letters, digits, . _ or -".into());
+                }
+                if f.get("Type") == "Claude account" {
+                    if self.paths.cla_root.join(&name).exists() {
+                        return Err(format!("A Claude account named {name} already exists."));
+                    }
+                    config::add_claude_account(&self.paths, &name).map_err(|e| e.to_string())?;
+                    self.refresh();
+                    self.open_login(&format!("claude/{name}"));
+                    return Ok(());
+                }
+                if command.is_empty() {
+                    return Err("The command can't be empty.".into());
+                }
+                if config::providers(&self.paths)
+                    .iter()
+                    .any(|p| p.name == name)
+                    || name == "claude"
+                {
+                    return Err(format!("{name} is already in the list."));
+                }
+                config::put_provider(&self.paths, &name, Some((&command, &label)))
+                    .map_err(|e| e.to_string())?;
+                let own_login = config::add_login_dir(&self.paths, &name, &command).is_some();
+                self.refresh();
+                if own_login {
+                    self.open_login(&name);
+                } else {
+                    self.say(format!("Added {name}. Press enter on it to start."));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn delete(&mut self, id: &str) {
+        if self
+            .tabs
+            .iter()
+            .any(|t| t.member == id && t.pane.is_some() && !t.done)
+        {
+            return self.say(format!("Close the running {id} tab first."));
+        }
+        let done = match id.strip_prefix("claude/") {
+            Some(acct) => config::trash_claude_account(&self.paths, acct).map(|_| ()),
+            None => config::put_provider(&self.paths, id, None),
+        };
+        match done {
+            Ok(()) => self.say(format!("Deleted {id}.")),
+            Err(e) => self.say(format!("Could not delete {id}: {e}")),
+        }
+        self.refresh();
+    }
+
+    /// A new account's first tab: its login (`claude auth login`, `codex login`).
+    fn open_login(&mut self, id: &str) {
+        let Some(entry) = self.entry(id) else { return };
+        let mut env: Vec<(String, Option<String>)> = Vec::new();
+        let command = match entry.kind {
+            Kind::Claude => {
+                let dir = config::claude_dir(&self.paths, &entry, self.base_config.as_deref());
+                env.push((
+                    "CLAUDE_CONFIG_DIR".into(),
+                    Some(dir.to_string_lossy().into_owned()),
+                ));
+                format!("{} auth login", entry.command)
+            }
+            Kind::Codex => {
+                if let Some(d) = config::account_dir(&self.paths, &entry) {
+                    env.push(("CODEX_HOME".into(), Some(d.to_string_lossy().into_owned())));
+                }
+                format!("{} login", entry.command)
+            }
+            Kind::Other => entry.command.clone(),
+        };
+        self.next_handoff += 1;
+        self.tabs.push(Tab {
+            member: id.to_string(),
+            pane: None,
+            notice: None,
+            handoff: self.paths.fo_state.join(format!(
+                "handoff.{}.{}.json",
+                std::process::id(),
+                self.next_handoff
+            )),
+            tried: vec![id.to_string()],
+            split: Split::default(),
+            session: None,
+            done: false,
+        });
+        self.current = self.tabs.len() - 1;
+        self.focus = Focus::Pane;
+        let (rows, cols) = self.pane_size;
+        match Pane::spawn(&command, &[], &env, rows, cols) {
+            Ok(p) => self.tabs[self.current].pane = Some(p),
+            Err(e) => {
+                self.tabs[self.current].notice =
+                    Some(Notice::Error(format!("could not start {command}: {e}")))
+            }
+        }
+        self.say(format!(
+            "Log in to {} in this tab. When it ends, press enter to start it.",
+            self.label(id)
+        ));
+    }
+
+    // ── mouse ─────────────────────────────────────────────
+
+    pub fn on_mouse(&mut self, m: MouseEvent, hits: &Hits) {
+        let at = Position::new(m.column, m.row);
+        let inside = |r: &Rect| r.contains(at);
+        if self.modal.is_some() {
+            if let (MouseEventKind::Down(MouseButton::Left), Some(Modal::Form(f))) =
+                (m.kind, &mut self.modal)
+                && let Some((_, i)) = hits.fields.iter().find(|(r, _)| inside(r))
+                && (*i == f.fields.len() || !f.fields[*i].locked)
+            {
+                f.focus = *i;
+                if *i == f.fields.len() {
+                    self.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+            }
+            return;
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            if let Some((_, t)) = hits.closes.iter().find(|(r, _)| inside(r)) {
+                self.current = *t;
+                return self.close_tab();
+            }
+            if let Some((_, t)) = hits.tabs.iter().find(|(r, _)| inside(r)) {
+                return self.show_tab(*t);
+            }
+            if let Some((_, b)) = hits.buttons.iter().find(|(r, _)| inside(r)) {
+                match b {
+                    Button::Add => self.modal = Some(Modal::Form(Form::add())),
+                    Button::Edit => self.start_edit(),
+                    Button::Delete => self.start_delete(),
+                    Button::Failover => config::set_failover(&self.paths, !self.failover),
+                }
+                return self.refresh();
+            }
+            if let Some((_, i)) = hits.rows.iter().find(|(r, _)| inside(r)) {
+                // click selects, a click on the selected row opens it
+                let again = self.selected == *i && self.focus == Focus::Sidebar;
+                self.selected = *i;
+                self.focus = Focus::Sidebar;
+                if again && let Some(id) = self.rows.get(*i).map(|r| r.entry.id.clone()) {
+                    self.open(&id);
+                }
+                return;
+            }
+        }
+        if inside(&hits.pane)
+            && let Some(tab) = self.tabs.get(self.current)
+        {
+            if matches!(m.kind, MouseEventKind::Down(_)) {
+                self.focus = Focus::Pane;
+            }
+            if tab.notice.is_none()
+                && let Some(p) = &tab.pane
+            {
+                p.mouse(m.kind, m.column - hits.pane.x, m.row - hits.pane.y);
             }
         }
     }
@@ -417,6 +703,13 @@ impl App {
 
     /// Called every frame: notices CLIs that ended and runs due switches.
     pub fn tick(&mut self) {
+        if self
+            .flash
+            .as_ref()
+            .is_some_and(|(_, until)| Instant::now() > *until)
+        {
+            self.flash = None;
+        }
         for t in 0..self.tabs.len() {
             if let Some(Notice::Switch { at, .. }) = &self.tabs[t].notice {
                 if Instant::now() >= *at {

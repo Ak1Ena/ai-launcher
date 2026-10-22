@@ -210,6 +210,7 @@ pub fn cla_accounts(root: &Path) -> Vec<String> {
             rd.filter_map(Result::ok)
                 .filter(|e| e.path().is_dir())
                 .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| !n.starts_with('.'))
                 .collect()
         })
         .unwrap_or_default();
@@ -344,6 +345,113 @@ pub fn account_dir(paths: &Paths, entry: &Entry) -> Option<PathBuf> {
     d.is_dir().then_some(d)
 }
 
+// ── changing accounts (the same files `ai add/edit/rm` and `cla add/rm` change) ──
+
+/// One word, safe as a file name: letters, digits, `.`, `_`, `-`.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Writes a provider line in place (or appends it); `None` deletes it. Keeps line order.
+pub fn put_provider(paths: &Paths, name: &str, value: Option<(&str, &str)>) -> std::io::Result<()> {
+    let text = fs::read_to_string(&paths.providers).unwrap_or_default();
+    let mut out = String::new();
+    let mut done = false;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        if line.split('\t').next() == Some(name) {
+            if let Some((cmd, label)) = value {
+                out.push_str(&format!("{name}\t{cmd}\t{label}\n"));
+            }
+            done = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !done && let Some((cmd, label)) = value {
+        out.push_str(&format!("{name}\t{cmd}\t{label}\n"));
+    }
+    if let Some(dir) = paths.providers.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(&paths.providers, out)
+}
+
+/// A new cla account folder. Settings, skills, plugins and memory are shared with the main
+/// account through links, the login stays separate (as `cla add`).
+pub fn add_claude_account(paths: &Paths, name: &str) -> std::io::Result<PathBuf> {
+    let dir = paths.cla_root.join(name);
+    fs::create_dir_all(&dir)?;
+    let main = paths.home.join(".claude");
+    for f in [
+        "settings.json",
+        "settings.local.json",
+        "CLAUDE.md",
+        "agents",
+        "skills",
+        "plugins",
+        "hooks",
+        "commands",
+        "projects",
+    ] {
+        let (from, to) = (main.join(f), dir.join(f));
+        if from.exists() && !to.exists() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&from, &to)?;
+        }
+    }
+    // the accounts show up through the `claude` provider
+    if !fs::read_to_string(&paths.providers)
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.split('\t').next() == Some("claude"))
+    {
+        put_provider(paths, "claude", Some(("claude", "Claude Code")))?;
+    }
+    Ok(dir)
+}
+
+/// Moves a cla account folder to `<cla root>/.trash/` instead of erasing it (its login, history
+/// and settings stay recoverable). Folders starting with `.` are not accounts.
+pub fn trash_claude_account(paths: &Paths, name: &str) -> std::io::Result<PathBuf> {
+    let stamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let trash = paths.cla_root.join(".trash");
+    fs::create_dir_all(&trash)?;
+    let to = trash.join(format!("{name}-{stamp}"));
+    fs::rename(paths.cla_root.join(name), &to)?;
+    Ok(to)
+}
+
+/// A 2nd provider of the same Codex/Gemini CLI gets its own login folder (as `ai add`).
+/// Kept on delete, so adding the same name again gets the same login back.
+pub fn add_login_dir(paths: &Paths, name: &str, command: &str) -> Option<PathBuf> {
+    let a = agent(command);
+    if a != "codex" && a != "gemini" {
+        return None;
+    }
+    let others = providers(paths);
+    let shares = others.iter().any(|p| {
+        p.name != name
+            && agent(&p.command) == a
+            && !paths.ai_accounts.join(&a).join(&p.name).is_dir()
+    });
+    if !shares {
+        return None;
+    }
+    let d = paths.ai_accounts.join(&a).join(name);
+    fs::create_dir_all(&d).ok()?;
+    Some(d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +495,75 @@ mod tests {
                 ("claude/a".into(), true),
                 ("cx".into(), true)
             ]
+        );
+    }
+
+    fn tmp_paths(tag: &str) -> Paths {
+        let root = std::env::temp_dir().join(format!("ai-cfg-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("home/.claude")).unwrap();
+        fs::write(root.join("home/.claude/settings.json"), "{}").unwrap();
+        Paths {
+            home: root.join("home"),
+            providers: root.join("cfg/providers"),
+            cla_root: root.join("acc"),
+            ai_accounts: root.join("ai-acc"),
+            fo_order: root.join("cfg/failover"),
+            fo_state: root.join("state"),
+            codex_home: root.join("home/.codex"),
+            cooldown: Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn put_provider_edits_in_place_and_deletes() {
+        let p = tmp_paths("put");
+        put_provider(&p, "a", Some(("a", "A"))).unwrap();
+        put_provider(&p, "b", Some(("b", "B"))).unwrap();
+        put_provider(&p, "a", Some(("a --x", "A2"))).unwrap();
+        assert_eq!(
+            fs::read_to_string(&p.providers).unwrap(),
+            "a\ta --x\tA2\nb\tb\tB\n"
+        );
+        put_provider(&p, "a", None).unwrap();
+        assert_eq!(fs::read_to_string(&p.providers).unwrap(), "b\tb\tB\n");
+    }
+
+    #[test]
+    fn claude_account_add_and_trash() {
+        let p = tmp_paths("cla");
+        let d = add_claude_account(&p, "work").unwrap();
+        assert!(d.join("settings.json").exists());
+        assert!(
+            fs::read_to_string(&p.providers)
+                .unwrap()
+                .starts_with("claude\t")
+        );
+        assert_eq!(cla_accounts(&p.cla_root), vec!["work".to_string()]);
+        trash_claude_account(&p, "work").unwrap();
+        assert!(
+            cla_accounts(&p.cla_root).is_empty(),
+            "trash is not an account"
+        );
+    }
+
+    #[test]
+    fn second_codex_gets_its_own_login() {
+        let p = tmp_paths("login");
+        put_provider(&p, "codex", Some(("codex", "Codex"))).unwrap();
+        assert!(add_login_dir(&p, "codex", "codex").is_none());
+        put_provider(&p, "work", Some(("codex", "Codex work"))).unwrap();
+        assert_eq!(
+            add_login_dir(&p, "work", "codex"),
+            Some(p.ai_accounts.join("codex/work"))
+        );
+    }
+
+    #[test]
+    fn names_are_path_safe() {
+        assert!(valid_name("work-2.a"));
+        assert!(
+            !valid_name("..") && !valid_name("a/b") && !valid_name(".trash") && !valid_name("")
         );
     }
 }
