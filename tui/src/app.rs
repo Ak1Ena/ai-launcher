@@ -7,6 +7,7 @@ use crate::form::{Confirm, Form, Outcome, Purpose};
 use crate::pane::Pane;
 use crate::ui::{Button, Hits};
 use crate::usage::{self, Usage};
+use crate::wrr;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use std::path::PathBuf;
@@ -62,6 +63,15 @@ pub struct Row {
     pub on: bool,
     pub limited: Option<Duration>,
     pub usage: Usage,
+    /// round-robin weight, for members
+    pub weight: u32,
+}
+
+/// An Auto launch waiting for the model's pick.
+pub struct Deciding {
+    rx: std::sync::mpsc::Receiver<Option<String>>,
+    cands: Vec<(String, u32)>,
+    default: String,
 }
 
 pub struct App {
@@ -72,6 +82,9 @@ pub struct App {
     pub current: usize,
     pub focus: Focus,
     pub failover: bool,
+    /// weighted round-robin mode: Auto opens the next account by weight
+    pub wrr: bool,
+    pub deciding: Option<Deciding>,
     pub quit: bool,
     pub pane_size: (u16, u16),
     /// args `ai-launcher` was started with, for the first CLI opened
@@ -105,6 +118,8 @@ impl App {
         let mod_dir = failover::install_mod(&paths);
         let mut app = App {
             failover: config::failover_on(&paths),
+            wrr: false,
+            deciding: None,
             base_config: std::env::var_os("CLAUDE_CONFIG_DIR")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
@@ -147,12 +162,15 @@ impl App {
         let selected = self.rows.get(self.selected).map(|r| r.entry.id.clone());
         let entries = config::entries(&self.paths, &config::providers(&self.paths));
         let order = config::order(&self.paths, &entries);
+        let weights = config::weights(&self.paths);
         let mut rows: Vec<Row> = order
             .iter()
             .enumerate()
             .filter_map(|(i, (id, on))| {
                 let e = entries.iter().find(|e| &e.id == id)?.clone();
-                Some(self.row(e, Some(i + 1), *on))
+                let mut r = self.row(e, Some(i + 1), *on);
+                r.weight = config::weight_of(&weights, id);
+                Some(r)
             })
             .collect();
         for e in entries.into_iter().filter(|e| !e.in_failover()) {
@@ -160,6 +178,7 @@ impl App {
         }
         self.rows = rows;
         self.failover = config::failover_on(&self.paths);
+        self.wrr = config::wrr_on(&self.paths);
         self.selected = selected
             .and_then(|id| self.rows.iter().position(|r| r.entry.id == id))
             .unwrap_or(0)
@@ -185,6 +204,7 @@ impl App {
             on,
             limited,
             usage,
+            weight: 1,
         }
     }
 
@@ -280,6 +300,13 @@ impl App {
                 }
             }
             KeyCode::Char('f') => config::set_failover(&self.paths, !self.failover),
+            KeyCode::Char('w') => self.toggle_mode(),
+            KeyCode::Char('n') => self.open_auto(),
+            KeyCode::Char('m') => {
+                self.modal = Some(Modal::Form(Form::model(&config::model(&self.paths))))
+            }
+            KeyCode::Char('+' | '=') => self.add_weight(1),
+            KeyCode::Char('-' | '_') => self.add_weight(-1),
             KeyCode::Char('r') => {
                 if let Some(id) = id {
                     config::clear_limit(&self.paths, &id);
@@ -362,6 +389,31 @@ impl App {
         self.refresh();
     }
 
+    fn toggle_mode(&mut self) {
+        config::set_wrr(&self.paths, !self.wrr);
+        self.say(if self.wrr {
+            "Mode: failover."
+        } else {
+            "Mode: weighted round-robin. n or ▶ Auto opens the next account."
+        });
+    }
+
+    fn add_weight(&mut self, by: i64) {
+        let Some(r) = self
+            .rows
+            .get(self.selected)
+            .filter(|r| r.priority.is_some())
+        else {
+            return;
+        };
+        let (id, w) = (
+            r.entry.id.clone(),
+            (r.weight as i64 + by).clamp(0, 99) as u32,
+        );
+        config::save_weight(&self.paths, &id, w);
+        self.say(format!("{id} weight {w}"));
+    }
+
     fn show_tab(&mut self, n: usize) {
         if n < self.tabs.len() {
             self.current = n;
@@ -439,6 +491,18 @@ impl App {
     fn save_form(&mut self, f: &Form) -> Result<(), String> {
         let (label, command) = (f.get("Label"), f.get("Command"));
         match &f.purpose {
+            Purpose::Model => {
+                let model = f.get("Model");
+                if !config::valid_model(&model) {
+                    return Err("A model is one word and doesn't start with -.".into());
+                }
+                config::set_model(&self.paths, &model);
+                self.say(if model.is_empty() {
+                    "Auto uses plain round-robin.".to_string()
+                } else {
+                    format!("Auto asks {model} which account to use.")
+                });
+            }
             Purpose::Edit(id) => {
                 if command.is_empty() {
                     return Err("The command can't be empty.".into());
@@ -598,6 +662,8 @@ impl App {
                     Button::Edit => self.start_edit(),
                     Button::Delete => self.start_delete(),
                     Button::Failover => config::set_failover(&self.paths, !self.failover),
+                    Button::Mode => self.toggle_mode(),
+                    Button::Auto => self.open_auto(),
                 }
                 return self.refresh();
             }
@@ -680,6 +746,77 @@ impl App {
     }
 
     // ── running CLIs ──────────────────────────────────────
+
+    /// Members an Auto launch may pick, in priority order: on, weight above 0, not limited.
+    fn auto_candidates(&self) -> Vec<(String, u32)> {
+        self.rows
+            .iter()
+            .filter(|r| r.priority.is_some() && r.on && r.weight > 0 && r.limited.is_none())
+            .map(|r| (r.entry.id.clone(), r.weight))
+            .collect()
+    }
+
+    /// Opens the next account by weighted round-robin, or the one the routing model picks.
+    pub fn open_auto(&mut self) {
+        if !self.wrr {
+            return self.say("Auto needs round-robin mode: press w.");
+        }
+        if self.deciding.is_some() {
+            return;
+        }
+        let cands = self.auto_candidates();
+        let Some((default, _)) = wrr::next(&cands, &wrr::load(&self.paths), None) else {
+            return self.say("No account is on, weighted above 0 and free.");
+        };
+        let model = config::model(&self.paths);
+        // the model runs on a Claude account that is free right now, the round-robin pick first
+        let dir = std::iter::once(&default)
+            .chain(cands.iter().map(|(m, _)| m))
+            .filter_map(|m| self.entry(m))
+            .find(|e| e.kind == Kind::Claude)
+            .map(|e| config::claude_dir(&self.paths, &e, self.base_config.as_deref()));
+        let (false, Some(dir)) = (model.is_empty(), dir) else {
+            return self.auto_open(&cands, &default);
+        };
+        let info: Vec<(String, u32, String)> = cands
+            .iter()
+            .map(|(m, w)| {
+                let usage = self
+                    .rows
+                    .iter()
+                    .find(|r| &r.entry.id == m)
+                    .map(|r| {
+                        r.usage
+                            .windows
+                            .iter()
+                            .map(|w| format!("{} {}%", w.label, w.percent))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or_else(|| "unknown".into());
+                (m.clone(), *w, usage)
+            })
+            .collect();
+        self.say(format!("Asking {model} which account to use…"));
+        self.deciding = Some(Deciding {
+            rx: wrr::spawn_decide(
+                model,
+                dir.to_string_lossy().into_owned(),
+                wrr::prompt(&info, &default),
+            ),
+            cands,
+            default,
+        });
+    }
+
+    fn auto_open(&mut self, cands: &[(String, u32)], pick: &str) {
+        if let Some((_, s)) = wrr::next(cands, &wrr::load(&self.paths), Some(pick)) {
+            wrr::save(&self.paths, &s);
+        }
+        self.open(pick);
+        self.say(format!("Auto → {}", self.label(pick)));
+    }
 
     /// Opens a new tab running the entry, with the args `ai-launcher` got the first time.
     pub fn open(&mut self, id: &str) {
@@ -788,6 +925,18 @@ impl App {
             self.say(format!("Update v{v}: npm i -g ai-launcher"));
             self.update = Some(v);
             self.update_rx = None;
+        }
+        // the model's answer; a dead thread counts as no answer
+        let reply = self.deciding.as_ref().and_then(|d| match d.rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(_) => Some(None),
+        });
+        if let Some(reply) = reply
+            && let Some(d) = self.deciding.take()
+        {
+            let pick = wrr::choose(reply.as_deref(), &d.cands, &d.default);
+            self.auto_open(&d.cands, &pick);
         }
         if self
             .flash
@@ -1222,6 +1371,112 @@ mod tests {
         click(&mut a, &hits, 1, 4); // Save
         assert!(a.modal.is_none());
         assert!(providers_text(&a).contains("x\ttrue\tx\n"));
+    }
+
+    /// `app()` plus claude accounts `x` and `y` (members: w, x, y in that order).
+    fn wrr_app() -> App {
+        let a = app();
+        for n in ["x", "y"] {
+            fs::create_dir_all(a.paths.cla_root.join(n)).unwrap();
+        }
+        // `true` instead of claude: Auto opens tabs, and tests must not start the real CLI
+        fs::write(&a.paths.providers, "claude\ttrue\tClaude Code\n").unwrap();
+        let mut a = App::with_paths(a.paths.clone(), vec![]);
+        a.value_flags = Some(vec![]);
+        a
+    }
+
+    #[test]
+    fn wrr_keys_and_candidates_skip_off_limited_and_zero_weight() {
+        let mut a = wrr_app();
+        key(&mut a, KeyCode::Char('w'));
+        assert!(a.wrr);
+        select(&mut a, "claude/w");
+        key(&mut a, KeyCode::Char('+'));
+        key(&mut a, KeyCode::Char('+'));
+        assert_eq!(config::weights(&a.paths), vec![("claude/w".into(), 3)]);
+        select(&mut a, "claude/x");
+        key(&mut a, KeyCode::Char('-'));
+        key(&mut a, KeyCode::Char('-'));
+        assert_eq!(a.rows[a.selected].weight, 0, "never below 0");
+        assert_eq!(
+            a.auto_candidates(),
+            vec![("claude/w".into(), 3), ("claude/y".into(), 1)]
+        );
+        config::mark_limited(&a.paths, "claude/w");
+        a.toggle_member("claude/y");
+        assert!(a.auto_candidates().is_empty());
+        a.open_auto();
+        assert!(a.tabs.is_empty());
+        let order = fs::read_to_string(&a.paths.fo_order).unwrap();
+        assert!(order.lines().all(|l| l.split('\t').count() == 2), "{order}");
+    }
+
+    #[test]
+    fn auto_opens_by_round_robin_and_keeps_state() {
+        let mut a = wrr_app();
+        a.open_auto();
+        assert!(a.tabs.is_empty(), "failover mode: Auto does nothing");
+        config::set_wrr(&a.paths, true);
+        config::save_weight(&a.paths, "claude/x", 0);
+        a.refresh();
+        for _ in 0..3 {
+            a.open_auto();
+        }
+        let opened: Vec<_> = a.tabs.iter().map(|t| t.member.as_str()).collect();
+        assert_eq!(opened, ["claude/w", "claude/y", "claude/w"]);
+        // a restart continues the rotation
+        let mut b = App::with_paths(a.paths.clone(), vec![]);
+        b.value_flags = Some(vec![]);
+        b.open_auto();
+        assert_eq!(b.tabs[0].member, "claude/y");
+    }
+
+    #[test]
+    fn model_reply_picks_or_falls_back_to_round_robin() {
+        let mut a = wrr_app();
+        config::set_wrr(&a.paths, true);
+        a.refresh();
+        let cands = a.auto_candidates();
+        for (reply, want) in [
+            (Some("claude/y\n"), "claude/y"),
+            (Some("no idea"), "claude/w"),
+            (None, "claude/w"),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(reply.map(str::to_string)).unwrap();
+            a.deciding = Some(Deciding {
+                rx,
+                cands: cands.clone(),
+                default: "claude/w".into(),
+            });
+            a.tick();
+            assert!(a.deciding.is_none());
+            assert_eq!(a.tabs.last().unwrap().member, want);
+        }
+        // a thread that died without answering counts as no answer
+        let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+        drop(tx);
+        a.deciding = Some(Deciding {
+            rx,
+            cands,
+            default: "claude/x".into(),
+        });
+        a.tick();
+        assert_eq!(a.tabs.last().unwrap().member, "claude/x");
+    }
+
+    #[test]
+    fn model_form_saves_and_clears_the_model() {
+        let mut a = app();
+        key(&mut a, KeyCode::Char('m'));
+        typed(&mut a, "haiku");
+        save(&mut a);
+        assert_eq!(config::model(&a.paths), "haiku");
+        key(&mut a, KeyCode::Char('m'));
+        a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        save(&mut a);
+        assert!(config::model(&a.paths).is_empty());
     }
 
     #[test]

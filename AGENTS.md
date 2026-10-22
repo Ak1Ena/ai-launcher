@@ -30,13 +30,13 @@ A bash command-line tool. `bin/ai` shows a picker of coding-agent CLIs with plan
 
 - **Picker row:** `<provider> TAB <id> TAB <shown text>`, printed with `_ai_row`. On selection, `ai` calls `_ai_<provider>_run <id> [args]` if it exists, otherwise `_ai_exec "<saved command>"`.
 - **`_ai_choose` output:** `<action>\n<row>`, where action is empty (launch), `team`, `add`, `edit`, `delete`, `failover` or `order`. A third arg `keys` is the main picker, and `order` is the failover priority screen, whose actions are empty (back), `up`, `down`, `toggle`, `clear` or `failover`. It returns non-zero on cancel. The fzf and menu versions must behave the same.
-- **Failover files:** order file `failover` next to the providers file (`$AI_FO_ORDER`, lines `member<TAB>on|off`), flag file `failover.on` beside it (failover is on only with the flag and jq), and state dir `$AI_FO_STATE` (`limited/<member>` marks by mtime, `handoff.<pid>.json`). Members are `claude/<account>` for each cla account, or the name of a provider that runs claude or codex. Not used in team mode.
+- **Failover files:** order file `failover` next to the providers file (`$AI_FO_ORDER`, lines `member<TAB>on|off`), flag file `failover.on` beside it (failover is on only with the flag and jq), and state dir `$AI_FO_STATE` (`limited/<member>` marks by mtime, `handoff.<pid>.json`). Members are `claude/<account>` for each cla account, or the name of a provider that runs claude or codex. Not used in team mode. The TUI also keeps `<$AI_FO_ORDER>.mode` (`wrr` or `failover`), `.weights` (`member<TAB>weight`), `.model` (one model name) and `$AI_FO_STATE/wrr` (`member<TAB>score`, smooth weighted round-robin state). These are TUI-only: bash must ignore them and must never break when they are present.
 - **Plugin hooks:** `_ai_<name>_rows` (optional, prints rows, only called when jq exists) and `_ai_<name>_run <id> [args]` (optional). `<name>` matches a provider name in the providers file.
 - **Providers file:** `~/.config/ai-launcher/providers` (override with `$AI_PROVIDERS`), with lines `name<TAB>command<TAB>label`. Only `_ai_put` writes it, and it keeps line order.
 - **Launch commands:** the saved string is the user's own config, so it runs through `bash -c` like a shell alias, with extra args passed as `"$@"`.
 - **Trust hooks:** `_ai_trust_<name>_has <dir>` and `_ai_trust_<name>_add <dir>`. `<dir>` is the resolved path (`pwd -P`), because agents store `getcwd()`.
 
-- **TUI shares config:** `tui/` must keep reading and writing the same files and formats as the bash tool (providers file, failover order and flag, limited marks, handoff files), so both stay usable together.
+- **TUI shares config:** `tui/` must keep reading and writing the same files and formats as the bash tool (providers file, failover order and flag, limited marks, handoff files), so both stay usable together. New TUI-only state goes in new files beside these, never in new columns of the shared files.
 
 ## Bash 3.2 rules
 
@@ -56,7 +56,7 @@ Use `date +%s` for the current time. Use `${arr[@]+"${arr[@]}"}` to expand array
 
 - **Never lose user config.** Edit other tools' JSON only through `_ai_json_edit`. It writes to a temp file, checks the result is non-empty, then writes back in place to keep permissions. Change only the one key you need.
 - **Never widen trust beyond the exact folder,** and never override an explicit untrusted choice (`DO_NOT_TRUST`, `trust_level = "untrusted"`).
-- **No network calls.** Usage must come from local files the agents already write.
+- **No network calls.** Usage must come from local files the agents already write. Two exceptions: the update notice (bash and TUI) runs `npm view ai-launcher version` at most once a day into the shared `<state>/ai-launcher/update-check` cache, off with `AI_LAUNCHER_NO_UPDATE_CHECK=1`, and the TUI's opt-in Auto decision model (`.model` file) runs the user's own `claude -p --model <m>` on a background thread with a 20 second timeout, falling back to round-robin. Never add a third.
 - **Portable.** Guard optional or OS-specific commands with `has <cmd>`: fzf, jq, tmux, `caffeinate`, `security`. For dates use `date -r` with a `date -d @` fallback. Don't use `stat` (its flags differ between macOS and Linux).
 - **Rows run in parallel** (background jobs in `_ai_rows`). Row functions must not prompt, and must finish quickly even when files are missing.
 - **Windows (Git Bash):**

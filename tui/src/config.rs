@@ -270,10 +270,110 @@ pub fn save_order(paths: &Paths, order: &[(String, bool)]) {
     let _ = fs::write(&paths.fo_order, text);
 }
 
-fn on_flag(paths: &Paths) -> PathBuf {
+/// A file beside the order file: `<failover>.on`, `.mode`, `.weights`, `.model`.
+fn beside(paths: &Paths, ext: &str) -> PathBuf {
     let mut p = paths.fo_order.clone().into_os_string();
-    p.push(".on");
+    p.push(ext);
     PathBuf::from(p)
+}
+
+fn on_flag(paths: &Paths) -> PathBuf {
+    beside(paths, ".on")
+}
+
+fn write_beside(paths: &Paths, ext: &str, text: &str) {
+    let f = beside(paths, ext);
+    if let Some(dir) = f.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(f, text);
+}
+
+// ── routing (TUI only, bash ignores these files) ──
+
+/// True in weighted round-robin mode; anything but `wrr` in the mode file is failover.
+pub fn parse_wrr(text: &str) -> bool {
+    text.trim() == "wrr"
+}
+
+pub fn wrr_on(paths: &Paths) -> bool {
+    parse_wrr(&fs::read_to_string(beside(paths, ".mode")).unwrap_or_default())
+}
+
+pub fn set_wrr(paths: &Paths, on: bool) {
+    write_beside(paths, ".mode", if on { "wrr\n" } else { "failover\n" });
+}
+
+/// `member<TAB>weight` lines; bad lines are skipped.
+pub fn parse_weights(text: &str) -> Vec<(String, u32)> {
+    text.lines()
+        .filter_map(|l| {
+            let (m, w) = l.split_once('\t')?;
+            Some((m.to_string(), w.trim().parse().ok()?))
+        })
+        .filter(|(m, _)| !m.is_empty())
+        .collect()
+}
+
+pub fn weights(paths: &Paths) -> Vec<(String, u32)> {
+    parse_weights(&fs::read_to_string(beside(paths, ".weights")).unwrap_or_default())
+}
+
+/// A member's weight, 1 when it has none saved.
+pub fn weight_of(weights: &[(String, u32)], id: &str) -> u32 {
+    weights.iter().find(|(m, _)| m == id).map_or(1, |(_, w)| *w)
+}
+
+/// Sets one member's weight in place (or appends it); other lines are kept.
+pub fn save_weight(paths: &Paths, id: &str, weight: u32) {
+    let saved = fs::read_to_string(beside(paths, ".weights")).unwrap_or_default();
+    write_beside(paths, ".weights", &set_weight_line(&saved, id, weight));
+}
+
+pub fn set_weight_line(saved: &str, id: &str, weight: u32) -> String {
+    let mut done = false;
+    let mut text = String::new();
+    for line in saved.lines().filter(|l| !l.trim().is_empty()) {
+        if line.split('\t').next() == Some(id) {
+            if done {
+                continue;
+            }
+            done = true;
+            text.push_str(&format!("{id}\t{weight}\n"));
+        } else {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    if !done {
+        text.push_str(&format!("{id}\t{weight}\n"));
+    }
+    text
+}
+
+/// A model name is one word that can't be read as a `claude` option.
+pub fn valid_model(m: &str) -> bool {
+    !m.starts_with('-') && !m.contains(char::is_whitespace)
+}
+
+/// The model that picks the account for an Auto launch; empty means plain round-robin.
+pub fn model(paths: &Paths) -> String {
+    let m = fs::read_to_string(beside(paths, ".model"))
+        .unwrap_or_default()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if valid_model(&m) { m } else { String::new() }
+}
+
+pub fn set_model(paths: &Paths, model: &str) {
+    if model.is_empty() {
+        let _ = fs::remove_file(beside(paths, ".model"));
+    } else {
+        write_beside(paths, ".model", &format!("{model}\n"));
+    }
 }
 
 pub fn failover_on(paths: &Paths) -> bool {
@@ -616,6 +716,42 @@ mod tests {
         assert_eq!(
             add_login_dir(&p, "work", "codex"),
             Some(p.ai_accounts.join("codex/work"))
+        );
+    }
+
+    #[test]
+    fn mode_weights_and_model_files() {
+        assert!(parse_wrr("wrr\n") && !parse_wrr("failover") && !parse_wrr("junk"));
+        assert_eq!(
+            parse_weights("a\t3\nb\tx\nc\t0\nnotab\n\t2\n"),
+            vec![("a".into(), 3), ("c".into(), 0)]
+        );
+        let ws = parse_weights("a\t3\n");
+        assert_eq!((weight_of(&ws, "a"), weight_of(&ws, "z")), (3, 1));
+        assert_eq!(
+            set_weight_line("a\t3\ngone\t2\n", "a", 5),
+            "a\t5\ngone\t2\n"
+        );
+        assert_eq!(set_weight_line("a\t3\n", "b", 0), "a\t3\nb\t0\n");
+
+        let p = tmp_paths("route");
+        assert!(!wrr_on(&p) && model(&p).is_empty());
+        set_wrr(&p, true);
+        save_weight(&p, "claude/a", 2);
+        set_model(&p, "haiku");
+        assert!(wrr_on(&p));
+        assert_eq!(weights(&p), vec![("claude/a".into(), 2)]);
+        assert_eq!(model(&p), "haiku");
+        set_wrr(&p, false);
+        set_model(&p, "");
+        assert!(!wrr_on(&p) && model(&p).is_empty());
+        set_model(&p, "--dangerously-skip-permissions");
+        assert!(model(&p).is_empty(), "an option is not a model");
+        assert!(valid_model("opus[1m]") && !valid_model("a b"));
+        set_model(&p, "");
+        assert!(
+            !p.fo_order.exists(),
+            "the order file bash reads is untouched"
         );
     }
 

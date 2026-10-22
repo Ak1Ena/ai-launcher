@@ -9,6 +9,7 @@ mod pane;
 mod ui;
 mod update;
 mod usage;
+mod wrr;
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,

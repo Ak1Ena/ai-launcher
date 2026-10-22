@@ -37,11 +37,19 @@ It reads and writes the same config as the bash `ai` (providers file, failover o
 | `shift-up` `shift-down` / `K` `J` | change the order (top is tried first) |
 | `space` | turn the account's failover on / off (or click its `● on` / `○ off` switch); an off account is skipped when a limit hits |
 | `f` | failover on / off |
+| `w` | switch between failover and weighted round-robin |
+| `+` `-` | round-robin: raise / lower the account's weight (0 to 99, default 1; 0 is never picked) |
+| `n` | round-robin: open the next account (or click `▶ Auto`) |
+| `m` | set the Auto decision model |
 | `r` | clear the account's limit |
 | `x` | close tab |
 | `1`-`9` | go to tab n |
 | `tab` | next tab |
 | `q` / `ctrl-c` | quit |
+
+Routing mode (`w`, or click the mode label in the title bar) is saved in `<failover file>.mode`. In failover mode the list is a priority order. In round-robin mode each account shows `×weight`, and `n` (or `▶ Auto`) opens the next account in a new tab by smooth weighted round-robin: with weights 3 and 1 you get A A B A A A B A. Accounts that are off, weight 0 or limited are skipped. Weights are saved in `<failover file>.weights` and the rotation in `$AI_FO_STATE/wrr`, so it continues after a restart.
+
+Optionally let a model choose instead: press `m` and enter a model name (for example `haiku`; empty means plain round-robin). Auto then runs `claude -p --model <model>` on one of your free Claude accounts, with each account's weight and usage, in the background (20 second timeout, the UI keeps working). If it fails, times out or answers with anything but an account name, the round-robin pick is used. The model name is saved in `<failover file>.model`. This is the only thing the tool asks a model; it uses your own `claude` login and counts against its plan. Bash `ai` ignores these files.
 
 In the add form, a Claude account opens its login in a tab. A Codex or Gemini login gets its own login folder when another one of that CLI exists. Other CLI runs any command you type.
 
@@ -62,6 +70,8 @@ On macOS, alt (⌥) keys need "Option as Meta" turned on in the terminal setting
 | click an account | select it; click it again to open it |
 | `+ Add` / `✎ Edit` / `✕ Delete` | add, edit or delete the selected account |
 | Failover switch (title bar) | failover on / off |
+| Mode label (title bar) | failover / round-robin |
+| `▶ Auto` (round-robin mode) | open the next account |
 | wheel | scroll a CLI's output (unless the CLI uses the mouse itself) |
 
 In a tab, every key goes to the CLI except these:
@@ -136,6 +146,8 @@ Usage shows up after your next Claude reply. It is only reported on Pro and Max 
 ai                 # pick an agent and start it here
 ai --resume        # extra arguments go to the agent
 ```
+
+When a newer version is on npm, the picker shows an `update X available` line. It reads the same once-a-day cache as the TUI (refreshed in the background with `npm view`, only when npm exists). Set `AI_LAUNCHER_NO_UPDATE_CHECK=1` to turn it off.
 
 | With fzf | Without fzf | What it does |
 | --- | --- | --- |

@@ -31,6 +31,10 @@ pub enum Button {
     Edit,
     Delete,
     Failover,
+    /// failover / weighted round-robin
+    Mode,
+    /// open the next account by round-robin
+    Auto,
 }
 
 /// Where clickable things were drawn this frame.
@@ -171,11 +175,28 @@ fn title_bar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     f.render_widget(Paragraph::new(switch).style(sw_style), sw_rect);
     hits.buttons.push((sw_rect, Button::Failover));
 
-    let mut limit = sw_rect.x;
+    let mode = if app.wrr {
+        " ⚖ round-robin "
+    } else {
+        " ⇢ failover "
+    };
+    let mw = mode.chars().count() as u16;
+    let mode_rect = Rect {
+        x: sw_rect.x.saturating_sub(mw + 1),
+        width: mw,
+        ..area
+    };
+    f.render_widget(
+        Paragraph::new(mode).style(Style::new().fg(Color::White).bg(RAISED)),
+        mode_rect,
+    );
+    hits.buttons.push((mode_rect, Button::Mode));
+
+    let mut limit = mode_rect.x;
     if let Some(v) = &app.update {
         let pill = format!(" ↑ v{v} available · npm i -g ai-launcher ");
         let pw = pill.chars().count() as u16;
-        if let Some(px) = sw_rect.x.checked_sub(pw + 1) {
+        if let Some(px) = mode_rect.x.checked_sub(pw + 1) {
             let r = Rect {
                 x: px,
                 width: pw,
@@ -262,7 +283,14 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         ));
     };
     if app.rows.iter().any(|r| r.priority.is_some()) {
-        header(&mut lines, "FAILOVER ORDER  ·  top is tried first");
+        header(
+            &mut lines,
+            if app.wrr {
+                "ROUND-ROBIN  ·  ×weight  ·  n opens next"
+            } else {
+                "FAILOVER ORDER  ·  top is tried first"
+            },
+        );
     }
     let mut others = false;
     for (i, r) in app.rows.iter().enumerate() {
@@ -323,11 +351,20 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
 
     let mut x = buttons.x;
     let y = buttons.y + 1;
-    for (label, b) in [
+    let auto = if app.deciding.is_some() {
+        " ⋯ asking "
+    } else {
+        " ▶ Auto "
+    };
+    let mut buttons = vec![
         (" + Add ", Button::Add),
         (" ✎ Edit ", Button::Edit),
         (" ✕ Delete ", Button::Delete),
-    ] {
+    ];
+    if app.wrr {
+        buttons.push((auto, Button::Auto));
+    }
+    for (label, b) in buttons {
         let w = label.chars().count() as u16;
         let r = Rect {
             x,
@@ -395,13 +432,21 @@ fn row_lines(
         Some(_) => Some(Span::styled(" ○ off ", Style::new().fg(MUTED).bg(RAISED))),
         None => None,
     };
+    let weight = (app.wrr && r.priority.is_some()).then(|| {
+        Span::styled(
+            format!("×{} ", r.weight),
+            s(if r.weight == 0 || off { FAINT } else { MUTED }),
+        )
+    });
     let used = 5
         + name.chars().count()
         + if running { 2 } else { 0 }
+        + weight.as_ref().map_or(0, |w| w.content.chars().count())
         + right.as_ref().map_or(0, |_| SWITCH_W as usize);
     top.push(Span::raw(
         " ".repeat((width as usize).saturating_sub(used + 1)),
     ));
+    top.extend(weight);
     top.extend(right);
 
     let mut bottom = vec![bar, Span::raw("    ")];
@@ -523,6 +568,16 @@ fn welcome(f: &mut Frame, area: Rect) {
             d("skip   "),
             cap("r"),
             d("clear a limit"),
+        ]),
+        Line::from(vec![
+            cap("w"),
+            d("failover / weighted round-robin   "),
+            cap("n"),
+            d("open next   "),
+            cap("+-"),
+            d("weight   "),
+            cap("m"),
+            d("model"),
         ]),
     ];
     let r = centered(area, 80, lines.len() as u16);
@@ -809,7 +864,7 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("  keys go to the CLI · click a tab or the list", s(FAINT)),
         ]
     } else {
-        vec![
+        let mut spans = vec![
             cap("enter"),
             d("open"),
             cap("a"),
@@ -824,13 +879,28 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
             d("skip"),
             cap("f"),
             d("failover"),
+            cap("w"),
+            d("mode"),
+        ];
+        if app.wrr {
+            spans.extend([
+                cap("n"),
+                d("auto"),
+                cap("+-"),
+                d("weight"),
+                cap("m"),
+                d("model"),
+            ]);
+        }
+        spans.extend([
             cap("r"),
             d("clear limit"),
             cap("x"),
             d("close tab"),
             cap("q"),
             d("quit"),
-        ]
+        ]);
+        spans
     };
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }

@@ -194,4 +194,22 @@ ok "small handoff keeps its first line"   '[ "$(_fo_handoff "$T/small.jsonl" | h
 ok "provider dir falls back to start dir" '[ "$(FO_BASE_CFG=/x/base _fo_claude_dir nosuch)" = /x/base ]'
 ok "windows: failover stays off"          '( uname() { echo MINGW64_NT-10.0; }; : > "$AI_FO_ORDER.on"; ! _fo_on && ! _ai_failover on >/dev/null 2>&1 )'
 
+# ── update notice ──
+AI_HOME=$REPO; cur=$(sed -n 's/^version *= *"\(.*\)".*/\1/p' "$REPO/tui/Cargo.toml" | head -1)
+uc=$(dirname "$AI_FO_STATE")/update-check; mkdir -p "$(dirname "$uc")"
+mkdir -p "$T/nonpm"; npm() { echo "network used" > "$T/npm.called"; }   # a stub: any call is a test failure
+setc() { printf '%s\t%s\n' "${2:-$now}" "$1" > "$uc"; }
+setc 99.0.0;   ok "update: newer cached -> notice"       'case $(_ai_update_notice) in *"update 99.0.0 available"*) true;; *) false;; esac'
+setc "$cur";   ok "update: equal -> hidden"              '[ -z "$(_ai_update_notice)" ]'
+setc 0.0.1;    ok "update: older -> hidden"              '[ -z "$(_ai_update_notice)" ]'
+setc 99.0.0-rc1; ok "update: prerelease of newer major shows" '[ -n "$(_ai_update_notice)" ]'
+setc "$cur-rc1"; ok "update: prerelease below release hidden" '[ -z "$(_ai_update_notice)" ]'
+setc garbage;  ok "update: garbage -> hidden"            '[ -z "$(_ai_update_notice)" ]'
+setc 99.0.0;   ok "update: off switch"                   '[ -z "$(AI_LAUNCHER_NO_UPDATE_CHECK=1 _ai_update_notice)" ]'
+ok "update: fresh cache never calls npm"                 '[ ! -e "$T/npm.called" ]'
+setc 99.0.0 $((now - 90000)); _ai_update_notice >/dev/null; sleep 1
+ok "update: stale cache shows nothing, refreshes in background" '[ -e "$T/npm.called" ] && [ -z "$(_ai_update_notice)" ]'
+unset -f npm; rm -f "$uc"
+ok "update: no cache, no npm -> silent"                  '[ -z "$(PATH=$T/nonpm:/usr/bin:/bin _ai_update_notice)" ] && [ ! -e "$uc" ]'
+
 echo; if [ $fails -gt 0 ]; then echo "$fails failed"; exit 1; else echo "all passed"; fi

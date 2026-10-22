@@ -33,6 +33,45 @@ _ai_account_dir() {
   [ -n "$(_ai_account_env "$a")" ] && [ -d "$AI_ACCOUNTS/$a/$1" ] && echo "$AI_ACCOUNTS/$a/$1"
 }
 
+# ── update notice: shares the TUI's cache `<state>/ai-launcher/update-check` (`<secs>\t<version>`, 24h) ──
+# "major minor patch release" for x.y.z[-pre] (release=1, prerelease=0); fails on anything else
+_ai_semver() {
+  local v=${1#v} core pre=1
+  case $v in *-*) core=${v%%-*}; pre=0 ;; *) core=$v ;; esac
+  case $core in *[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+  local IFS=.; set -- $core
+  [ $# = 3 ] && echo "$1 $2 $3 $pre"
+}
+# true when $1 is a strictly newer release than $2
+_ai_is_newer() {
+  local a b; a=$(_ai_semver "$1") && b=$(_ai_semver "$2") || return 1
+  set -- $a $b
+  local i x y
+  for i in 1 2 3 4; do
+    eval "x=\${$i} y=\${$((i + 4))}"
+    [ "$x" -gt "$y" ] && return 0; [ "$x" -lt "$y" ] && return 1
+  done
+  return 1
+}
+# prints the notice line when a newer release is cached; refreshes a stale cache in the background
+_ai_update_notice() {
+  [ -n "${AI_LAUNCHER_NO_UPDATE_CHECK:-}" ] && return 0
+  local cur t v now cache
+  cur=$(sed -n 's/^version *= *"\(.*\)".*/\1/p' "${AI_HOME:-/nonexistent}/tui/Cargo.toml" 2>/dev/null | head -1)
+  [ -n "$cur" ] || return 0
+  cache=$(dirname "${AI_FO_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ai-launcher/failover}")/update-check
+  now=$(date +%s)
+  t=; v=; [ -r "$cache" ] && IFS=$'\t' read -r t v < "$cache"
+  case $t in ''|*[!0-9]*) t=0 ;; esac
+  if [ $((now - t)) -ge 86400 ] && has npm; then
+    ( { v=$(npm view ai-launcher version </dev/null 2>/dev/null) && _ai_semver "$v" >/dev/null &&
+        mkdir -p "$(dirname "$cache")" && printf '%s\t%s\n' "$now" "$v" > "$cache"; } >/dev/null 2>&1 & )
+  elif [ $((now - t)) -lt 86400 ] && _ai_is_newer "$v" "$cur"; then
+    echo "update $v available · npm i -g ai-launcher"
+  fi
+  return 0
+}
+
 ai_main() {
   case ${1:-} in
     ls|add|edit|rm|failover) local sub=$1; shift; "_ai_$sub" "$@"; return ;;
@@ -42,6 +81,7 @@ ai_main() {
   esac
   local out key row name id
   while :; do
+    AI_NOTICE=$(_ai_update_notice)
     _ai_seed
     [ -s "$AI_PROVIDERS" ] || { echo "no providers. add one: ai add <name> [command]"; return 1; }
     out=$(_ai_choose " ✻ AI agents · failover $(_fo_state) " \
@@ -217,7 +257,7 @@ _ai_fzf() {
   esac
   out=$(fzf --ansi --delimiter="$TAB" --with-nth=3 --height=~16 --reverse --border=rounded \
       --border-label="$1" --prompt='  ' --pointer='▶' --info=hidden --no-scrollbar \
-      --header=$'\033[2m'"$2"$'\033[0m' \
+      --header=$'\033[2m'"$2"${AI_NOTICE:+$'\n\033[38;5;173m'"$AI_NOTICE"}$'\033[0m' \
       --color='border:#d97757,label:#d97757:bold,pointer:#d97757,prompt:#d97757,hl:#d97757,hl+:#d97757' \
       ${extra[@]+"${extra[@]}"} <<<"$4") || return 1
   [ -n "${3:-}" ] || { printf '\n%s\n' "$out"; return; }
@@ -233,7 +273,9 @@ _ai_menu() {
   local rows=() line i=0 ans act n mode=${3:-}
   while IFS= read -r line; do [ -n "$line" ] && rows+=("$line"); done <<<"$4"
   {
-    printf '\n  \033[1;38;5;173m%s\033[0m\n\n' "$1"
+    printf '\n  \033[1;38;5;173m%s\033[0m\n' "$1"
+    [ -n "${AI_NOTICE:-}" ] && printf '  \033[38;5;173m%s\033[0m\n' "$AI_NOTICE"
+    printf '\n'
     for line in ${rows[@]+"${rows[@]}"}; do
       i=$((i + 1)); printf '  \033[2m%2d\033[0m  %s\n' $i "${line#*"$TAB"*"$TAB"}"
     done

@@ -73,6 +73,8 @@ impl Field {
 pub enum Purpose {
     Add,
     Edit(String),
+    /// the model that picks the account for an Auto launch
+    Model,
 }
 
 pub struct Form {
@@ -126,6 +128,21 @@ impl Form {
                 Field::text("Command", command, hint),
             ],
             focus: 1,
+            error: None,
+            auto: (true, true),
+        }
+    }
+
+    pub fn model(current: &str) -> Form {
+        Form {
+            title: "Auto launch model".into(),
+            purpose: Purpose::Model,
+            fields: vec![Field::text(
+                "Model",
+                current,
+                "e.g. haiku · empty = plain round-robin",
+            )],
+            focus: 0,
             error: None,
             auto: (true, true),
         }
