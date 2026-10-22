@@ -35,7 +35,7 @@ It reads and writes the same config as the bash `ai` (providers file, failover o
 | `e` | edit the selected account |
 | `d` | delete the selected account |
 | `shift-up` `shift-down` / `K` `J` | change the order (top is tried first) |
-| `space` | leave an account out / back in |
+| `space` | turn the account's failover on / off (or click its `● on` / `○ off` switch); an off account is skipped when a limit hits |
 | `f` | failover on / off |
 | `r` | clear the account's limit |
 | `x` | close tab |

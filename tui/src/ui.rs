@@ -23,6 +23,7 @@ const GOOD: Color = Color::Rgb(0x7d, 0xc9, 0x7d);
 const WARN: Color = Color::Rgb(0xe5, 0xc0, 0x7b);
 const BAD: Color = Color::Rgb(0xe0, 0x6c, 0x75);
 pub const SIDEBAR: u16 = 44;
+const SWITCH_W: u16 = 7;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Button {
@@ -39,6 +40,8 @@ pub struct Hits {
     pub tabs: Vec<(Rect, usize)>,
     pub closes: Vec<(Rect, usize)>,
     pub buttons: Vec<(Rect, Button)>,
+    /// each failover member's on/off switch, by row
+    pub switches: Vec<(Rect, usize)>,
     /// form fields by index; `fields.len()` is the Save button
     pub fields: Vec<(Rect, usize)>,
     pub pane: Rect,
@@ -302,6 +305,18 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         };
         f.render_widget(Paragraph::new(line).style(Style::new().bg(bg)), r);
         if let Some(i) = row {
+            // the first line of a member's row carries its switch
+            if !hits.rows.iter().any(|(_, j)| *j == i) && app.rows[i].priority.is_some() {
+                let x = (r.x + r.width).saturating_sub(SWITCH_W + 1);
+                hits.switches.push((
+                    Rect {
+                        x,
+                        width: SWITCH_W,
+                        ..r
+                    },
+                    i,
+                ));
+            }
             hits.rows.push((r, i));
         }
     }
@@ -365,16 +380,25 @@ fn row_lines(
         s(Color::White).add_modifier(Modifier::BOLD)
     };
     let mut top = vec![bar.clone(), num, Span::styled(name.clone(), name_style)];
-    let right = if running {
-        Some(Span::styled("● running", s(GOOD)))
-    } else if off {
-        Some(Span::styled("off", s(FAINT)))
-    } else if r.priority.is_some() {
-        Some(Span::styled("on", s(GOOD)))
-    } else {
-        None
+    if running {
+        top.push(Span::styled(" ●", s(GOOD)));
+    }
+    // the account's own failover switch (space or a click); `SWITCH_W` wide, at the right edge
+    let right = match r.priority {
+        Some(_) if r.on => Some(Span::styled(
+            " ● on  ",
+            Style::new()
+                .fg(Color::Black)
+                .bg(GOOD)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Some(_) => Some(Span::styled(" ○ off ", Style::new().fg(MUTED).bg(RAISED))),
+        None => None,
     };
-    let used = 5 + name.chars().count() + right.as_ref().map_or(0, |s| s.content.chars().count());
+    let used = 5
+        + name.chars().count()
+        + if running { 2 } else { 0 }
+        + right.as_ref().map_or(0, |_| SWITCH_W as usize);
     top.push(Span::raw(
         " ".repeat((width as usize).saturating_sub(used + 1)),
     ));

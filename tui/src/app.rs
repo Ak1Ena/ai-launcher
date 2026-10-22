@@ -276,11 +276,7 @@ impl App {
             }
             KeyCode::Char(' ') => {
                 if let Some(id) = id {
-                    let mut o = self.order();
-                    if let Some(m) = o.iter_mut().find(|(m, _)| *m == id) {
-                        m.1 = !m.1;
-                        config::save_order(&self.paths, &o);
-                    }
+                    self.toggle_member(&id);
                 }
             }
             KeyCode::Char('f') => config::set_failover(&self.paths, !self.failover),
@@ -348,6 +344,22 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Turns one account on or off for failover. Off accounts stay in the list but are skipped.
+    fn toggle_member(&mut self, id: &str) {
+        let mut o = self.order();
+        if let Some(m) = o.iter_mut().find(|(m, _)| m == id) {
+            m.1 = !m.1;
+            let state = if m.1 {
+                "on"
+            } else {
+                "off: skipped when a limit hits"
+            };
+            config::save_order(&self.paths, &o);
+            self.say(format!("{id} {state}"));
+        }
+        self.refresh();
     }
 
     fn show_tab(&mut self, n: usize) {
@@ -588,6 +600,13 @@ impl App {
                     Button::Failover => config::set_failover(&self.paths, !self.failover),
                 }
                 return self.refresh();
+            }
+            if let Some((_, i)) = hits.switches.iter().find(|(r, _)| inside(r)) {
+                self.selected = *i;
+                if let Some(id) = self.rows.get(*i).map(|r| r.entry.id.clone()) {
+                    self.toggle_member(&id);
+                }
+                return;
             }
             if let Some((_, i)) = hits.rows.iter().find(|(r, _)| inside(r)) {
                 // one click selects, a second on the same row within 500 ms opens it
@@ -1167,6 +1186,24 @@ mod tests {
         assert!(a.failover);
         click(&mut a, &hits, 1, 5);
         assert!(!a.failover);
+    }
+
+    #[test]
+    fn click_account_switch_turns_it_off_and_on() {
+        let mut a = app();
+        let i = a.rows.iter().position(|r| r.priority.is_some()).unwrap();
+        let id = a.rows[i].entry.id.clone();
+        let hits = Hits {
+            switches: vec![(r(3), i)],
+            ..Hits::default()
+        };
+        assert!(a.rows[i].on);
+        click(&mut a, &hits, 1, 3);
+        let row = a.rows.iter().find(|r| r.entry.id == id).unwrap();
+        assert!(!row.on, "one click turns it off");
+        assert!(a.tabs.is_empty(), "the switch never opens the account");
+        click(&mut a, &hits, 1, 3);
+        assert!(a.rows.iter().find(|r| r.entry.id == id).unwrap().on);
     }
 
     #[test]
