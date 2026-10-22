@@ -40,7 +40,7 @@ Open a new terminal and type `ai`.
 | Tool | Adds | Built into |
 | --- | --- | --- |
 | [fzf](https://github.com/junegunn/fzf) | Arrow-key picker with search. Without it you get a numbered menu. | — |
-| [jq](https://jqlang.org) | Usage bars and shared folder trust | macOS 15+ |
+| [jq](https://jqlang.org) | Usage bars, shared folder trust and failover | macOS 15+ |
 | tmux | Claude team mode (`ctrl-t`, `cla-team`). Not on native Windows. | — |
 
 ```bash
@@ -83,6 +83,8 @@ ai --resume        # extra arguments go to the agent
 | `ctrl-a` | `a` | Add an agent |
 | `ctrl-e` | `e 2` | Edit the selected agent |
 | `ctrl-x` | `x 2` | Delete the selected agent |
+| `ctrl-f` | `f` | Turn failover on or off |
+| `ctrl-o` | `o` | Open the failover priority screen |
 
 ### Manage agents
 
@@ -122,6 +124,38 @@ ai add personal codex "Codex personal"   # codex is already listed, so this is a
 Start it from `ai` and log in. Each one gets its own row with its own usage bars (Codex). Logins live in `~/.ai-accounts/<cli>/<name>`, which the CLI gets as `CODEX_HOME` or `GEMINI_CLI_HOME`. Set `AI_ACCOUNTS` to use another folder. A new login starts with fresh settings: nothing is copied from the main one. `ai rm` keeps the folder, so adding the same name again gets the same login back.
 
 Antigravity (`agy`) can't have several accounts yet: it always reads `~/.gemini/antigravity-cli` and has no setting to move it.
+
+### Failover
+
+When a Claude account hits its usage limit, the same session resumes on the next account in your priority order. Codex has no limit hook, so it only gets a written handoff of the session, and the session ends there: accounts below Codex in the order are not tried. New Codex accounts start at the bottom. Failover is off until you turn it on.
+
+```bash
+ai failover on     # or ctrl-f in the picker
+ai failover off
+ai failover ls     # members in order, with any limit still running
+```
+
+Set the priority with `ai failover` (or `ctrl-o` in the picker). On that screen:
+
+| With fzf | Without fzf | What it does |
+| --- | --- | --- |
+| `ctrl-u` / `ctrl-d` | `u 2` / `d 2` | Move the member up / down |
+| `ctrl-x` | `x 2` | Turn the member on / off |
+| `ctrl-r` | `r 2` | Clear its limit |
+| `ctrl-f` | `f` | Turn failover on / off |
+
+```bash
+ai failover order claude/work claude/personal codex   # put these first, in this order
+ai failover clear claude/work                         # forget a limit (no name = all)
+```
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `AI_FO_COOLDOWN` | `18000` | Seconds an account is skipped after it hits its limit |
+| `AI_FO_STATE` | `${XDG_STATE_HOME:-~/.local/state}/ai-launcher/failover` | Where limit marks are kept |
+| `AI_FO_PROMPT` | "...Continue the work exactly where you left off." | First message sent to the new account |
+
+Needs jq. Not used in team mode. Limits: the cooldown is fixed, not the real reset time (use `ctrl-r` if the limit ended sooner). Codex can't trigger a failover, so put it last. Not available on native Windows (Git Bash yet); use WSL.
 
 ## How it works
 

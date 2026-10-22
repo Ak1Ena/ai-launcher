@@ -1,0 +1,5 @@
+{
+  "name": "ai-launcher-failover",
+  "version": "0.1.0",
+  "description": "When a Claude Code turn stops on a rate limit, hand the session to ai-launcher so it resumes on the next account."
+}

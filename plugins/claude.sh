@@ -56,6 +56,8 @@ cla_main() {
       [ -d "$root/$1" ] || { echo "no account '$1'. run: cla add $1"; return 1; }
       dir=$root/$1; shift
       _ai_trust_share "$PWD"; _cla_trust_sync "$dir"
+      # before CLAUDE_CONFIG_DIR is set: failover keeps the folder ai started with for other providers
+      if [ "${1:-}" != team ] && _fo_on; then _fo_run "claude/${dir##*/}" "$@"; return; fi
       CLAUDE_CONFIG_DIR=$(native_path "$dir"); export CLAUDE_CONFIG_DIR
       if [ "${1:-}" = team ]; then shift; _cla_team "$@"
       else _ai_exec "$(_ai_cmd claude claude)" "$@"; fi ;;

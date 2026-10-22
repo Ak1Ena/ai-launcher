@@ -15,6 +15,8 @@ A bash command-line tool. `bin/ai` shows a picker of coding-agent CLIs with plan
 | `bin/ai` | Entry point. Finds the repo by following symlinks, sources `lib/` and `plugins/`, calls `ai_main`. |
 | `lib/core.sh` | `ai_main` and its subcommands, the providers file, rows and bars, the picker (fzf or numbered menu), and launching (`_ai_exec`). |
 | `lib/trust.sh` | Shared folder trust. One `_has` / `_add` pair per agent, listed in `AI_TRUST`. |
+| `lib/failover.sh` | Failover: `ai failover` commands, priority screen, and `_fo_run` (relaunches the session on the next account after a limit). |
+| `mods/failover/` | Claude Code mod. Its `classic.StopFailure` hook, on `rate_limit`, writes `$AI_FO_HANDOFF` and ends that claude. |
 | `plugins/<name>.sh` | Usage rows or a custom launch for the provider named `<name>`. `claude.sh` also implements `cla` / `cla-team`. |
 | `scripts/statusline-usage.sh` | Claude Code status line command that saves `rate_limits` to `$CLAUDE_CONFIG_DIR/usage/usage.json`. |
 | `tests/check.sh` | Self-check of every feature against a fake `$HOME`. |
@@ -23,7 +25,8 @@ A bash command-line tool. `bin/ai` shows a picker of coding-agent CLIs with plan
 ## Contracts to keep
 
 - **Picker row:** `<provider> TAB <id> TAB <shown text>`, printed with `_ai_row`. On selection, `ai` calls `_ai_<provider>_run <id> [args]` if it exists, otherwise `_ai_exec "<saved command>"`.
-- **`_ai_choose` output:** `<action>\n<row>`, where action is empty (launch), `team`, `add`, `edit` or `delete`. It returns non-zero on cancel. The fzf and menu versions must behave the same.
+- **`_ai_choose` output:** `<action>\n<row>`, where action is empty (launch), `team`, `add`, `edit`, `delete`, `failover` or `order`. A third arg `keys` is the main picker, and `order` is the failover priority screen, whose actions are empty (back), `up`, `down`, `toggle`, `clear` or `failover`. It returns non-zero on cancel. The fzf and menu versions must behave the same.
+- **Failover files:** order file `failover` next to the providers file (`$AI_FO_ORDER`, lines `member<TAB>on|off`), flag file `failover.on` beside it (failover is on only with the flag and jq), and state dir `$AI_FO_STATE` (`limited/<member>` marks by mtime, `handoff.<pid>.json`). Members are `claude/<account>` for each cla account, or the name of a provider that runs claude or codex. Not used in team mode.
 - **Plugin hooks:** `_ai_<name>_rows` (optional, prints rows, only called when jq exists) and `_ai_<name>_run <id> [args]` (optional). `<name>` matches a provider name in the providers file.
 - **Providers file:** `~/.config/ai-launcher/providers` (override with `$AI_PROVIDERS`), with lines `name<TAB>command<TAB>label`. Only `_ai_put` writes it, and it keeps line order.
 - **Launch commands:** the saved string is the user's own config, so it runs through `bash -c` like a shell alias, with extra args passed as `"$@"`.
