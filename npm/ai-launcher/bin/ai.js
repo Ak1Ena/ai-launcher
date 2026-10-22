@@ -2,16 +2,14 @@
 const { spawn } = require("child_process");
 const os = require("os");
 
-const pkg = `@akihikoena/ai-launcher-${process.platform}-${process.arch}`;
+const path = require("path");
+const fs = require("fs");
+
+const plat = `${process.platform}-${process.arch}`;
 const exe = process.platform === "win32" ? "ai-launcher.exe" : "ai-launcher";
-let bin;
-try {
-  bin = require.resolve(`${pkg}/bin/${exe}`);
-} catch {
-  console.error(
-    `ai-launcher: no binary package installed for ${process.platform}-${process.arch} (expected "${pkg}").\n` +
-      `Reinstall without --omit=optional, or run: npm install ${pkg}`
-  );
+const bin = path.join(__dirname, plat, exe);
+if (!fs.existsSync(bin)) {
+  console.error(`ai-launcher: no binary for ${plat}. Supported: darwin-arm64, darwin-x64, linux-x64, linux-arm64, win32-x64.`);
   process.exit(1);
 }
 

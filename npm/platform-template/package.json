@@ -1,9 +1,0 @@
-{
-  "name": "@akihikoena/ai-launcher-__PLATFORM__-__ARCH__",
-  "version": "__VERSION__",
-  "description": "ai-launcher binary for __PLATFORM__ __ARCH__",
-  "license": "MIT",
-  "os": ["__PLATFORM__"],
-  "cpu": ["__ARCH__"],
-  "files": ["bin"]
-}

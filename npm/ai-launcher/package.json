@@ -5,12 +5,5 @@
   "license": "MIT",
   "bin": { "ai": "bin/ai.js" },
   "files": ["bin"],
-  "engines": { "node": ">=16" },
-  "optionalDependencies": {
-    "@akihikoena/ai-launcher-darwin-arm64": "0.0.0",
-    "@akihikoena/ai-launcher-darwin-x64": "0.0.0",
-    "@akihikoena/ai-launcher-linux-x64": "0.0.0",
-    "@akihikoena/ai-launcher-linux-arm64": "0.0.0",
-    "@akihikoena/ai-launcher-win32-x64": "0.0.0"
-  }
+  "engines": { "node": ">=16" }
 }

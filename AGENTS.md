@@ -21,7 +21,7 @@ A bash command-line tool. `bin/ai` shows a picker of coding-agent CLIs with plan
 | `scripts/statusline-usage.sh` | Claude Code status line command that saves `rate_limits` to `$CLAUDE_CONFIG_DIR/usage/usage.json`. |
 | `tui/` | Rust TUI (`ai-launcher`): sidebar of accounts, each CLI in a tab, failover in place. |
 | `.github/workflows/` | `ci.yml` (branches/PRs), `release.yml` (build all platforms, draft release), `npm-publish.yml` (on publish). |
-| `npm/` | npm package files: `ai-launcher` main package and `platform-template`. |
+| `npm/` | npm package files: `ai-launcher`, one package with every platform's binary in `bin/<platform>-<arch>/`. |
 | `scripts/npm-pack.sh` | Builds the npm packages from release binaries. |
 | `tests/check.sh` | Self-check of every feature against a fake `$HOME`. |
 | `docs/screenshot.png` | README image, rendered from demo data. |
