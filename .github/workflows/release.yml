@@ -91,9 +91,15 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.v.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          draft: true
-          files: dist/*
+      # gh, not softprops/action-gh-release: updating an existing draft with it published the draft
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --target "$GITHUB_SHA" --draft=true
+          else
+            gh release create "$TAG" dist/* --draft --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+          fi
