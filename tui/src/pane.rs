@@ -160,7 +160,8 @@ impl Pane {
     pub fn mouse(&self, kind: MouseEventKind, col: u16, row: u16) {
         let mut p = self.screen.lock().unwrap_or_else(|e| e.into_inner());
         let s = p.screen_mut();
-        let wants = s.mouse_protocol_mode() != vt100::MouseProtocolMode::None;
+        let mode = s.mouse_protocol_mode();
+        let wants = mode != vt100::MouseProtocolMode::None;
         let sgr = s.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr;
         if !wants {
             let at = s.scrollback();
@@ -176,10 +177,14 @@ impl Pane {
             MouseEventKind::Down(b) => (mouse_button(b), false),
             MouseEventKind::Up(b) => (mouse_button(b), true),
             MouseEventKind::Drag(b) => (mouse_button(b) + 32, false),
+            MouseEventKind::Moved => (35, false),
             MouseEventKind::ScrollUp => (64, false),
             MouseEventKind::ScrollDown => (65, false),
             _ => return,
         };
+        if !mouse_reported(mode, kind) {
+            return;
+        }
         let (x, y) = (col + 1, row + 1);
         if sgr {
             self.write(
@@ -325,12 +330,42 @@ pub fn encode_key(key: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Whether a CLI in `mode` asked for this kind of mouse event.
+fn mouse_reported(mode: vt100::MouseProtocolMode, kind: MouseEventKind) -> bool {
+    use vt100::MouseProtocolMode as M;
+    match kind {
+        MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            mode != M::None
+        }
+        MouseEventKind::Up(_) => matches!(mode, M::PressRelease | M::ButtonMotion | M::AnyMotion),
+        MouseEventKind::Drag(_) => matches!(mode, M::ButtonMotion | M::AnyMotion),
+        MouseEventKind::Moved => mode == M::AnyMotion,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn k(code: KeyCode, m: KeyModifiers) -> Vec<u8> {
         encode_key(KeyEvent::new(code, m), false).unwrap()
+    }
+
+    #[test]
+    fn mouse_modes_filter_events() {
+        use vt100::MouseProtocolMode as M;
+        let (d, u) = (
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        );
+        let g = MouseEventKind::Drag(MouseButton::Left);
+        assert!(mouse_reported(M::Press, d) && !mouse_reported(M::Press, u));
+        assert!(mouse_reported(M::PressRelease, u) && !mouse_reported(M::PressRelease, g));
+        assert!(mouse_reported(M::ButtonMotion, g));
+        assert!(!mouse_reported(M::ButtonMotion, MouseEventKind::Moved));
+        assert!(mouse_reported(M::AnyMotion, MouseEventKind::Moved));
+        assert!(mouse_reported(M::Press, MouseEventKind::ScrollUp));
     }
 
     #[test]

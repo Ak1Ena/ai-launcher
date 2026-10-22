@@ -185,6 +185,18 @@ impl Form {
         Outcome::Open
     }
 
+    /// Pasted text goes into the focused text field at the cursor; newlines are dropped.
+    pub fn paste(&mut self, text: &str) {
+        if self.focus >= self.fields.len()
+            || !matches!(self.fields[self.focus].input, Input::Text { .. })
+        {
+            return;
+        }
+        for c in text.chars().filter(|c| !matches!(c, '\n' | '\r')) {
+            self.edit_field(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
     fn step(&mut self, by: isize) {
         let n = self.fields.len() as isize + 1;
         let mut i = self.focus as isize;
@@ -262,6 +274,17 @@ mod tests {
         for c in s.chars() {
             press(f, KeyCode::Char(c));
         }
+    }
+
+    #[test]
+    fn paste_inserts_at_cursor_without_newlines() {
+        let mut f = Form::add();
+        press(&mut f, KeyCode::Right); // Codex login
+        press(&mut f, KeyCode::Tab);
+        typed(&mut f, "ab");
+        press(&mut f, KeyCode::Left);
+        f.paste("X\nY\r");
+        assert_eq!(f.get("Name"), "aXYb");
     }
 
     #[test]

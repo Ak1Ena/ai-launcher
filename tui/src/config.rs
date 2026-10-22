@@ -360,7 +360,11 @@ pub fn valid_name(name: &str) -> bool {
 
 /// Writes a provider line in place (or appends it); `None` deletes it. Keeps line order.
 pub fn put_provider(paths: &Paths, name: &str, value: Option<(&str, &str)>) -> std::io::Result<()> {
-    let text = fs::read_to_string(&paths.providers).unwrap_or_default();
+    let text = match fs::read_to_string(&paths.providers) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
     let mut out = String::new();
     let mut done = false;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -380,7 +384,14 @@ pub fn put_provider(paths: &Paths, name: &str, value: Option<(&str, &str)>) -> s
     if let Some(dir) = paths.providers.parent() {
         fs::create_dir_all(dir)?;
     }
-    fs::write(&paths.providers, out)
+    // temp file beside the target, then rename: a crash never leaves half a file
+    let mut tmp = paths.providers.clone().into_os_string();
+    tmp.push(format!(".tmp{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, out)?;
+    fs::rename(&tmp, &paths.providers).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 /// A new cla account folder. Settings, skills, plugins and memory are shared with the main
@@ -401,9 +412,13 @@ pub fn add_claude_account(paths: &Paths, name: &str) -> std::io::Result<PathBuf>
         "projects",
     ] {
         let (from, to) = (main.join(f), dir.join(f));
-        if from.exists() && !to.exists() {
+        // symlink_metadata: a dangling link already counts as present
+        if from.exists() && to.symlink_metadata().is_err() {
             #[cfg(unix)]
-            std::os::unix::fs::symlink(&from, &to)?;
+            match std::os::unix::fs::symlink(&from, &to) {
+                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+                _ => {}
+            }
         }
     }
     // the accounts show up through the `claude` provider
@@ -426,8 +441,22 @@ pub fn trash_claude_account(paths: &Paths, name: &str) -> std::io::Result<PathBu
         .unwrap_or(0);
     let trash = paths.cla_root.join(".trash");
     fs::create_dir_all(&trash)?;
-    let to = trash.join(format!("{name}-{stamp}"));
-    fs::rename(paths.cla_root.join(name), &to)?;
+    let from = paths.cla_root.join(name);
+    // log out first (as `cla rm`); failure is fine
+    let _ = std::process::Command::new("claude")
+        .args(["auth", "logout"])
+        .env("CLAUDE_CONFIG_DIR", &from)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let mut to = trash.join(format!("{name}-{stamp}"));
+    let mut n = 2;
+    while to.symlink_metadata().is_ok() {
+        to = trash.join(format!("{name}-{stamp}-{n}"));
+        n += 1;
+    }
+    fs::rename(&from, &to)?;
     Ok(to)
 }
 
@@ -527,6 +556,31 @@ mod tests {
         );
         put_provider(&p, "a", None).unwrap();
         assert_eq!(fs::read_to_string(&p.providers).unwrap(), "b\tb\tB\n");
+    }
+
+    #[test]
+    fn put_provider_refuses_unreadable_file() {
+        let p = tmp_paths("bad");
+        fs::create_dir_all(p.providers.parent().unwrap()).unwrap();
+        fs::write(&p.providers, [0xff, 0xfe]).unwrap();
+        assert!(put_provider(&p, "a", Some(("a", "A"))).is_err());
+        assert_eq!(fs::read(&p.providers).unwrap(), vec![0xff, 0xfe]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_account_retries_over_dangling_link_and_trash_names_are_unique() {
+        let p = tmp_paths("retry");
+        let d = p.cla_root.join("w");
+        fs::create_dir_all(&d).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/x", d.join("settings.json")).unwrap();
+        add_claude_account(&p, "w").unwrap();
+        add_claude_account(&p, "w").unwrap();
+        let a = trash_claude_account(&p, "w").unwrap();
+        fs::create_dir_all(p.cla_root.join("w")).unwrap();
+        let b = trash_claude_account(&p, "w").unwrap();
+        assert_ne!(a, b);
+        assert!(a.exists() && b.exists());
     }
 
     #[test]

@@ -83,6 +83,10 @@ pub struct App {
     pub modal: Option<Modal>,
     /// a short message under the sidebar, and when it goes away
     pub flash: Option<(String, Instant)>,
+    /// a press started inside the pane: drags and release follow it outside
+    pane_drag: bool,
+    /// sidebar row and time of the last click, for double-click to open
+    last_click: Option<(usize, Instant)>,
 }
 
 impl App {
@@ -111,6 +115,8 @@ impl App {
             next_handoff: 0,
             modal: None,
             flash: None,
+            pane_drag: false,
+            last_click: None,
         };
         app.refresh();
         app
@@ -223,6 +229,12 @@ impl App {
     }
 
     pub fn on_paste(&mut self, text: &str) {
+        if let Some(m) = &mut self.modal {
+            if let Modal::Form(f) = m {
+                f.paste(text);
+            }
+            return;
+        }
         if self.focus == Focus::Pane
             && let Some(p) = self.tabs.get(self.current).and_then(|t| t.pane.as_ref())
         {
@@ -370,7 +382,7 @@ impl App {
         };
         let what = match r.entry.id.strip_prefix("claude/") {
             Some(acct) => format!(
-                "Its folder moves to {}/.trash/{acct}-… (login, history and settings stay there).",
+                "Its folder moves to {}/.trash/{acct}-… and it is logged out (history and settings stay there).",
                 self.paths.cla_root.display()
             ),
             None => "It leaves the list. A Codex or Gemini login folder is kept, so adding it again logs back in.".into(),
@@ -384,7 +396,7 @@ impl App {
     fn modal_key(&mut self, key: KeyEvent) {
         match self.modal.take() {
             Some(Modal::Confirm(c)) => match key.code {
-                KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.delete(&c.id),
+                KeyCode::Char('y' | 'Y') => self.delete(&c.id),
                 KeyCode::Char('n' | 'N') | KeyCode::Esc => {}
                 _ => self.modal = Some(Modal::Confirm(c)),
             },
@@ -490,7 +502,17 @@ impl App {
                 }
                 format!("{} login", entry.command)
             }
-            Kind::Other => entry.command.clone(),
+            Kind::Other => {
+                if config::agent(&entry.command) == "gemini"
+                    && let Some(d) = config::account_dir(&self.paths, &entry)
+                {
+                    env.push((
+                        "GEMINI_CLI_HOME".into(),
+                        Some(d.to_string_lossy().into_owned()),
+                    ));
+                }
+                entry.command.clone()
+            }
         };
         self.next_handoff += 1;
         self.tabs.push(Tab {
@@ -559,8 +581,11 @@ impl App {
                 return self.refresh();
             }
             if let Some((_, i)) = hits.rows.iter().find(|(r, _)| inside(r)) {
-                // click selects, a click on the selected row opens it
-                let again = self.selected == *i && self.focus == Focus::Sidebar;
+                // one click selects, a second on the same row within 500 ms opens it
+                let again = self
+                    .last_click
+                    .is_some_and(|(r, t)| r == *i && t.elapsed() < Duration::from_millis(500));
+                self.last_click = (!again).then(|| (*i, Instant::now()));
                 self.selected = *i;
                 self.focus = Focus::Sidebar;
                 if again && let Some(id) = self.rows.get(*i).map(|r| r.entry.id.clone()) {
@@ -569,7 +594,16 @@ impl App {
                 return;
             }
         }
-        if inside(&hits.pane)
+        let up = matches!(m.kind, MouseEventKind::Up(_));
+        let follows =
+            self.pane_drag && matches!(m.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_));
+        if matches!(m.kind, MouseEventKind::Down(_)) && inside(&hits.pane) {
+            self.pane_drag = true;
+        }
+        if up {
+            self.pane_drag = false;
+        }
+        if (inside(&hits.pane) || follows)
             && let Some(tab) = self.tabs.get(self.current)
         {
             if matches!(m.kind, MouseEventKind::Down(_)) {
@@ -578,7 +612,14 @@ impl App {
             if tab.notice.is_none()
                 && let Some(p) = &tab.pane
             {
-                p.mouse(m.kind, m.column - hits.pane.x, m.row - hits.pane.y);
+                let pane = hits.pane;
+                let col = m
+                    .column
+                    .clamp(pane.x, pane.right().saturating_sub(1).max(pane.x));
+                let row = m
+                    .row
+                    .clamp(pane.y, pane.bottom().saturating_sub(1).max(pane.y));
+                p.mouse(m.kind, col - pane.x, row - pane.y);
             }
         }
     }
@@ -689,7 +730,16 @@ impl App {
                     env.push(("CODEX_HOME".into(), Some(d.to_string_lossy().into_owned())));
                 }
             }
-            Kind::Other => {}
+            Kind::Other => {
+                if config::agent(&entry.command) == "gemini"
+                    && let Some(d) = config::account_dir(&self.paths, &entry)
+                {
+                    env.push((
+                        "GEMINI_CLI_HOME".into(),
+                        Some(d.to_string_lossy().into_owned()),
+                    ));
+                }
+            }
         }
         let (rows, cols) = self.pane_size;
         match Pane::spawn(&command, &args, &env, rows, cols) {
@@ -1023,6 +1073,54 @@ mod tests {
         assert_eq!(a.tabs.len(), 1);
         assert_eq!(a.tabs[0].member, "t1");
         assert!(a.focus == Focus::Pane);
+    }
+
+    #[test]
+    fn single_click_on_keyboard_selected_row_does_not_open() {
+        let mut a = app();
+        let i = ids(&a).iter().position(|i| i == "t1").unwrap();
+        a.selected = i;
+        let hits = Hits {
+            rows: vec![(r(1), 0), (r(2), 1), (r(3), 2)],
+            ..Hits::default()
+        };
+        click(&mut a, &hits, 1, 1 + i as u16);
+        assert!(a.tabs.is_empty());
+        a.last_click = Some((i, Instant::now() - Duration::from_millis(600)));
+        click(&mut a, &hits, 1, 1 + i as u16);
+        assert!(a.tabs.is_empty());
+    }
+
+    #[test]
+    fn drag_and_release_outside_pane_stay_with_the_pane() {
+        let mut a = app();
+        a.open("t1");
+        let hits = Hits {
+            pane: Rect::new(10, 2, 20, 10),
+            ..Hits::default()
+        };
+        let ev = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        a.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 12, 3), &hits);
+        assert!(a.pane_drag);
+        a.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 0, 0), &hits);
+        assert!(a.pane_drag);
+        a.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), 0, 0), &hits);
+        assert!(!a.pane_drag);
+    }
+
+    #[test]
+    fn delete_confirms_on_y_only() {
+        let mut a = app();
+        a.start_delete();
+        a.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(a.modal, Some(Modal::Confirm(_))));
+        a.modal_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(a.modal.is_none());
     }
 
     #[test]
