@@ -19,11 +19,13 @@ A terminal UI that shows every account in a sidebar with its priority, on/off st
 Install:
 
 ```bash
-npm i -g ai-launcher            # once published
+npm i -g ai-launcher            # installs the TUI as the command `ai`
 cd tui && cargo build --release # or build it yourself (binary: tui/target/release/ai-launcher)
 ```
 
-Run `ai-launcher [claude args]`. The first CLI you open gets those args.
+Run `ai [claude args]` (npm install) or `tui/target/release/ai-launcher [claude args]` (built yourself). The first CLI you open gets those args.
+
+The bash tool is also called `ai` (`bin/ai`, when the repo's `bin` is on your `PATH`). Whichever comes first on `PATH` runs. Round-robin, Auto and the decision model are TUI-only; the bash picker has failover and the update notice.
 
 It reads and writes the same config as the bash `ai` (providers file, failover order and flag), so you can use both.
 
@@ -47,7 +49,7 @@ It reads and writes the same config as the bash `ai` (providers file, failover o
 | `tab` | next tab |
 | `q` / `ctrl-c` | quit |
 
-Routing mode (`w`, or click the mode label in the title bar) is saved in `<failover file>.mode`. In failover mode the list is a priority order. In round-robin mode each account shows `×weight`, and `n` (or `▶ Auto`) opens the next account in a new tab by smooth weighted round-robin: with weights 3 and 1 you get A A B A A A B A. Accounts that are off, weight 0 or limited are skipped. Weights are saved in `<failover file>.weights` and the rotation in `$AI_FO_STATE/wrr`, so it continues after a restart.
+Routing mode (`w`, or click the mode label in the title bar) is saved in `<failover file>.mode`. In failover mode the list is a priority order. In round-robin mode each account shows `×weight`, and `n` (or `▶ Auto`) opens the next account in a new tab by smooth weighted round-robin: with weights 3 and 1 you get A A B A (then it repeats). Accounts that are off, weight 0 or limited are skipped. Weights are saved in `<failover file>.weights` and the rotation in `$AI_FO_STATE/wrr`, so it continues after a restart.
 
 Optionally let a model choose instead: press `m` and enter a model name (for example `haiku`; empty means plain round-robin). Auto then runs `claude -p --model <model>` on one of your free Claude accounts, with each account's weight and usage, in the background (20 second timeout, the UI keeps working). If it fails, times out or answers with anything but an account name, the round-robin pick is used. The model name is saved in `<failover file>.model`. This is the only thing the tool asks a model; it uses your own `claude` login and counts against its plan. Bash `ai` ignores these files.
 

@@ -2,7 +2,7 @@
 const { spawn } = require("child_process");
 const os = require("os");
 
-const pkg = `ai-launcher-${process.platform}-${process.arch}`;
+const pkg = `@akihikoena/ai-launcher-${process.platform}-${process.arch}`;
 const exe = process.platform === "win32" ? "ai-launcher.exe" : "ai-launcher";
 let bin;
 try {
