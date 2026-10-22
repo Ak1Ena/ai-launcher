@@ -31,19 +31,43 @@ It reads and writes the same config as the bash `ai` (providers file, failover o
 | --- | --- |
 | `up` `down` / `k` `j` | move selection |
 | `enter` | open the selected account in a tab |
+| `a` | add an account |
+| `e` | edit the selected account |
+| `d` | delete the selected account |
 | `shift-up` `shift-down` / `K` `J` | change the order (top is tried first) |
 | `space` | leave an account out / back in |
 | `f` | failover on / off |
 | `r` | clear the account's limit |
+| `x` | close tab |
 | `1`-`9` | go to tab n |
 | `tab` | next tab |
-| `x` | close tab |
-| `ctrl-\` | move to the running CLI |
 | `q` / `ctrl-c` | quit |
+
+In the add form, a Claude account opens its login in a tab. A Codex or Gemini login gets its own login folder when another one of that CLI exists. Other CLI runs any command you type.
+
+Delete asks first. A Claude account folder moves to `<accounts folder>/.trash`, so its login and history are kept.
+
+| Key (anywhere) | Does |
+| --- | --- |
+| `alt-1`-`alt-9` | go to tab n, also while typing in a CLI |
+| `alt-←` `alt-→` | previous / next tab |
+| `ctrl-\` | move between the list and the running CLI |
+
+On macOS, alt (⌥) keys need "Option as Meta" turned on in the terminal settings (Terminal: Profiles > Keyboard; iTerm2: Profiles > Keys).
+
+| Mouse | Does |
+| --- | --- |
+| click a tab | go to it |
+| click a tab's `✕` | close it |
+| click an account | select it; click it again to open it |
+| `+ Add` / `✎ Edit` / `✕ Delete` | add, edit or delete the selected account |
+| Failover switch (title bar) | failover on / off |
+| wheel | scroll a CLI's output (unless the CLI uses the mouse itself) |
+
+In a tab, every key goes to the CLI except these:
 
 | Key (in a tab) | Does |
 | --- | --- |
-| `ctrl-\` | back to the list (all other keys go to the CLI) |
 | `enter` | on a failover notice: switch now; on an ended tab: restart it |
 | `o` | on a failover notice: go to the list to pick another account |
 | `q` / `esc` | on a failover notice: stay on the ended session |

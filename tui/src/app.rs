@@ -87,7 +87,10 @@ pub struct App {
 
 impl App {
     pub fn new(args: Vec<String>) -> App {
-        let paths = Paths::from_env();
+        App::with_paths(Paths::from_env(), args)
+    }
+
+    pub fn with_paths(paths: Paths, args: Vec<String>) -> App {
         let mod_dir = failover::install_mod(&paths);
         let mut app = App {
             failover: config::failover_on(&paths),
@@ -818,4 +821,277 @@ impl App {
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::layout::Rect;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static N: AtomicUsize = AtomicUsize::new(0);
+
+    /// An app over a fresh temp folder: claude account `w`, other CLIs `t1` and `t2` (command `true`).
+    fn app() -> App {
+        let home = std::env::temp_dir().join(format!(
+            "ai-launcher-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&home);
+        let cla_root = home.join("cla");
+        fs::create_dir_all(cla_root.join("w")).unwrap();
+        let providers = home.join("cfg/providers");
+        fs::create_dir_all(providers.parent().unwrap()).unwrap();
+        fs::write(
+            &providers,
+            "claude\tclaude\tClaude Code\nt1\ttrue\tT One\nt2\ttrue\tT Two\n",
+        )
+        .unwrap();
+        let paths = Paths {
+            fo_order: home.join("cfg/failover"),
+            fo_state: home.join("state"),
+            ai_accounts: home.join("accts"),
+            codex_home: home.join("codex"),
+            cooldown: Duration::from_secs(60),
+            providers,
+            cla_root,
+            home,
+        };
+        let mut a = App::with_paths(paths, vec![]);
+        a.value_flags = Some(vec![]); // don't run `claude --help`
+        a
+    }
+
+    fn key(a: &mut App, code: KeyCode) {
+        a.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn typed(a: &mut App, s: &str) {
+        s.chars().for_each(|c| key(a, KeyCode::Char(c)));
+    }
+
+    /// Opens the add form as "Other CLI" with name and command typed in (focus ends on Command).
+    fn fill_add(a: &mut App, name: &str, command: &str) {
+        key(a, KeyCode::Char('a'));
+        (0..3).for_each(|_| key(a, KeyCode::Right));
+        key(a, KeyCode::Tab);
+        typed(a, name);
+        key(a, KeyCode::Tab);
+        key(a, KeyCode::Tab);
+        typed(a, command);
+    }
+
+    fn save(a: &mut App) {
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+    }
+
+    fn form_error(a: &App) -> Option<String> {
+        match &a.modal {
+            Some(Modal::Form(f)) => f.error.clone(),
+            _ => None,
+        }
+    }
+
+    fn providers_text(a: &App) -> String {
+        fs::read_to_string(&a.paths.providers).unwrap()
+    }
+
+    fn ids(a: &App) -> Vec<String> {
+        a.rows.iter().map(|r| r.entry.id.clone()).collect()
+    }
+
+    fn select(a: &mut App, id: &str) {
+        a.selected = ids(a).iter().position(|i| i == id).unwrap();
+    }
+
+    fn click(a: &mut App, hits: &Hits, x: u16, y: u16) {
+        a.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            },
+            hits,
+        );
+    }
+
+    fn r(y: u16) -> Rect {
+        Rect::new(0, y, 5, 1)
+    }
+
+    #[test]
+    fn add_other_cli_writes_the_providers_line() {
+        let mut a = app();
+        fill_add(&mut a, "x", "true");
+        save(&mut a);
+        assert!(a.modal.is_none());
+        assert!(providers_text(&a).contains("x\ttrue\tx\n"));
+        assert!(ids(&a).contains(&"x".to_string()));
+    }
+
+    #[test]
+    fn add_duplicate_name_keeps_the_form_open_with_an_error() {
+        let mut a = app();
+        fill_add(&mut a, "t1", "true");
+        save(&mut a);
+        assert!(form_error(&a).unwrap().contains("already"));
+        assert_eq!(providers_text(&a).matches("t1\t").count(), 1);
+    }
+
+    #[test]
+    fn add_invalid_name_keeps_the_form_open_with_an_error() {
+        let mut a = app();
+        fill_add(&mut a, "a/b", "true");
+        save(&mut a);
+        assert!(form_error(&a).is_some());
+        assert!(!providers_text(&a).contains("a/b"));
+    }
+
+    #[test]
+    fn edit_changes_label_and_command_in_place() {
+        let mut a = app();
+        select(&mut a, "t1");
+        key(&mut a, KeyCode::Char('e')); // focus starts on Label
+        a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        typed(&mut a, "New");
+        key(&mut a, KeyCode::Tab);
+        a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        typed(&mut a, "false");
+        save(&mut a);
+        assert!(a.modal.is_none());
+        let text = providers_text(&a);
+        assert!(text.contains("t1\tfalse\tNew\n"), "{text}");
+        let lines: Vec<_> = text.lines().collect();
+        assert!(lines[1].starts_with("t1\t") && lines[2].starts_with("t2\t"));
+    }
+
+    #[test]
+    fn delete_provider_leaves_the_file() {
+        let mut a = app();
+        select(&mut a, "t1");
+        key(&mut a, KeyCode::Char('d'));
+        key(&mut a, KeyCode::Char('y'));
+        assert!(!providers_text(&a).contains("t1\t"));
+        assert!(!ids(&a).contains(&"t1".to_string()));
+    }
+
+    #[test]
+    fn delete_claude_account_moves_it_to_trash() {
+        let mut a = app();
+        select(&mut a, "claude/w");
+        key(&mut a, KeyCode::Char('d'));
+        key(&mut a, KeyCode::Char('y'));
+        assert!(!a.paths.cla_root.join("w").exists());
+        let trashed: Vec<_> = fs::read_dir(a.paths.cla_root.join(".trash"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            trashed
+                .iter()
+                .any(|e| e.file_name().to_string_lossy().starts_with("w-"))
+        );
+        assert!(!ids(&a).contains(&"claude/w".to_string()));
+    }
+
+    #[test]
+    fn delete_declined_keeps_everything() {
+        let mut a = app();
+        select(&mut a, "claude/w");
+        key(&mut a, KeyCode::Char('d'));
+        key(&mut a, KeyCode::Char('n'));
+        assert!(a.modal.is_none());
+        assert!(a.paths.cla_root.join("w").exists());
+        assert!(ids(&a).contains(&"claude/w".to_string()));
+    }
+
+    #[test]
+    fn click_row_selects_then_opens_a_tab() {
+        let mut a = app();
+        let i = ids(&a).iter().position(|i| i == "t1").unwrap();
+        let hits = Hits {
+            rows: vec![(r(1), 0), (r(2), 1), (r(3), 2)],
+            ..Hits::default()
+        };
+        click(&mut a, &hits, 1, 1 + i as u16);
+        assert_eq!(a.selected, i);
+        assert!(a.tabs.is_empty());
+        click(&mut a, &hits, 1, 1 + i as u16);
+        assert_eq!(a.tabs.len(), 1);
+        assert_eq!(a.tabs[0].member, "t1");
+        assert!(a.focus == Focus::Pane);
+    }
+
+    #[test]
+    fn click_tab_switches_and_close_closes() {
+        let mut a = app();
+        a.open("t1");
+        a.open("t2");
+        assert_eq!(a.current, 1);
+        let hits = Hits {
+            tabs: vec![(r(0), 0), (Rect::new(10, 0, 5, 1), 1)],
+            closes: vec![(Rect::new(6, 0, 1, 1), 0), (Rect::new(16, 0, 1, 1), 1)],
+            ..Hits::default()
+        };
+        click(&mut a, &hits, 1, 0);
+        assert_eq!(a.current, 0);
+        click(&mut a, &hits, 16, 0);
+        assert_eq!(a.tabs.len(), 1);
+        assert_eq!(a.tabs[0].member, "t1");
+    }
+
+    #[test]
+    fn click_failover_button_toggles_it() {
+        let mut a = app();
+        let hits = Hits {
+            buttons: vec![(r(5), Button::Failover)],
+            ..Hits::default()
+        };
+        assert!(!a.failover);
+        click(&mut a, &hits, 1, 5);
+        assert!(a.failover);
+        click(&mut a, &hits, 1, 5);
+        assert!(!a.failover);
+    }
+
+    #[test]
+    fn click_form_field_focuses_and_save_saves() {
+        let mut a = app();
+        fill_add(&mut a, "x", "true");
+        let hits = Hits {
+            fields: (0..5).map(|i| (r(i as u16), i)).collect(),
+            ..Hits::default()
+        };
+        click(&mut a, &hits, 1, 1);
+        let Some(Modal::Form(f)) = &a.modal else {
+            panic!("form closed")
+        };
+        assert_eq!(f.focus, 1);
+        click(&mut a, &hits, 1, 4); // Save
+        assert!(a.modal.is_none());
+        assert!(providers_text(&a).contains("x\ttrue\tx\n"));
+    }
+
+    #[test]
+    fn alt_keys_switch_tabs_from_the_pane() {
+        let mut a = app();
+        a.open("t1");
+        a.open("t2");
+        let alt = |a: &mut App, code| a.on_key(KeyEvent::new(code, KeyModifiers::ALT));
+        a.focus = Focus::Pane;
+        alt(&mut a, KeyCode::Char('1'));
+        assert_eq!(a.current, 0);
+        alt(&mut a, KeyCode::Char('2'));
+        assert_eq!(a.current, 1);
+        alt(&mut a, KeyCode::Left);
+        assert_eq!(a.current, 0);
+        alt(&mut a, KeyCode::Left); // wraps
+        assert_eq!(a.current, 1);
+        alt(&mut a, KeyCode::Right); // wraps
+        assert_eq!(a.current, 0);
+        assert!(a.focus == Focus::Pane);
+    }
 }
