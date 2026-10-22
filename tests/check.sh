@@ -90,7 +90,7 @@ ok "scripts keep LF endings"    '! grep -lq $'"'"'\r'"'"' "$REPO"/bin/ai "$REPO"
 ok ".cmd files use CRLF"        'grep -q $'"'"'\r$'"'"' "$REPO/bin/ai.cmd"'
 
 # ── failover ──
-FO=$T/fo; mkdir -p "$FO/bin" "$FO/proj/-slug" "$FO/state/limited/claude"; AI_FO_STATE=$FO/state; AI_FO_ORDER=$T/cfg/failover; rm -f "$AI_FO_ORDER" "$AI_FO_ORDER.on"
+AI_FO_WAIT=0; FO=$T/fo; mkdir -p "$FO/bin" "$FO/proj/-slug" "$FO/state/limited/claude"; AI_FO_STATE=$FO/state; AI_FO_ORDER=$T/cfg/failover; rm -f "$AI_FO_ORDER" "$AI_FO_ORDER.on"
 # stub claude: --help lists value flags; run as a provider command it logs its args and, unless resumed, "hits the limit"
 cat > "$FO/bin/claude" <<'EOS'
 #!/bin/sh
@@ -105,9 +105,9 @@ members() { _fo_list | cut -f1 | tr '\n' ' '; }
 stateof() { _fo_list | awk -F'\t' -v m="$1" '$1 == m { print $3 }'; }
 touch_limit() { mkdir -p "$(dirname "$AI_FO_STATE/limited/$1")"; touch "$AI_FO_STATE/limited/$1"; }
 ok "failover is off by default"   '[ "$(_fo_state)" = off ]'
-_ai_failover on >/dev/null
+_ai_failover on >/dev/null 2>&1
 ok "failover on toggles"          '_fo_on && [ "$(_fo_state)" = on ]'
-_ai_failover off >/dev/null
+_ai_failover off >/dev/null 2>&1
 ok "failover off toggles"         '! _fo_on && [ "$(_fo_state)" = off ]'
 ok "members: accounts + claude/codex providers only" '[ "$(members)" = "claude/one claude/two cl2 cx " ]'
 ok "new members default on"       '[ "$(_fo_list | cut -f3 | sort -u)" = on ]'
@@ -118,7 +118,7 @@ _fo_list | _fo_move cx down | _fo_save
 ok "move down persists"           '[ "$(members)" = "claude/one claude/two cx cl2 " ]'
 _fo_list | _fo_set cl2 | _fo_save
 ok "set toggles off"              '[ "$(stateof cl2)" = off ]'
-_ai_failover order cl2 claude/two >/dev/null
+_ai_failover order cl2 claude/two >/dev/null 2>&1
 ok "order puts names first"       '[ "$(members)" = "cl2 claude/two claude/one cx " ]'
 ok "order keeps off state"        '[ "$(stateof cl2)" = off ]'
 _fo_list | _fo_set cl2 on | _fo_save
@@ -128,30 +128,51 @@ ok "free member is not limited"   '! _fo_limited claude/one'
 ok "next skips tried and limited" '[ "$(_fo_next " claude/two ")" = cl2 ] && [ "$(_fo_next " cl2 claude/two claude/one ")" != cx ]'
 _fo_list | _fo_set claude/one off | _fo_save
 ok "next skips off members"       '! _fo_next " cl2 claude/two cx "'
-ok "clear frees limited members"  '_ai_failover clear >/dev/null; ! _fo_limited cx'
+ok "clear frees limited members"  '_ai_failover clear >/dev/null 2>&1; ! _fo_limited cx'
 touch_limit cx
 ok "cooldown expires"             '( AI_FO_COOLDOWN=0; ! _fo_limited cx )'
-_ai_failover clear >/dev/null
+_ai_failover clear >/dev/null 2>&1
 rm -f "$AI_FO_ORDER"
 ok "split: keep flags and prompt" '( PATH=$FO/bin:$PATH; _fo_split -p "x" --model m --allowedTools Bash --resume id; [ "${FO_KEEP[*]}" = "-p --model m --allowedTools Bash" ] && [ "$FO_PROMPT" = x ] )'
 # end to end: claude/one hits the limit, claude/two resumes S1
 export FO_LOG=$FO/log FO_TR=$FO/proj/-slug/S1.jsonl; : > "$FO_LOG"
-_ai_failover on >/dev/null; _ai_failover order claude/one claude/two cx >/dev/null
+_ai_failover on >/dev/null 2>&1; _ai_failover order claude/one claude/two cx >/dev/null 2>&1
 ( PATH=$FO/bin:$PATH; _fo_run claude/one -p hi --model m ) 2>/dev/null
 ok "run: next account resumes the session" 'grep -q "^$CLA_ROOT/two|.*--model m --resume S1" "$FO_LOG"'
 ok "run: transcript copied to its config dir" '[ -f "$CLA_ROOT/two/projects/-slug/S1.jsonl" ]'
 ok "run: limit is remembered"     '_fo_limited claude/one >/dev/null'
 # claude/two off: the next stop is the codex provider, which gets a handoff with the transcript
-_ai_failover clear >/dev/null; : > "$FO_LOG"; rm -f "$FO_LOG.codex"
+_ai_failover clear >/dev/null 2>&1; : > "$FO_LOG"; rm -f "$FO_LOG.codex"
 _fo_list | _fo_set claude/two off | _fo_save
 ( PATH=$FO/bin:$PATH; _fo_run claude/one -p hi ) 2>/dev/null
 ok "run: codex gets a handoff"    'grep -q "hello world" "$FO_LOG.codex" && grep -q "half done" "$FO_LOG.codex"'
+# q at the switch card: stops, next member never launched
+_ai_failover clear >/dev/null 2>&1; : > "$FO_LOG"; _fo_list | _fo_set claude/two on | _fo_save
+( PATH=$FO/bin:$PATH; AI_FO_WAIT=2 _fo_run claude/one -p hi ) 2>/dev/null <<<"q"; stoprc=$?
+ok "run: q at the switch card stops" '[ $stoprc != 0 ] && [ "$(wc -l < "$FO_LOG" | tr -d " ")" = 1 ] && ! grep -q "^$CLA_ROOT/two|" "$FO_LOG"'
 mrows=$(_fo_rows)
 ok "menu order: u 2 is up"        '[ "$(_ai_menu t "" order "$mrows" <<<"u 2" 2>/dev/null | head -1)" = up ]'
 ok "menu order: x 1 is toggle"    '[ "$(_ai_menu t "" order "$mrows" <<<"x 1" 2>/dev/null | head -1)" = toggle ]'
 ok "menu keys: x 1 is delete"     '[ "$(_ai_menu t "" keys "$mrows" <<<"x 1" 2>/dev/null | head -1)" = delete ]'
 ok "menu keys: u 2 fails"         '! _ai_menu t "" keys "$mrows" <<<"u 2" >/dev/null 2>&1'
-_ai_failover off >/dev/null
+_ai_failover off >/dev/null 2>&1
+
+# ── failover: screens ──
+vis() { plain | wc -m | tr -d ' '; }
+card=$(_fo_card "T" "short" $'\033[1mbold\033[0m ünï ✻ wide line here' 2>&1 >/dev/null | plain | sed '/^$/d')
+ok "card: box lines share one width" '[ "$(echo "$card" | while IFS= read -r l; do printf "%s" "$l" | wc -m; done | sort -u | wc -l | tr -d " ")" = 1 ]'
+ok "card: has top, body and bottom" '[ "$(echo "$card" | wc -l | tr -d " ")" = 4 ] && echo "$card" | line 1 | grep -q "^╭" && echo "$card" | line 4 | grep -q "^╰"'
+ok "label: claude account"        '[ "$(_fo_label claude/x)" = "Claude account x" ]'
+ok "label: provider with label"   '[ "$(_fo_label cl2)" = "Claude 2 (cl2)" ]'
+ok "label: provider without label" '[ "$(_fo_label other2)" = other2 ]'
+ok "wait: enter goes"             '[ "$(AI_FO_WAIT=2 _fo_wait 2>/dev/null <<<"")" = go ]'
+ok "wait: o is order"             '[ "$(AI_FO_WAIT=2 _fo_wait 2>/dev/null <<<"o")" = order ]'
+ok "wait: q is stop"              '[ "$(AI_FO_WAIT=2 _fo_wait 2>/dev/null <<<"q")" = stop ]'
+ok "wait: 0 seconds goes without input" '[ "$(AI_FO_WAIT=0 _fo_wait 2>/dev/null </dev/null)" = go ]'
+_ai_failover order cl2 claude/two claude/one cx >/dev/null 2>&1
+shown=$(_fo_show 2>&1 | plain)
+ok "show: lists members in order" '[ "$(echo "$shown" | grep -o "cl2\|claude/two\|claude/one\|cx" | tr "\n" " ")" = "cl2 claude/two claude/one cx " ]'
+rm -f "$AI_FO_ORDER"
 
 # ── status line script ──
 echo '{"rate_limits":{"five_hour":{"used_percentage":5}},"x":"next"}' |
@@ -171,6 +192,6 @@ ok "empty list never truncates the order" '[ -s "$AI_FO_ORDER" ]'
 printf '%s\n' '{"type":"user","message":{"content":"short one"}}' > "$T/small.jsonl"; mkdir -p "$AI_FO_STATE"
 ok "small handoff keeps its first line"   '[ "$(_fo_handoff "$T/small.jsonl" | head -1)" = "### user" ]'
 ok "provider dir falls back to start dir" '[ "$(FO_BASE_CFG=/x/base _fo_claude_dir nosuch)" = /x/base ]'
-ok "windows: failover stays off"          '( uname() { echo MINGW64_NT-10.0; }; : > "$AI_FO_ORDER.on"; ! _fo_on && ! _ai_failover on >/dev/null )'
+ok "windows: failover stays off"          '( uname() { echo MINGW64_NT-10.0; }; : > "$AI_FO_ORDER.on"; ! _fo_on && ! _ai_failover on >/dev/null 2>&1 )'
 
 echo; if [ $fails -gt 0 ]; then echo "$fails failed"; exit 1; else echo "all passed"; fi

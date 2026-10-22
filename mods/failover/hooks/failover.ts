@@ -3,6 +3,17 @@ import type { Register } from 'claude-code'
 // Acts only when ai-launcher's failover started this claude: it sets AI_FO_HANDOFF and
 // relaunches the session on the next account once this process ends.
 export const register: Register = on => {
+  // While failover runs this claude, the status line names this account and the next one.
+  on('session.start', async ($, e, next) => {
+    const result = await next(e)
+    const member = await $.env.get('AI_FO_MEMBER')
+    if (member) {
+      const after = await $.env.get('AI_FO_NEXT')
+      $.ui.status(`⇄ ${member} · ${after ? `next: ${after}` : 'last account'}`)
+    }
+    return result
+  })
+
   on('classic.StopFailure', async ($, e, next) => {
     const result = await next(e)
     const handoff = await $.env.get('AI_FO_HANDOFF')
@@ -15,10 +26,10 @@ export const register: Register = on => {
       member,
       error_details: e.error_details ?? null,
     }))
-    $.ui.toast(`failover: ${member} hit its limit, switching account`)
+    $.ui.toast(`${member} hit its limit, switching account`)
     // The shell's parent is this claude.
     const kill = await $.process.run(['sh', '-c', 'kill -TERM "$PPID"'])
-    if (kill.exitCode !== 0) $.ui.toast(`failover: could not end claude: ${kill.stderr.trim()}`)
+    if (kill.exitCode !== 0) $.ui.toast(`could not end claude: ${kill.stderr.trim()}`)
     return result
   })
 }

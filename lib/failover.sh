@@ -19,19 +19,58 @@ _fo_state() { if _fo_on; then echo on; else echo off; fi; }
 _ai_failover() {
   case ${1:-} in
     '') _fo_ui ;;
-    on) has jq || { echo "failover needs jq"; return 1; }
+    on) has jq || { _fo_card "✻ Failover" "Failover needs jq (brew install jq / apt install jq)"; return 1; }
         # shortcut: native Windows is off (the mod's kill, Windows transcript paths and the 32 KB
         # command line are unverified there); WSL works like Linux.
-        is_windows && { echo "failover is not supported on native Windows yet; use WSL"; return 1; }
-        mkdir -p "$(dirname "$AI_FO_ORDER")" && : > "$AI_FO_ORDER.on" && echo "failover on" ;;
-    off) rm -f "$AI_FO_ORDER.on"; echo "failover off" ;;
-    ls) echo "failover $(_fo_state)"; _fo_rows | cut -f3 ;;
-    order) shift; _fo_list | _fo_reorder "$@" | _fo_save && _fo_rows | cut -f3 ;;
-    clear) rm -rf "${AI_FO_STATE:?}/limited/${2:-}" && echo "cleared ${2:-every} limit" ;;
-    *) echo "usage: ai failover [on|off|ls|order <member>...|clear [member]]"; return 1 ;;
+        is_windows && { _fo_card "✻ Failover" "Not supported on native Windows yet. Use WSL."; return 1; }
+        mkdir -p "$(dirname "$AI_FO_ORDER")" && : > "$AI_FO_ORDER.on" && _fo_card "✻ Failover" "Failover is $(_fo_on_text)" ;;
+    off) rm -f "$AI_FO_ORDER.on"; _fo_card "✻ Failover" "Failover is $(_fo_on_text)" ;;
+    ls) _fo_show ;;
+    order) shift; _fo_list | _fo_reorder "$@" | _fo_save && _fo_show ;;
+    clear) rm -rf "${AI_FO_STATE:?}/limited/${2:-}" && _fo_card "✻ Failover" "Cleared the limit of ${2:-every account}" ;;
+    *) _fo_card "✻ Failover" "ai failover              priority screen" "ai failover on | off" "ai failover ls" \
+         "ai failover order <member>..." "ai failover clear [member]"; return 1 ;;
   esac
 }
 _fo_toggle() { if _fo_on; then _ai_failover off; else _ai_failover on; fi; }
+_fo_on_text() { if _fo_on; then printf '\033[1;32mon\033[0m'; else printf '\033[2moff\033[0m'; fi; }
+
+# ── screens ────────────────────────────────────────────────
+# a box on stderr in the picker's colors: _fo_card <title> <line>...
+_fo_card() {
+  local t=$1 l v w=0 c=$'\033[38;5;173m' r=$'\033[0m'; shift
+  for l in "$@"; do v=$(printf '%s' "$l" | sed $'s/\033\\[[0-9;]*m//g'); [ ${#v} -gt $w ] && w=${#v}; done
+  w=$((w + 4)); [ $w -ge $((${#t} + 6)) ] || w=$((${#t} + 6))
+  {
+    printf '\n%s╭─ \033[1m%s%s%s %s╮%s\n' "$c" "$t" "$r" "$c" "$(rep ─ $((w - ${#t} - 3)))" "$r"
+    for l in "$@"; do printf '%s│%s  %s  %s│%s\n' "$c" "$r" "$(pad "$l" $((w - 4)))" "$c" "$r"; done
+    printf '%s╰%s╯%s\n' "$c" "$(rep ─ $w)" "$r"
+  } >&2
+}
+# the order as a card, for `ai failover ls|order`
+_fo_show() {
+  local lines=() l
+  while IFS= read -r l; do [ -n "$l" ] && lines+=("$l"); done <<EOF
+$(_fo_rows | cut -f3)
+EOF
+  _fo_card "✻ Failover: $(_fo_state)" "$(dim 'top is tried first · change it: ai failover')" "" ${lines[@]+"${lines[@]}"}
+}
+# who a member is, for people: its label and name
+_fo_label() {
+  local l
+  case $1 in claude/*) echo "Claude account ${1#claude/}" ;; *) l=$(_ai_get "$1" 3); echo "${l:-$1}${l:+ ($1)}" ;; esac
+}
+# countdown under a card. Prints go (enter, any key or time up) | order (o) | stop (q).
+_fo_wait() {
+  local i k rc
+  for ((i = ${AI_FO_WAIT:-5}; i > 0; i--)); do
+    printf '\r\033[2m  switching in %ds · enter now · o change order · q stop \033[0m' $i >&2
+    k=; IFS= read -r -s -n 1 -t 1 k; rc=$?
+    case $k in q|Q) printf '\n' >&2; echo stop; return ;; o|O) printf '\n' >&2; echo order; return ;; esac
+    [ $rc = 0 ] && break
+  done
+  printf '\n' >&2; echo go
+}
 
 # ── members and their priority ─────────────────────────────
 # every account failover can use: member TAB kind (claude|codex), in providers order
@@ -101,11 +140,11 @@ _fo_rows() {
   done
 }
 _fo_ui() {
-  has jq || { echo "failover needs jq"; return 1; }
+  has jq || { _fo_card "✻ Failover" "Failover needs jq (brew install jq / apt install jq)"; return 1; }
   local out key m rows
   while :; do
     rows=$(_fo_rows)
-    [ -n "$rows" ] || { echo "no Claude or Codex accounts to fail over between"; return 1; }
+    [ -n "$rows" ] || { _fo_card "✻ Failover" "No Claude or Codex accounts yet." "Add one: cla add <name>  ·  ai add <name> codex"; return 1; }
     out=$(_ai_choose " ✻ Failover: $(_fo_state) " \
       'top = first · ctrl-u up · ctrl-d down · ctrl-x on/off · ctrl-r clear limit · ctrl-f failover on/off · esc back' \
       order "$rows") || return 0
@@ -114,7 +153,7 @@ _fo_ui() {
       up|down) _fo_list | _fo_move "$m" "$key" | _fo_save ;;
       toggle) _fo_list | _fo_set "$m" | _fo_save ;;
       clear) rm -f "$AI_FO_STATE/limited/$m" ;;
-      failover) _fo_toggle >/dev/null ;;
+      failover) _fo_toggle 2>/dev/null || { _fo_toggle; sleep 2; } ;;
       *) return 0 ;;
     esac
   done
@@ -161,7 +200,7 @@ _fo_launch_claude() {
        if [ -n "${FO_BASE_CFG:-}" ]; then CLAUDE_CONFIG_DIR=$FO_BASE_CFG; export CLAUDE_CONFIG_DIR; else unset CLAUDE_CONFIG_DIR; fi
        c=$(_ai_cmd "$m" claude) ;;
   esac
-  AI_FO_MEMBER=$m _ai_exec "$c --plugin-dir $(printf %q "$(native_path "$AI_FO_MOD")")" "$@"
+  AI_FO_MEMBER=$(_fo_label "$m") _ai_exec "$c --plugin-dir $(printf %q "$(native_path "$AI_FO_MOD")")" "$@"
 }
 _fo_launch_codex() {
   local m=$1 d; shift
@@ -202,10 +241,9 @@ _fo_run() {
   while :; do
     kind=$(_fo_kind "$m"); tried="$tried$m "
     rm -f "$AI_FO_HANDOFF"
-    echo "failover: using $m" >&2
     if [ "$kind" = codex ]; then
       if [ -n "$tr" ]; then
-        history=$(_fo_handoff "$tr") && [ -n "$history" ] || { echo "failover: empty handoff from $tr" >&2; return 1; }
+        history=$(_fo_handoff "$tr") && [ -n "$history" ] || { _fo_card "✻ Failover" "Could not write a handoff from" "$tr"; return 1; }
         set -- "$AI_FO_PROMPT Below is the end of the Claude Code transcript (full file: $tr).
 
 $history"
@@ -222,18 +260,31 @@ $history"
       dest=$(_fo_claude_dir "$m")/projects/$(basename "$(dirname "$tr")")
       mkdir -p "$dest" && { [ "$tr" -ef "$dest/$(basename "$tr")" ] || {
         cp "$tr" "$dest/" && { [ ! -d "${tr%.jsonl}" ] || cp -R "${tr%.jsonl}" "$dest/"; }; }; } ||
-        { echo "failover: could not copy $tr" >&2; return 1; }
+        { _fo_card "✻ Failover" "Could not copy the session to $(_fo_label "$m")" "$tr"; return 1; }
       run=(${FO_KEEP[@]+"${FO_KEEP[@]}"} --resume "$sid" "$AI_FO_PROMPT")
     fi
     first=0
+    AI_FO_NEXT=$(_fo_next "$tried"); AI_FO_NEXT=${AI_FO_NEXT:+$(_fo_label "$AI_FO_NEXT")}; export AI_FO_NEXT
     _fo_launch_claude "$m" ${run[@]+"${run[@]}"}; rc=$?
     [ -f "$AI_FO_HANDOFF" ] || return $rc   # ended normally: no limit hit
     mkdir -p "$(dirname "$AI_FO_STATE/limited/$m")" && touch "$AI_FO_STATE/limited/$m"
     sid=$(jq -r '.session_id // empty' "$AI_FO_HANDOFF"); tr=$(jq -r '.transcript_path // empty' "$AI_FO_HANDOFF")
     [ -f "$tr" ] || { sid=; tr=; }
     rm -f "$AI_FO_HANDOFF"
-    local prev=$m
-    m=$(_fo_next "$tried") || { echo "failover: $prev hit its limit and no account is left (see: ai failover)" >&2; return 1; }
-    echo "failover: $prev hit its limit, moving ${sid:+session $sid }to $m" >&2
+    local prev=$m k
+    printf '\033[H\033[2J' >&2   # a clean screen for the switch, not claude's exit text
+    while :; do
+      if m=$(_fo_next "$tried"); then
+        _fo_card "✻ Failover" "$(_fo_label "$prev") hit its usage limit." \
+          "→ Moving ${sid:+this session }to $(_fo_label "$m")."
+        case $(_fo_wait) in go) break ;; stop) return 1 ;; esac
+      else
+        _fo_card "✻ Failover" "$(_fo_label "$prev") hit its usage limit." "No other account is on and free right now."
+        printf '\033[2m  o change order · any other key stops \033[0m' >&2
+        k=; IFS= read -r -s -n 1 k; printf '\n' >&2
+        case $k in o|O) ;; *) return 1 ;; esac
+      fi
+      _fo_ui; _fo_on || return 1
+    done
   done
 }

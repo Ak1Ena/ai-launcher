@@ -53,7 +53,7 @@ ai_main() {
       add) _ai_add ;;
       edit) _ai_edit "$name" ;;
       delete) _ai_rm "$name" ;;
-      failover) _fo_toggle ;;
+      failover) _fo_toggle 2>/dev/null || { _fo_toggle; sleep 2; } ;;   # the title shows the new state
       order) _fo_ui ;;
       *) [ "$key" = team ] && export AI_TEAM=1
          _ai_run "$name" "$id" "$@"; return ;;
