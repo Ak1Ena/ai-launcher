@@ -14,7 +14,7 @@ Works on macOS, Linux and Windows (PowerShell, CMD or WSL). Nothing extra to ins
 
 ## TUI (preview)
 
-A terminal UI that shows every account in a sidebar with its priority, on/off state and usage. Each CLI runs inside a tab on the right. When failover triggers, the session switches to the next account in the same tab, after a 5 second notice (press enter to switch now).
+A terminal UI that shows every account in a sidebar with its priority, on/off state and usage. Each CLI runs inside a tab on the right. When failover triggers, the session switches to the next account in the same tab, after a 5 second notice (press enter to switch now). When a newer version is on npm, a notice appears in the title bar (checked at most once a day in the background; set `AI_LAUNCHER_NO_UPDATE_CHECK=1` to disable).
 
 Install:
 

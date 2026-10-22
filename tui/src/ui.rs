@@ -168,6 +168,24 @@ fn title_bar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     f.render_widget(Paragraph::new(switch).style(sw_style), sw_rect);
     hits.buttons.push((sw_rect, Button::Failover));
 
+    let mut limit = sw_rect.x;
+    if let Some(v) = &app.update {
+        let pill = format!(" ↑ v{v} available · npm i -g ai-launcher ");
+        let pw = pill.chars().count() as u16;
+        if let Some(px) = sw_rect.x.checked_sub(pw + 1) {
+            let r = Rect {
+                x: px,
+                width: pw,
+                ..area
+            };
+            f.render_widget(
+                Paragraph::new(pill).style(Style::new().fg(Color::Black).bg(WARN)),
+                r,
+            );
+            limit = px;
+        }
+    }
+
     let mut x = area.x + brand.chars().count() as u16 + 1;
     for (i, t) in app.tabs.iter().enumerate() {
         let active = i == app.current;
@@ -178,7 +196,7 @@ fn title_bar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         };
         let label = format!(" {} {mark}{} ", i + 1, short(app, &t.member));
         let w = label.chars().count() as u16 + 2;
-        if x + w >= sw_rect.x {
+        if x + w >= limit {
             break;
         }
         let style = if active {

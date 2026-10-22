@@ -87,11 +87,18 @@ pub struct App {
     pane_drag: bool,
     /// sidebar row and time of the last click, for double-click to open
     last_click: Option<(usize, Instant)>,
+    /// newer version found on npm
+    pub update: Option<String>,
+    update_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
 
 impl App {
     pub fn new(args: Vec<String>) -> App {
-        App::with_paths(Paths::from_env(), args)
+        let paths = Paths::from_env();
+        let rx = crate::update::spawn_check(paths.fo_state.parent().unwrap_or(&paths.fo_state));
+        let mut app = App::with_paths(paths, args);
+        app.update_rx = Some(rx);
+        app
     }
 
     pub fn with_paths(paths: Paths, args: Vec<String>) -> App {
@@ -117,6 +124,8 @@ impl App {
             flash: None,
             pane_drag: false,
             last_click: None,
+            update: None,
+            update_rx: None,
         };
         app.refresh();
         app
@@ -756,6 +765,11 @@ impl App {
 
     /// Called every frame: notices CLIs that ended and runs due switches.
     pub fn tick(&mut self) {
+        if let Some(v) = self.update_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.say(format!("Update v{v}: npm i -g ai-launcher"));
+            self.update = Some(v);
+            self.update_rx = None;
+        }
         if self
             .flash
             .as_ref()

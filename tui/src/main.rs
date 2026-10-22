@@ -7,6 +7,7 @@ mod failover;
 mod form;
 mod pane;
 mod ui;
+mod update;
 mod usage;
 
 use crossterm::event::{
