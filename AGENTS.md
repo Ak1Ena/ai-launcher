@@ -19,6 +19,10 @@ A bash command-line tool. `bin/ai` shows a picker of coding-agent CLIs with plan
 | `mods/failover/` | Claude Code mod. Its `classic.StopFailure` hook, on `rate_limit`, writes `$AI_FO_HANDOFF` and ends that claude. |
 | `plugins/<name>.sh` | Usage rows or a custom launch for the provider named `<name>`. `claude.sh` also implements `cla` / `cla-team`. |
 | `scripts/statusline-usage.sh` | Claude Code status line command that saves `rate_limits` to `$CLAUDE_CONFIG_DIR/usage/usage.json`. |
+| `tui/` | Rust TUI (`ai-launcher`): sidebar of accounts, each CLI in a tab, failover in place. |
+| `.github/workflows/` | `ci.yml` (branches/PRs), `release.yml` (build all platforms, draft release), `npm-publish.yml` (on publish). |
+| `npm/` | npm package files: `ai-launcher` main package and `platform-template`. |
+| `scripts/npm-pack.sh` | Builds the npm packages from release binaries. |
 | `tests/check.sh` | Self-check of every feature against a fake `$HOME`. |
 | `docs/screenshot.png` | README image, rendered from demo data. |
 
@@ -31,6 +35,8 @@ A bash command-line tool. `bin/ai` shows a picker of coding-agent CLIs with plan
 - **Providers file:** `~/.config/ai-launcher/providers` (override with `$AI_PROVIDERS`), with lines `name<TAB>command<TAB>label`. Only `_ai_put` writes it, and it keeps line order.
 - **Launch commands:** the saved string is the user's own config, so it runs through `bash -c` like a shell alias, with extra args passed as `"$@"`.
 - **Trust hooks:** `_ai_trust_<name>_has <dir>` and `_ai_trust_<name>_add <dir>`. `<dir>` is the resolved path (`pwd -P`), because agents store `getcwd()`.
+
+- **TUI shares config:** `tui/` must keep reading and writing the same files and formats as the bash tool (providers file, failover order and flag, limited marks, handoff files), so both stay usable together.
 
 ## Bash 3.2 rules
 
@@ -67,6 +73,12 @@ Use `date +%s` for the current time. Use `${arr[@]+"${arr[@]}"}` to expand array
 bash tests/check.sh                 # must print "all passed"
 /bin/bash tests/check.sh            # macOS: same on bash 3.2
 for f in bin/ai lib/*.sh plugins/*.sh; do bash -n "$f"; done
+```
+
+For the Rust TUI:
+
+```bash
+cd tui && cargo fmt --check && cargo clippy -- -D warnings && cargo test
 ```
 
 Add a check to `tests/check.sh` for any new behaviour. Tests must use the fake `$HOME` the script sets up, and never real config files.

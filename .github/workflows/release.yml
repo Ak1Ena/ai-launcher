@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash tests/check.sh
-      - run: bash -n bin/ai lib/*.sh plugins/*.sh
+      - run: for f in bin/ai lib/*.sh plugins/*.sh; do bash -n "$f"; done
   rust:
     strategy:
       matrix:

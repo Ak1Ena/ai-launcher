@@ -105,12 +105,15 @@ impl Pane {
                         break;
                     }
                     let reply = {
-                        let mut p = screen.lock().unwrap();
+                        let mut p = screen.lock().unwrap_or_else(|e| e.into_inner());
                         p.process(&buf[..n]);
                         std::mem::take(&mut p.callbacks_mut().0)
                     };
                     if !reply.is_empty() {
-                        let _ = writer.lock().unwrap().write_all(&reply);
+                        let _ = writer
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .write_all(&reply);
                     }
                 }
             });
@@ -142,21 +145,37 @@ impl Pane {
             .set_size(rows, cols);
     }
 
+    // shortcut: writes on the UI thread, so a huge paste to a CLI that isn't reading blocks the
+    // TUI until it reads; move writes to a thread if that shows up.
     pub fn write(&self, bytes: &[u8]) {
-        let _ = self.writer.lock().unwrap().write_all(bytes);
+        let _ = self
+            .writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write_all(bytes);
     }
 
     pub fn key(&self, key: KeyEvent) {
-        let app_cursor = self.screen.lock().unwrap().screen().application_cursor();
+        let app_cursor = self
+            .screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .screen()
+            .application_cursor();
         if let Some(b) = encode_key(key, app_cursor) {
             self.write(&b);
         }
     }
 
     pub fn paste(&self, text: &str) {
-        let bracketed = self.screen.lock().unwrap().screen().bracketed_paste();
-        if bracketed {
-            self.write(format!("\x1b[200~{text}\x1b[201~").as_bytes());
+        let wants = self
+            .screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .screen()
+            .bracketed_paste();
+        if wants {
+            self.write(bracketed(text).as_bytes());
         } else {
             self.write(text.as_bytes());
         }
@@ -178,6 +197,12 @@ impl Drop for Pane {
             self.kill();
         }
     }
+}
+
+/// A paste wrapped for a CLI that asked for bracketed paste. Escapes are dropped: a pasted
+/// "\x1b[201~" would end the paste early and the rest would arrive as typed keys.
+pub fn bracketed(text: &str) -> String {
+    format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
 }
 
 /// Bytes a terminal sends for a key press (xterm encoding).
@@ -273,6 +298,14 @@ mod tests {
         );
         assert_eq!(k(KeyCode::Enter, KeyModifiers::SHIFT), b"\x1b\r".to_vec());
         assert_eq!(k(KeyCode::F(5), KeyModifiers::NONE), b"\x1b[15~".to_vec());
+    }
+
+    #[test]
+    fn paste_cannot_end_itself_early() {
+        assert_eq!(
+            bracketed("a\x1b[201~rm -rf ~\n"),
+            "\x1b[200~a[201~rm -rf ~\n\x1b[201~"
+        );
     }
 
     #[test]

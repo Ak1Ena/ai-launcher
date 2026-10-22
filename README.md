@@ -12,6 +12,43 @@ One command for all your AI coding agents. Type `ai` to see every agent and acco
 
 Works on macOS, Linux and Windows (PowerShell, CMD or WSL). Nothing extra to install: it's plain bash.
 
+## TUI (preview)
+
+A terminal UI that shows every account in a sidebar with its priority, on/off state and usage. Each CLI runs inside a tab on the right. When failover triggers, the session switches to the next account in the same tab, after a 5 second notice (press enter to switch now).
+
+Install:
+
+```bash
+npm i -g ai-launcher            # once published
+cd tui && cargo build --release # or build it yourself (binary: tui/target/release/ai-launcher)
+```
+
+Run `ai-launcher [claude args]`. The first CLI you open gets those args.
+
+It reads and writes the same config as the bash `ai` (providers file, failover order and flag), so you can use both.
+
+| Key (sidebar) | Does |
+| --- | --- |
+| `up` `down` / `k` `j` | move selection |
+| `enter` | open the selected account in a tab |
+| `shift-up` `shift-down` / `K` `J` | change the order (top is tried first) |
+| `space` | leave an account out / back in |
+| `f` | failover on / off |
+| `r` | clear the account's limit |
+| `1`-`9` | go to tab n |
+| `tab` | next tab |
+| `x` | close tab |
+| `ctrl-\` | move to the running CLI |
+| `q` / `ctrl-c` | quit |
+
+| Key (in a tab) | Does |
+| --- | --- |
+| `ctrl-\` | back to the list (all other keys go to the CLI) |
+| `enter` | on a failover notice: switch now; on an ended tab: restart it |
+| `o` | on a failover notice: go to the list to pick another account |
+| `q` / `esc` | on a failover notice: stay on the ended session |
+| `x` | on an ended tab: close it |
+
 ## Install
 
 Nothing to install first. It's plain bash, which is built into macOS and Linux, and comes with Git for Windows (Claude Code on Windows needs Git anyway). It works from any shell.
@@ -191,6 +228,10 @@ bash tests/check.sh
 ```
 
 This runs every feature against a throwaway home folder and never touches your real configs.
+
+## Releases
+
+CI runs on branches and PRs. Every merge to main builds all platforms and creates or updates a draft release `v<version>`, where the version is in `tui/Cargo.toml`. Publishing the draft triggers the npm publish (needs the `NPM_TOKEN` secret). Bump the version in `tui/Cargo.toml` before the next release.
 
 ## License
 

@@ -42,7 +42,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     match app.tabs.get(app.current) {
         Some(tab) => {
             if let Some(p) = &tab.pane {
-                let parser = p.screen.lock().unwrap();
+                let parser = p.screen.lock().unwrap_or_else(|e| e.into_inner());
                 let mut cursor = Cursor::default();
                 if app.focus != Focus::Pane || tab.notice.is_some() {
                     cursor.hide();

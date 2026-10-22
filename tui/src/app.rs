@@ -273,6 +273,10 @@ impl App {
                 tab.notice = Some(Notice::Ended { code: 1 });
             }
             (Some(Notice::NoneLeft { .. }), KeyCode::Enter) => self.retry(self.current),
+            // a failed switch: try the switch again, the session is still there
+            (Some(Notice::Error(_)), KeyCode::Enter) if tab.done && tab.session.is_some() => {
+                self.retry(self.current)
+            }
             (Some(Notice::Ended { .. } | Notice::Error(_)), KeyCode::Enter) => {
                 let member = tab.member.clone();
                 self.tabs.remove(self.current);
@@ -321,7 +325,13 @@ impl App {
 
     /// Opens a new tab running the entry, with the args `ai-launcher` got the first time.
     pub fn open(&mut self, id: &str) {
-        let args = self.first_args.take().unwrap_or_default();
+        // the args ai-launcher got are claude args: only a Claude entry takes them
+        let is_claude = self.entry(id).is_some_and(|e| e.kind == Kind::Claude);
+        let args = if is_claude {
+            self.first_args.take().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let flags = self
             .value_flags
             .get_or_insert_with(failover::value_flags)
@@ -454,24 +464,23 @@ impl App {
     }
 
     fn switch_now(&mut self, t: usize) {
-        let Some(Notice::Switch { to, .. }) = self.tabs[t].notice.take() else {
+        if !matches!(self.tabs[t].notice, Some(Notice::Switch { .. })) {
             return;
-        };
-        // the order may have changed while the notice was up
-        let to = if config::limited_left(&self.paths, &to).is_none() {
-            to
-        } else {
-            match failover::next_member(&self.paths, &self.entries(), &self.tabs[t].tried) {
-                Some(n) => n,
-                None => return self.retry(t),
-            }
+        }
+        self.tabs[t].notice = None;
+        if !self.failover {
+            self.tabs[t].notice = Some(Notice::Ended { code: 1 });
+            return;
+        }
+        // the order, on/off and limits may have changed while the notice was up
+        let Some(to) = failover::next_member(&self.paths, &self.entries(), &self.tabs[t].tried)
+        else {
+            return self.retry(t);
         };
         let Some(entry) = self.entry(&to) else {
             return self.retry(t);
         };
         let tab = &mut self.tabs[t];
-        tab.member = to.clone();
-        tab.tried.push(to.clone());
         let args = match (entry.kind, &tab.session) {
             (Kind::Claude, Some((sid, transcript))) => {
                 let dir = config::claude_dir(&self.paths, &entry, self.base_config.as_deref());
@@ -498,10 +507,13 @@ impl App {
             // no transcript yet: start over with the prompt
             _ => tab.split.prompt.clone().into_iter().collect(),
         };
+        tab.member = to.clone();
+        tab.tried.push(to);
         self.launch(t, args);
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        let (rows, cols) = (rows.max(1), cols.max(1));
         self.pane_size = (rows, cols);
         for t in &mut self.tabs {
             if let Some(p) = &mut t.pane {
