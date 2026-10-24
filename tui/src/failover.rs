@@ -157,10 +157,23 @@ pub fn read_handoff(path: &Path) -> Option<Handoff> {
 
 /// Next member to try: on, not tried in this run, not cooling down.
 pub fn next_member(paths: &Paths, entries: &[Entry], tried: &[String]) -> Option<String> {
-    config::order(paths, entries)
+    let order = config::order(paths, entries);
+    let members = order
+        .iter()
+        .map(|(m, on)| (m.as_str(), *on, config::limited_left(paths, m).is_some()));
+    pick(members, tried).map(String::from)
+}
+
+/// The failover rule over `(member, on, limited)` in priority order: the first that is on,
+/// not limited and not tried in this run. Shared by the real switch and the `next:` hint.
+pub fn pick<'a>(
+    members: impl IntoIterator<Item = (&'a str, bool, bool)>,
+    tried: &[String],
+) -> Option<&'a str> {
+    members
         .into_iter()
-        .find(|(m, on)| *on && !tried.contains(m) && config::limited_left(paths, m).is_none())
-        .map(|(m, _)| m)
+        .find(|(m, on, limited)| *on && !limited && !tried.iter().any(|t| t == m))
+        .map(|(m, ..)| m)
 }
 
 /// Copies the session into the next account's config folder so `--resume` finds it there,
@@ -248,6 +261,19 @@ mod tests {
 
     fn v(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn pick_takes_first_on_free_untried_member() {
+        let m = [
+            ("a", true, false),
+            ("b", false, false),
+            ("c", true, true),
+            ("d", true, false),
+        ];
+        assert_eq!(pick(m, &[]), Some("a"));
+        assert_eq!(pick(m, &["a".into()]), Some("d"));
+        assert_eq!(pick(m, &["a".into(), "d".into()]), None);
     }
 
     #[test]
