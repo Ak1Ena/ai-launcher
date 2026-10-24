@@ -435,6 +435,20 @@ pub fn claude_dir(paths: &Paths, entry: &Entry, base: Option<&Path>) -> PathBuf 
         .unwrap_or_else(|| paths.home.join(".claude"))
 }
 
+/// The `.claude.json` (login, trust) a Claude entry uses: inside its config folder, except for
+/// the default login with no CLAUDE_CONFIG_DIR, which keeps it at `~/.claude.json`.
+pub fn claude_json(paths: &Paths, entry: &Entry, base: Option<&Path>) -> PathBuf {
+    let dir = claude_dir(paths, entry, base);
+    let default = !entry.id.starts_with("claude/")
+        && base.is_none()
+        && !entry.command.contains("CLAUDE_CONFIG_DIR=");
+    if default {
+        paths.home.join(".claude.json")
+    } else {
+        dir.join(".claude.json")
+    }
+}
+
 /// A Codex or Gemini provider's own login folder, made by `ai add` for a 2nd login of the same CLI.
 pub fn account_dir(paths: &Paths, entry: &Entry) -> Option<PathBuf> {
     let a = agent(&entry.command);
@@ -648,6 +662,33 @@ mod tests {
             codex_home: root.join("home/.codex"),
             cooldown: Duration::from_secs(60),
         }
+    }
+
+    #[test]
+    fn claude_json_is_in_the_config_dir_except_for_the_default_login() {
+        let p = tmp_paths("cjson");
+        let e = |id: &str, cmd: &str| Entry {
+            id: id.into(),
+            command: cmd.into(),
+            label: id.into(),
+            kind: Kind::Claude,
+        };
+        assert_eq!(
+            claude_json(&p, &e("claude/w", "claude"), None),
+            p.cla_root.join("w/.claude.json")
+        );
+        assert_eq!(
+            claude_json(&p, &e("claude", "claude"), None),
+            p.home.join(".claude.json")
+        );
+        assert_eq!(
+            claude_json(&p, &e("claude", "claude"), Some(Path::new("/x/.claude"))),
+            Path::new("/x/.claude/.claude.json")
+        );
+        assert_eq!(
+            claude_json(&p, &e("c2", "CLAUDE_CONFIG_DIR=~/.claude claude"), None),
+            p.home.join(".claude/.claude.json")
+        );
     }
 
     #[test]

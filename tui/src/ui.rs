@@ -134,9 +134,14 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
 
 // ── title bar: name, tabs, failover switch ───────────────
 
+/// A member id without its `claude/` prefix: the Claude account's own name.
+fn bare(id: &str) -> &str {
+    id.strip_prefix("claude/").unwrap_or(id)
+}
+
 fn short(app: &App, id: &str) -> String {
     match id.strip_prefix("claude/") {
-        Some(acct) => format!("Claude · {acct}"),
+        Some(_) => format!("Claude · {}", bare(id)),
         None => app
             .rows
             .iter()
@@ -446,9 +451,9 @@ fn row_lines(
         )
     });
     let used = 5
-        + name.chars().count()
+        + dw(&name)
         + if running { 2 } else { 0 }
-        + weight.as_ref().map_or(0, |w| w.content.chars().count())
+        + weight.as_ref().map_or(0, Span::width)
         + right.as_ref().map_or(0, |_| SWITCH_W as usize);
     top.push(Span::raw(
         " ".repeat((width as usize).saturating_sub(used + 1)),
@@ -482,9 +487,7 @@ fn row_lines(
             .max_by_key(|&i| wins[i].percent)
             .unwrap_or(0);
         let avail = (width as usize).saturating_sub(5);
-        let at = wins[most]
-            .resets_at
-            .map(|t| format!(" ↻ {}", usage::local_hm(t)));
+        let at = wins[most].reset.as_ref().map(|t| format!(" ↻ {t}"));
         let build = |w: usize, reset: bool| {
             let mut out = Vec::new();
             for (i, win) in wins.iter().enumerate() {
@@ -501,11 +504,12 @@ fn row_lines(
             }
             out
         };
-        let pick = [(base, true), (base - 1, true), (base - 2, true)]
+        let pick = [true, false]
             .into_iter()
+            .flat_map(|reset| [base, base - 1, base - 2].map(|w| (w, reset)))
             .map(|(w, reset)| build(w, reset))
             .find(|sp| width_of(sp) <= avail)
-            .unwrap_or_else(|| build(base, false));
+            .unwrap_or_else(|| build(base - 2, false));
         bottom.extend(pick);
     }
     (Line::from(top), Line::from(bottom))
@@ -649,16 +653,23 @@ struct Cols {
     email: bool,
 }
 
+/// The welcome table's usage cells: the 5h and 7d windows by label (none where missing), or
+/// with one column only, the most-used window. Windows with other labels fill in by order.
+fn columns(wins: &[usage::Window], two: bool) -> Vec<Option<&usage::Window>> {
+    if !two {
+        return vec![wins.iter().max_by_key(|w| w.percent)];
+    }
+    let by = |l: &str| wins.iter().find(|w| w.label == l);
+    match (by("5h"), by("7d")) {
+        (None, None) => vec![wins.first(), wins.get(1)],
+        (a, b) => vec![a, b],
+    }
+}
+
 /// One row per account like the bash picker: name, email, 5h and 7d bars with reset times.
 fn welcome(f: &mut Frame, app: &App, area: Rect) {
     let now = usage::now_secs();
-    let name = |r: &Row| {
-        r.entry
-            .id
-            .strip_prefix("claude/")
-            .unwrap_or(&r.entry.id)
-            .to_string()
-    };
+    let name = |r: &Row| bare(&r.entry.id).to_string();
     let who = |r: &Row| match (&r.usage.email, r.entry.kind) {
         (Some(e), _) => e.clone(),
         (None, Kind::Claude) => "not logged in".into(),
@@ -669,23 +680,7 @@ fn welcome(f: &mut Frame, app: &App, area: Rect) {
     };
     let name_w = app.rows.iter().map(|r| dw(&name(r))).max().unwrap_or(0);
     let who_w = app.rows.iter().map(|r| dw(&who(r))).max().unwrap_or(0);
-    // reset times per row and window, formatted once for all layouts tried below
-    let resets: Vec<Vec<String>> = app
-        .rows
-        .iter()
-        .map(|r| {
-            r.usage
-                .windows
-                .iter()
-                .map(|w| {
-                    w.resets_at
-                        .map(|t| format!("↻ {}", usage::local_hm(t)))
-                        .unwrap_or_default()
-                })
-                .collect()
-        })
-        .collect();
-    let row_line = |(r, resets): (&Row, &Vec<String>), c: Cols| -> Line<'static> {
+    let row_line = |r: &Row, c: Cols| -> Line<'static> {
         let mut sp = vec![Span::styled(
             format!("{}  ", pad(&name(r), name_w)),
             s(Color::White).add_modifier(Modifier::BOLD),
@@ -702,19 +697,23 @@ fn welcome(f: &mut Frame, app: &App, area: Rect) {
             sp.push(Span::styled("no usage data", s(FAINT)));
             return Line::from(sp);
         }
-        for (i, w) in r
-            .usage
-            .windows
-            .iter()
-            .take(if c.second { 2 } else { 1 })
-            .enumerate()
-        {
+        let cell_w = 3 + c.bar + 5 + if c.reset { 12 } else { 0 };
+        for (i, w) in columns(&r.usage.windows, c.second).into_iter().enumerate() {
             if i > 0 {
                 sp.push(Span::raw("  "));
             }
+            let Some(w) = w else {
+                sp.push(Span::raw(" ".repeat(cell_w)));
+                continue;
+            };
             sp.extend(meter(&w.label, w.percent, c.bar, true));
             if c.reset {
-                sp.push(Span::styled(format!(" {}", pad(&resets[i], 11)), s(FAINT)));
+                let at = w
+                    .reset
+                    .as_ref()
+                    .map(|t| format!("↻ {t}"))
+                    .unwrap_or_default();
+                sp.push(Span::styled(format!(" {}", pad(&at, 11)), s(FAINT)));
             }
         }
         if let Some(note) = r
@@ -765,8 +764,7 @@ fn welcome(f: &mut Frame, app: &App, area: Rect) {
     let table_w = |c: Cols| {
         app.rows
             .iter()
-            .zip(&resets)
-            .map(|rr| row_line(rr, c).width())
+            .map(|r| row_line(r, c).width())
             .max()
             .unwrap_or(0)
     };
@@ -795,7 +793,7 @@ fn welcome(f: &mut Frame, app: &App, area: Rect) {
             s(MUTED),
         )));
     }
-    lines.extend(app.rows.iter().zip(&resets).map(|rr| row_line(rr, cols)));
+    lines.extend(app.rows.iter().map(|r| row_line(r, cols)));
     let w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let r = centered(area, w, lines.len() as u16);
     f.render_widget(Paragraph::new(lines), r);
@@ -1153,6 +1151,28 @@ mod tests {
         assert_eq!(cells(12, 4), 1);
         assert_eq!(cells(99, 10), 9);
         assert_eq!(cells(100, 10), 10);
+    }
+
+    #[test]
+    fn welcome_columns_by_label_and_most_used() {
+        let w = |label: &str, percent| usage::Window {
+            label: label.into(),
+            percent,
+            ..Default::default()
+        };
+        let labels = |c: Vec<Option<&usage::Window>>| {
+            c.iter()
+                .map(|w| w.map_or("-".to_string(), |w| w.label.clone()))
+                .collect::<Vec<_>>()
+        };
+        let only7 = [w("7d", 40)];
+        assert_eq!(labels(columns(&only7, true)), ["-", "7d"]);
+        let both = [w("5h", 10), w("7d", 40)];
+        assert_eq!(labels(columns(&both, true)), ["5h", "7d"]);
+        assert_eq!(labels(columns(&both, false)), ["7d"]);
+        let odd = [w("1h", 5), w("2d", 9)];
+        assert_eq!(labels(columns(&odd, true)), ["1h", "2d"]);
+        assert_eq!(labels(columns(&[], false)), ["-"]);
     }
 
     #[test]

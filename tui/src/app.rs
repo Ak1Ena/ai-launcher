@@ -187,11 +187,13 @@ impl App {
 
     fn row(&self, entry: Entry, priority: Option<usize>, on: bool) -> Row {
         let usage = match entry.kind {
-            Kind::Claude => usage::claude(&config::claude_dir(
-                &self.paths,
-                &entry,
-                self.base_config.as_deref(),
-            )),
+            Kind::Claude => {
+                let base = self.base_config.as_deref();
+                usage::claude(
+                    &config::claude_dir(&self.paths, &entry, base),
+                    &config::claude_json(&self.paths, &entry, base),
+                )
+            }
             Kind::Codex => usage::codex(
                 &config::account_dir(&self.paths, &entry).unwrap_or(self.paths.codex_home.clone()),
             ),
@@ -378,7 +380,11 @@ impl App {
         let mut o = self.order();
         if let Some(m) = o.iter_mut().find(|(m, _)| m == id) {
             m.1 = !m.1;
-            let state = if m.1 { "on" } else { "off" };
+            let state = if m.1 {
+                "on"
+            } else {
+                "off: skipped by failover"
+            };
             config::save_order(&self.paths, &o);
             self.say(format!("{id} {state}"));
         }
@@ -1102,11 +1108,12 @@ mod tests {
                     label: "5h".into(),
                     percent: 8,
                     resets_at: Some(1_700_000_000),
+                    reset: Some("Tue 12:59".into()),
                 },
                 usage::Window {
                     label: "7d".into(),
                     percent: 100,
-                    resets_at: None,
+                    ..Default::default()
                 },
             ],
             plan: Some("max".into()),
