@@ -2,8 +2,10 @@
 //! `<config>/usage/usage.json`, Codex keeps rate limits in its newest session log.
 
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -12,6 +14,8 @@ pub struct Window {
     pub percent: u8,
     /// when the window resets (unix seconds); none once it has passed
     pub resets_at: Option<i64>,
+    /// `resets_at` as local "Tue 12:59", formatted once when read
+    pub reset: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -31,18 +35,46 @@ fn now() -> f64 {
         .unwrap_or(0.0)
 }
 
-pub fn claude(config_dir: &Path) -> Usage {
+/// `json` is the account's `.claude.json` (see `config::claude_json`).
+pub fn claude(config_dir: &Path, json: &Path) -> Usage {
     let mut u = fs::read_to_string(config_dir.join("usage/usage.json"))
         .map(|t| claude_from(&t, now()))
         .unwrap_or_default();
-    // Claude Code keeps .claude.json inside CLAUDE_CONFIG_DIR, or beside ~/.claude without it
-    let json = if config_dir.ends_with(".claude") {
-        config_dir.with_file_name(".claude.json")
-    } else {
-        config_dir.join(".claude.json")
-    };
-    u.email = fs::read_to_string(json).ok().and_then(|t| email_from(&t));
+    u.email = email(json);
     u
+}
+
+type EmailCache = HashMap<PathBuf, (SystemTime, Option<String>)>;
+static EMAILS: LazyLock<Mutex<EmailCache>> = LazyLock::new(Mutex::default);
+
+/// The login email, parsed again only when `.claude.json` (often large) changes.
+fn email(json: &Path) -> Option<String> {
+    let mtime = fs::metadata(json).and_then(|m| m.modified()).ok()?;
+    let mut cache = EMAILS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((t, e)) = cache.get(json)
+        && *t == mtime
+    {
+        return e.clone();
+    }
+    let e = fs::read_to_string(json).ok().and_then(|t| email_from(&t));
+    cache.insert(json.to_path_buf(), (mtime, e.clone()));
+    e
+}
+
+/// The window's percent and reset time, with a passed reset meaning an empty window again.
+fn window(label: String, pct: f64, resets_at: Option<f64>, now: f64) -> Window {
+    let passed = resets_at.is_some_and(|r| r < now);
+    let resets_at = resets_at.filter(|_| !passed).map(|r| r as i64);
+    Window {
+        label,
+        percent: if passed {
+            0
+        } else {
+            pct.clamp(0.0, 100.0) as u8
+        },
+        resets_at,
+        reset: resets_at.map(local_hm),
+    }
 }
 
 pub fn email_from(text: &str) -> Option<String> {
@@ -100,18 +132,8 @@ pub fn claude_from(text: &str, now: f64) -> Usage {
         .filter_map(|(key, label)| {
             let w = v.get("rate_limits")?.get(*key)?;
             let pct = w.get("used_percentage")?.as_f64()?;
-            // a window whose reset time has passed is empty again
             let at = w.get("resets_at").and_then(Value::as_f64);
-            let passed = at.is_some_and(|r| r < now);
-            Some(Window {
-                label: label.to_string(),
-                percent: if passed {
-                    0
-                } else {
-                    pct.clamp(0.0, 100.0) as u8
-                },
-                resets_at: at.filter(|_| !passed).map(|r| r as i64),
-            })
+            Some(window(label.to_string(), pct, at, now))
         })
         .collect();
     Usage {
@@ -149,10 +171,10 @@ pub fn codex(home: &Path) -> Usage {
     let Some(text) = newest_session(home).and_then(|f| fs::read_to_string(f).ok()) else {
         return Usage::default();
     };
-    codex_from(&text)
+    codex_from(&text, now())
 }
 
-pub fn codex_from(text: &str) -> Usage {
+pub fn codex_from(text: &str, now: f64) -> Usage {
     let Some(rl) = text
         .lines()
         .rev()
@@ -175,11 +197,9 @@ pub fn codex_from(text: &str) -> Usage {
                 m if m > 0 && m % 60 == 0 => format!("{}h", m / 60),
                 m => format!("{m}m"),
             };
-            Some(Window {
-                label,
-                percent: w.get("used_percent")?.as_f64()?.clamp(0.0, 100.0) as u8,
-                resets_at: w.get("resets_at").and_then(Value::as_f64).map(|t| t as i64),
-            })
+            let pct = w.get("used_percent")?.as_f64()?;
+            let at = w.get("resets_at").and_then(Value::as_f64);
+            Some(window(label, pct, at, now))
         })
         .collect();
     Usage {
@@ -218,12 +238,14 @@ mod tests {
                 Window {
                     label: "5h".into(),
                     percent: 34,
-                    resets_at: Some(2000)
+                    resets_at: Some(2000),
+                    reset: Some(local_hm(2000))
                 },
                 Window {
                     label: "7d".into(),
                     percent: 0,
-                    resets_at: None
+                    resets_at: None,
+                    reset: None
                 }
             ]
         );
@@ -253,15 +275,22 @@ mod tests {
     #[test]
     fn codex_reads_last_rate_limits() {
         let log = "{\"x\":1}\n{\"payload\":{\"rate_limits\":{\"primary\":{\"used_percent\":41.0,\"window_minutes\":300,\"resets_at\":1700000000},\"plan_type\":\"plus\"}}}\n";
-        let u = codex_from(log);
+        let u = codex_from(log, 1_600_000_000.0);
         assert_eq!(
             u.windows,
             vec![Window {
                 label: "5h".into(),
                 percent: 41,
-                resets_at: Some(1_700_000_000)
+                resets_at: Some(1_700_000_000),
+                reset: Some(local_hm(1_700_000_000))
             }]
         );
         assert_eq!(u.plan.as_deref(), Some("plus"));
+        // once the reset has passed the window is empty, with no reset time
+        let u = codex_from(log, 1_800_000_000.0);
+        assert_eq!(
+            (u.windows[0].percent, u.windows[0].reset.clone()),
+            (0, None)
+        );
     }
 }
