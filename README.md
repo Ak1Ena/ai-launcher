@@ -2,7 +2,7 @@
 
 One command for all your AI coding agents. Type `ai` to see every agent and account with how much of its plan limit is used, then pick one to start it in the current folder.
 
-![ai picker showing Claude accounts and Codex with usage bars, plus Gemini and OpenCode](docs/screenshot.png)
+![ai-launcher home: every account with usage bars, reset times and a failover switch](docs/tui.png)
 
 - **Every agent in one list.** Claude Code (several accounts), Codex, Gemini, Antigravity, Kimi, OpenCode, Qwen, or any CLI you add.
 - **Usage at a glance.** Shows 5-hour and weekly limits with reset times. Bars turn yellow at 60% and red at 90%.
@@ -10,13 +10,18 @@ One command for all your AI coding agents. Type `ai` to see every agent and acco
 - **Trust a folder once.** If any agent trusts the folder, every agent you start through `ai` trusts it too, so they stop asking.
 - **No API calls.** Usage comes from files the agents already write on your machine.
 
-Works on macOS, Linux and Windows (PowerShell, CMD or WSL). Nothing extra to install: it's plain bash.
+There are two front ends with the same config: the TUI shown above (`npm i -g ai-launcher`), and a plain-bash picker that needs nothing installed ([Use it](#use-it)). Both work on macOS, Linux and Windows (PowerShell, CMD or WSL).
 
 ## TUI (preview)
 
-![ai-launcher TUI: failover order in the sidebar, usage table with reset times on the right](docs/tui.png)
+A terminal UI with two kinds of tabs:
 
-A terminal UI that shows every account in a sidebar with its priority, on/off state and usage. Until you open a tab, the right side shows a usage table like the bash picker: each account's email, 5-hour and weekly bars, and when each limit resets. Each CLI runs inside a tab on the right. Key hints that don't fit the terminal width are dropped, least important first. When failover triggers, the session switches to the next account in the same tab, after a 5 second notice (press enter to switch now). When a newer version is on npm, a notice appears in the title bar (checked at most once a day in the background; set `AI_LAUNCHER_NO_UPDATE_CHECK=1` to disable).
+- **`✻ home`** (the screenshot above) lists every account in failover order: its email, 5-hour and weekly usage bars, when each limit resets, and its `● on` / `○ off` failover switch. Other CLIs are listed below.
+- **One tab per running CLI**, using the full window. The bottom line shows that account's usage and, for Claude, which account failover moves to next.
+
+![a Claude tab: the CLI fills the window, with the account's usage and the next failover account on the bottom line](docs/tui-tab.png)
+
+On a narrow terminal, columns and key hints that don't fit are dropped, least important first. When failover triggers, the session switches to the next account in the same tab, after a 5 second notice (press enter to switch now). When a newer version is on npm, a notice appears in the title bar (checked at most once a day in the background; set `AI_LAUNCHER_NO_UPDATE_CHECK=1` to disable).
 
 Install:
 
@@ -31,7 +36,7 @@ The bash tool is also called `ai` (`bin/ai`, when the repo's `bin` is on your `P
 
 It reads and writes the same config as the bash `ai` (providers file, failover order and flag), so you can use both.
 
-| Key (sidebar) | Does |
+| Key (home) | Does |
 | --- | --- |
 | `up` `down` / `k` `j` | move selection |
 | `enter` | open the selected account in a tab |
@@ -46,7 +51,7 @@ It reads and writes the same config as the bash `ai` (providers file, failover o
 | `n` | round-robin: open the next account (or click `▶ Auto`) |
 | `m` | set the Auto decision model |
 | `r` | clear the account's limit |
-| `x` | close tab |
+| `x` | close the current tab (highlighted in the tab bar) |
 | `1`-`9` | go to tab n |
 | `tab` | next tab |
 | `q` / `ctrl-c` | quit |
@@ -63,13 +68,14 @@ Delete asks first. A Claude account folder moves to `<accounts folder>/.trash`, 
 | --- | --- |
 | `alt-1`-`alt-9` | go to tab n, also while typing in a CLI |
 | `alt-←` `alt-→` | previous / next tab |
-| `ctrl-\` | move between the list and the running CLI |
+| `ctrl-\` | go home, or from home back to the current tab |
+| `alt-0` | go home |
 
 On macOS, alt (⌥) keys need "Option as Meta" turned on in the terminal settings (Terminal: Profiles > Keyboard; iTerm2: Profiles > Keys).
 
 | Mouse | Does |
 | --- | --- |
-| click a tab | go to it |
+| click a tab (or `✻ home`) | go to it |
 | click a tab's `✕` | close it |
 | click an account | select it; click it again to open it |
 | `+ Add` / `✎ Edit` / `✕ Delete` | add, edit or delete the selected account |
@@ -83,7 +89,7 @@ In a tab, every key goes to the CLI except these:
 | Key (in a tab) | Does |
 | --- | --- |
 | `enter` | on a failover notice: switch now; on an ended tab: restart it |
-| `o` | on a failover notice: go to the list to pick another account |
+| `o` | on a failover notice: go home to pick another account |
 | `q` / `esc` | on a failover notice: stay on the ended session |
 | `x` | on an ended tab: close it |
 
@@ -150,6 +156,8 @@ Usage shows up after your next Claude reply. It is only reported on Pro and Max 
 ai                 # pick an agent and start it here
 ai --resume        # extra arguments go to the agent
 ```
+
+![bash picker showing Claude accounts and Codex with usage bars, plus Gemini and OpenCode](docs/screenshot.png)
 
 When a newer version is on npm, the picker shows an `update X available` line. It reads the same once-a-day cache as the TUI (refreshed in the background with `npm view`, only when npm exists). Set `AI_LAUNCHER_NO_UPDATE_CHECK=1` to turn it off.
 
