@@ -86,6 +86,8 @@ pub struct App {
     pub failover: bool,
     /// weighted round-robin mode: Auto opens the next account by weight
     pub wrr: bool,
+    /// entry `ai` opens on start, marked ★ on home
+    pub default: String,
     pub deciding: Option<Deciding>,
     pub quit: bool,
     pub pane_size: (u16, u16),
@@ -113,6 +115,7 @@ impl App {
         let rx = crate::update::spawn_check(paths.fo_state.parent().unwrap_or(&paths.fo_state));
         let mut app = App::with_paths(paths, args);
         app.update_rx = Some(rx);
+        app.open_default();
         app
     }
 
@@ -121,6 +124,7 @@ impl App {
         let mut app = App {
             failover: config::failover_on(&paths),
             wrr: false,
+            default: String::new(),
             deciding: None,
             base_config: std::env::var_os("CLAUDE_CONFIG_DIR")
                 .filter(|v| !v.is_empty())
@@ -181,10 +185,18 @@ impl App {
         self.rows = rows;
         self.failover = config::failover_on(&self.paths);
         self.wrr = config::wrr_on(&self.paths);
+        self.default = config::default_id(&self.paths);
         self.selected = selected
             .and_then(|id| self.rows.iter().position(|r| r.entry.id == id))
             .unwrap_or(0)
             .min(self.rows.len().saturating_sub(1));
+    }
+
+    /// Opens the default entry in a tab, if it still exists.
+    pub fn open_default(&mut self) {
+        if let Some(e) = self.entry(&self.default.clone()) {
+            self.open(&e.id);
+        }
     }
 
     fn row(&self, entry: Entry, priority: Option<usize>, on: bool) -> Row {
@@ -305,6 +317,12 @@ impl App {
             KeyCode::Char(' ') => {
                 if let Some(id) = id {
                     self.toggle_member(&id);
+                }
+            }
+            KeyCode::Char('*') => {
+                if let Some(id) = id {
+                    let new = if self.default == id { "" } else { id.as_str() };
+                    config::set_default(&self.paths, new);
                 }
             }
             KeyCode::Char('f') => config::set_failover(&self.paths, !self.failover),
@@ -1645,5 +1663,28 @@ mod tests {
         alt(&mut a, KeyCode::Right); // wraps
         assert_eq!(a.current, 0);
         assert!(a.focus == Focus::Pane);
+    }
+
+    #[test]
+    fn star_sets_and_clears_the_default_and_start_opens_it() {
+        let mut a = app();
+        select(&mut a, "t1");
+        key(&mut a, KeyCode::Char('*'));
+        assert_eq!(config::default_id(&a.paths), "t1");
+        assert_eq!(a.default, "t1");
+        a.open_default();
+        assert_eq!(a.tabs.len(), 1);
+        assert_eq!(a.tabs[0].member, "t1");
+        a.focus = Focus::Home;
+        key(&mut a, KeyCode::Char('*'));
+        assert!(config::default_id(&a.paths).is_empty());
+        config::set_default(&a.paths, "gone");
+        a.refresh();
+        a.open_default();
+        assert_eq!(
+            a.tabs.len(),
+            1,
+            "a default that no longer exists opens nothing"
+        );
     }
 }

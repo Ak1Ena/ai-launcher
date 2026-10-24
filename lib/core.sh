@@ -74,12 +74,17 @@ _ai_update_notice() {
 
 ai_main() {
   case ${1:-} in
-    ls|add|edit|rm|failover) local sub=$1; shift; "_ai_$sub" "$@"; return ;;
+    ls|add|edit|rm|failover|default) local sub=$1; shift; "_ai_$sub" "$@"; return ;;
     cla) shift; cla_main "$@"; return ;;
     cla-team) shift; cla_team_main "$@"; return ;;
     help|-h|--help) _ai_help; return ;;
   esac
-  local out key row name id
+  local out key row name id d
+  if [ "${1:-}" = pick ]; then shift
+  elif d=$(head -1 "$AI_FO_ORDER.default" 2>/dev/null) && _ai_default_ok "$d"; then
+    case $d in claude/*) _ai_run claude "${d#claude/}" "$@" ;; *) _ai_run "$d" "$d" "$@" ;; esac
+    return
+  fi
   while :; do
     AI_NOTICE=$(_ai_update_notice)
     _ai_seed
@@ -103,8 +108,11 @@ ai_main() {
 
 _ai_help() {
   cat <<'EOF'
-ai                               pick an agent (with plan usage) and start it in this folder
+ai                               pick an agent (with plan usage) and start it in this folder,
+                                 or start the default one straight away if set
 ai [agent args]                  same, extra args go to the agent
+ai pick [agent args]             always show the picker, even with a default
+ai default [name|-]              show / set / clear the default: claude/<account> or a provider
 ai ls                            list agents
 ai add  [name] [command] [label] add an agent (asks for anything left out). A 2nd codex or
                                  gemini gets its own login: ai add work codex
@@ -199,6 +207,25 @@ _ai_rm() {
   [ -n "$n" ] && [ -n "$(_ai_get "$n" 1)" ] || { echo "no provider '$n'. see: ai ls"; return 1; }
   read -r -p "delete provider '$n'? [y/N] " ans
   case $ans in y|Y|yes) _ai_put "$n" && echo "deleted $n (bring back: ai add $n)" ;; *) return 1 ;; esac
+}
+
+# the entry plain `ai` starts without the picker, in <failover>.default (shared with the TUI)
+_ai_default() {
+  local f=$AI_FO_ORDER.default
+  case ${1:-} in
+    '') if [ -s "$f" ]; then head -1 "$f"; else echo "no default. set one: ai default claude/<account> | <provider>"; fi ;;
+    -) rm -f "$f"; echo "default cleared" ;;
+    *) _ai_default_ok "$1" || { echo "no account or provider '$1'. names: claude/<account> (cla ls) or ai ls"; return 1; }
+       mkdir -p "$(dirname "$f")" && echo "$1" > "$f" && echo "default: $1" ;;
+  esac
+}
+# claude/<account> with its folder, or a provider other than claude itself (that one is the cla picker)
+_ai_default_ok() {
+  case $1 in
+    claude/*) case ${1#claude/} in ''|.|..|*/*) return 1 ;; esac; [ -d "$CLA_ROOT/${1#claude/}" ] ;;
+    ''|claude) return 1 ;;
+    *) [ -n "$(_ai_get "$1" 1)" ] ;;
+  esac
 }
 
 # ── rows ───────────────────────────────────────────────────

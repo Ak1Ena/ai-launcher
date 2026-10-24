@@ -44,6 +44,7 @@ It reads and writes the same config as the bash `ai` (providers file, failover o
 | `e` | edit the selected account |
 | `d` | delete the selected account |
 | `shift-up` `shift-down` / `K` `J` | change the order (top is tried first) |
+| `*` | make the account the default (opens on start, marked `★`); again to clear |
 | `space` | turn the account's failover on / off (or click its `● on` / `○ off` switch); an off account is skipped when a limit hits |
 | `f` | failover on / off |
 | `w` | switch between failover and weighted round-robin |
@@ -156,6 +157,19 @@ Usage shows up after your next Claude reply. It is only reported on Pro and Max 
 ai                 # pick an agent and start it here
 ai --resume        # extra arguments go to the agent
 ```
+
+### Default account
+
+Set a default and `ai` starts it straight away, skipping the picker:
+
+```bash
+ai default claude/work   # a Claude account, or any name from `ai ls`
+ai default               # show it
+ai default -             # clear it
+ai pick                  # show the picker anyway
+```
+
+In the TUI, press `*` on a row to make it the default (press again to clear); it is marked `★` and opens in a tab when the TUI starts. Both read the same file, `<failover file>.default`. A default that no longer exists is ignored.
 
 ![bash picker showing Claude accounts and Codex with usage bars, plus Gemini and OpenCode](docs/screenshot.png)
 

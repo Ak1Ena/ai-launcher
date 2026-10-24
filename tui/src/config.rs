@@ -270,7 +270,7 @@ pub fn save_order(paths: &Paths, order: &[(String, bool)]) {
     let _ = fs::write(&paths.fo_order, text);
 }
 
-/// A file beside the order file: `<failover>.on`, `.mode`, `.weights`, `.model`.
+/// A file beside the order file: `<failover>.on`, `.default`, `.mode`, `.weights`, `.model`.
 fn beside(paths: &Paths, ext: &str) -> PathBuf {
     let mut p = paths.fo_order.clone().into_os_string();
     p.push(ext);
@@ -373,6 +373,25 @@ pub fn set_model(paths: &Paths, model: &str) {
         let _ = fs::remove_file(beside(paths, ".model"));
     } else {
         write_beside(paths, ".model", &format!("{model}\n"));
+    }
+}
+
+/// The entry `ai` opens on start (shared with bash); empty when unset.
+pub fn default_id(paths: &Paths) -> String {
+    fs::read_to_string(beside(paths, ".default"))
+        .unwrap_or_default()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+pub fn set_default(paths: &Paths, id: &str) {
+    if id.is_empty() {
+        let _ = fs::remove_file(beside(paths, ".default"));
+    } else {
+        write_beside(paths, ".default", &format!("{id}\n"));
     }
 }
 

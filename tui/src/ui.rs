@@ -455,7 +455,12 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
             },
         })
         .collect();
-    let name_w = |i: usize| dw(bare(&app.rows[i].entry.id)) + if running[i] { 2 } else { 0 };
+    let is_default = |i: usize| app.rows[i].entry.id == app.default;
+    let name_w = |i: usize| {
+        dw(bare(&app.rows[i].entry.id))
+            + if running[i] { 2 } else { 0 }
+            + if is_default(i) { 2 } else { 0 }
+    };
     let names_w = (0..app.rows.len()).map(name_w).max().unwrap_or(0);
     let who_w = who.iter().map(|w| dw(w)).max().unwrap_or(0);
     // everything before the weight and switch
@@ -477,6 +482,9 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
                 s(Color::White).add_modifier(Modifier::BOLD)
             },
         ));
+        if is_default(i) {
+            sp.push(Span::styled(" ★", s(ACCENT)));
+        }
         if running[i] {
             sp.push(Span::styled(" ●", s(GOOD)));
         }
@@ -1044,6 +1052,7 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
             (3, hint("d", "delete")),
             (2, hint("shift-↑↓", "order")),
             (2, hint("space", "on/off")),
+            (3, hint("*", "default")),
             (1, hint("f", "failover")),
             (1, hint("w", "mode")),
         ];

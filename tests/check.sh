@@ -212,4 +212,16 @@ ok "update: stale cache shows nothing, refreshes in background" '[ -e "$T/npm.ca
 unset -f npm; rm -f "$uc"
 ok "update: no cache, no npm -> silent"                  '[ -z "$(PATH=$T/nonpm:/usr/bin:/bin _ai_update_notice)" ] && [ ! -e "$uc" ]'
 
+# ── default account ──
+mkdir -p "$T/dbin"; printf '#!/bin/sh\necho "dflt $*"\n' > "$T/dbin/dflt"; chmod +x "$T/dbin/dflt"
+_ai_put dflt "$T/dbin/dflt" Dflt; rm -f "$AI_FO_ORDER.default"
+ok "default: unknown name refused"     '! _ai_default nosuch >/dev/null && ! _ai_default claude >/dev/null && ! _ai_default claude/.. >/dev/null && [ ! -e "$AI_FO_ORDER.default" ]'
+_ai_default dflt >/dev/null
+ok "default: saved beside failover"    '[ "$(cat "$AI_FO_ORDER.default")" = dflt ] && [ "$(_ai_default)" = dflt ]'
+ok "default: ai starts it with args"   '[ "$(ai_main --x 2>&1)" = "dflt --x" ]'
+ok "default: ai pick skips it"         '[ "$(echo q | PATH=/usr/bin:/bin ai_main pick 2>/dev/null)" != "dflt " ]'
+ok "default: claude/<account> valid"   '_ai_default_ok claude/one'
+_ai_put dflt; ok "default: gone -> picker" '[ "$(echo q | PATH=/usr/bin:/bin ai_main 2>/dev/null)" = "" ]'
+_ai_default - >/dev/null; ok "default: cleared" '[ ! -e "$AI_FO_ORDER.default" ]'
+
 echo; if [ $fails -gt 0 ]; then echo "$fails failed"; exit 1; else echo "all passed"; fi
