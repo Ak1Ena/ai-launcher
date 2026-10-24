@@ -1,9 +1,1 @@
-{
-  "name": "ai-launcher",
-  "version": "0.0.0",
-  "description": "Launcher for AI coding CLIs",
-  "license": "MIT",
-  "bin": { "ai": "bin/ai.js" },
-  "files": ["bin"],
-  "engines": { "node": ">=16" }
-}
+{"name":"ai-launcher","version":"0.0.0","description":"Launcher for AI coding CLIs","license":"MIT","repository":{"type":"git","url":"git+https://github.com/Ak1Ena/ai-launcher.git"},"homepage":"https://github.com/Ak1Ena/ai-launcher#readme","bin":{"ai":"bin/ai.js"},"files":["bin"],"engines":{"node":">=16"}}

@@ -7,6 +7,7 @@ ver=$1 src=$(cd "$2" && pwd) out=$3
 root=$(cd "$(dirname "$0")/.." && pwd)
 rm -rf "$out"; mkdir -p "$out"; out=$(cd "$out" && pwd)
 cp -R "$root/npm/ai-launcher" "$out/ai-launcher"
+cp "$root/README.md" "$root/LICENSE" "$out/ai-launcher/"
 
 # target -> platform arch
 targets="aarch64-apple-darwin:darwin:arm64 x86_64-apple-darwin:darwin:x64
