@@ -24,7 +24,7 @@ A bash command-line tool. `bin/ai` shows a picker of coding-agent CLIs with plan
 | `npm/` | npm package files: `ai-launcher`, one package with every platform's binary in `bin/<platform>-<arch>/`. |
 | `scripts/npm-pack.sh` | Builds the npm packages from release binaries. |
 | `tests/check.sh` | Self-check of every feature against a fake `$HOME`. |
-| `docs/screenshot.png` | README image, rendered from demo data. |
+| `docs/screenshot.png`, `docs/tui.png` | README images (bash picker, TUI), rendered from demo data. |
 
 ## Contracts to keep
 

@@ -378,11 +378,7 @@ impl App {
         let mut o = self.order();
         if let Some(m) = o.iter_mut().find(|(m, _)| m == id) {
             m.1 = !m.1;
-            let state = if m.1 {
-                "on"
-            } else {
-                "off: skipped when a limit hits"
-            };
+            let state = if m.1 { "on" } else { "off" };
             config::save_order(&self.paths, &o);
             self.say(format!("{id} {state}"));
         }
@@ -394,7 +390,7 @@ impl App {
         self.say(if self.wrr {
             "Mode: failover."
         } else {
-            "Mode: weighted round-robin. n or ▶ Auto opens the next account."
+            "Round-robin: n or ▶ Auto opens next."
         });
     }
 
@@ -1094,6 +1090,46 @@ mod tests {
         let mut a = App::with_paths(paths, vec![]);
         a.value_flags = Some(vec![]); // don't run `claude --help`
         a
+    }
+
+    #[test]
+    fn draws_at_any_size_without_panicking() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut a = app();
+        a.rows[0].usage = Usage {
+            windows: vec![
+                usage::Window {
+                    label: "5h".into(),
+                    percent: 8,
+                    resets_at: Some(1_700_000_000),
+                },
+                usage::Window {
+                    label: "7d".into(),
+                    percent: 100,
+                    resets_at: None,
+                },
+            ],
+            plan: Some("max".into()),
+            saved_at: Some(1_600_000_000),
+            email: Some("全角@example.com".into()),
+        };
+        let draw_all = |a: &App| {
+            for (w, h) in [(20, 5), (40, 10), (120, 40)] {
+                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| {
+                    crate::ui::draw(f, a);
+                })
+                .unwrap();
+            }
+        };
+        draw_all(&a);
+        a.wrr = true;
+        a.update = Some("9.9.9".into());
+        draw_all(&a);
+        a.open("t1");
+        draw_all(&a);
+        a.focus = Focus::Sidebar;
+        draw_all(&a);
     }
 
     fn key(a: &mut App, code: KeyCode) {

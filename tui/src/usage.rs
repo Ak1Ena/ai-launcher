@@ -10,12 +10,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Window {
     pub label: String,
     pub percent: u8,
+    /// when the window resets (unix seconds); none once it has passed
+    pub resets_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Usage {
     pub windows: Vec<Window>,
     pub plan: Option<String>,
+    /// when the agent last saved this usage (unix seconds)
+    pub saved_at: Option<i64>,
+    /// the Claude account's login email
+    pub email: Option<String>,
 }
 
 fn now() -> f64 {
@@ -26,10 +32,63 @@ fn now() -> f64 {
 }
 
 pub fn claude(config_dir: &Path) -> Usage {
-    let Ok(text) = fs::read_to_string(config_dir.join("usage/usage.json")) else {
-        return Usage::default();
+    let mut u = fs::read_to_string(config_dir.join("usage/usage.json"))
+        .map(|t| claude_from(&t, now()))
+        .unwrap_or_default();
+    // Claude Code keeps .claude.json inside CLAUDE_CONFIG_DIR, or beside ~/.claude without it
+    let json = if config_dir.ends_with(".claude") {
+        config_dir.with_file_name(".claude.json")
+    } else {
+        config_dir.join(".claude.json")
     };
-    claude_from(&text, now())
+    u.email = fs::read_to_string(json).ok().and_then(|t| email_from(&t));
+    u
+}
+
+pub fn email_from(text: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    Some(
+        v.get("oauthAccount")?
+            .get("emailAddress")?
+            .as_str()?
+            .to_string(),
+    )
+}
+
+/// " · 90m old" style note for usage saved 10 minutes ago or more, like the bash picker.
+pub fn age_note(saved_at: i64, now: i64) -> Option<String> {
+    let m = (now - saved_at) / 60;
+    let n = match m {
+        m if m >= 2880 => format!("{}d", m / 1440),
+        m if m >= 120 => format!("{}h", m / 60),
+        m => format!("{m}m"),
+    };
+    (m >= 10).then(|| format!("{n} old"))
+}
+
+/// Local "Tue 12:59" for a unix time, like the bash picker's `strftime("%a %H:%M")`.
+pub fn local_hm(t: i64) -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    // SAFETY: tm is plain data that localtime fills in
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let tt = t as libc::time_t;
+    #[cfg(unix)]
+    let ok = !unsafe { libc::localtime_r(&tt, &mut tm) }.is_null();
+    #[cfg(windows)]
+    let ok = unsafe { libc::localtime_s(&mut tm, &tt) } == 0;
+    if !ok {
+        return String::new();
+    }
+    format!(
+        "{} {:02}:{:02}",
+        DAYS[tm.tm_wday.rem_euclid(7) as usize],
+        tm.tm_hour,
+        tm.tm_min
+    )
+}
+
+pub fn now_secs() -> i64 {
+    now() as i64
 }
 
 pub fn claude_from(text: &str, now: f64) -> Usage {
@@ -42,10 +101,8 @@ pub fn claude_from(text: &str, now: f64) -> Usage {
             let w = v.get("rate_limits")?.get(*key)?;
             let pct = w.get("used_percentage")?.as_f64()?;
             // a window whose reset time has passed is empty again
-            let passed = w
-                .get("resets_at")
-                .and_then(Value::as_f64)
-                .is_some_and(|r| r < now);
+            let at = w.get("resets_at").and_then(Value::as_f64);
+            let passed = at.is_some_and(|r| r < now);
             Some(Window {
                 label: label.to_string(),
                 percent: if passed {
@@ -53,12 +110,14 @@ pub fn claude_from(text: &str, now: f64) -> Usage {
                 } else {
                     pct.clamp(0.0, 100.0) as u8
                 },
+                resets_at: at.filter(|_| !passed).map(|r| r as i64),
             })
         })
         .collect();
     Usage {
         windows,
-        plan: None,
+        saved_at: v.get("saved_at").and_then(Value::as_f64).map(|t| t as i64),
+        ..Usage::default()
     }
 }
 
@@ -119,6 +178,7 @@ pub fn codex_from(text: &str) -> Usage {
             Some(Window {
                 label,
                 percent: w.get("used_percent")?.as_f64()?.clamp(0.0, 100.0) as u8,
+                resets_at: w.get("resets_at").and_then(Value::as_f64).map(|t| t as i64),
             })
         })
         .collect();
@@ -128,6 +188,7 @@ pub fn codex_from(text: &str) -> Usage {
             .get("plan_type")
             .and_then(Value::as_str)
             .map(str::to_string),
+        ..Usage::default()
     }
 }
 
@@ -148,7 +209,7 @@ mod tests {
     #[test]
     fn claude_windows_and_passed_reset() {
         let u = claude_from(
-            r#"{"rate_limits":{"five_hour":{"used_percentage":34.6,"resets_at":2000},"seven_day":{"used_percentage":95,"resets_at":500}}}"#,
+            r#"{"rate_limits":{"five_hour":{"used_percentage":34.6,"resets_at":2000},"seven_day":{"used_percentage":95,"resets_at":500}},"saved_at":900}"#,
             1000.0,
         );
         assert_eq!(
@@ -156,25 +217,49 @@ mod tests {
             vec![
                 Window {
                     label: "5h".into(),
-                    percent: 34
+                    percent: 34,
+                    resets_at: Some(2000)
                 },
                 Window {
                     label: "7d".into(),
-                    percent: 0
+                    percent: 0,
+                    resets_at: None
                 }
             ]
         );
+        assert_eq!(u.saved_at, Some(900));
+    }
+
+    #[test]
+    fn age_note_matches_bash() {
+        assert_eq!(age_note(1000, 1000 + 9 * 60), None);
+        assert_eq!(age_note(0, 90 * 60).as_deref(), Some("90m old"));
+        assert_eq!(age_note(0, 3 * 3600).as_deref(), Some("3h old"));
+        assert_eq!(age_note(0, 3 * 86400).as_deref(), Some("3d old"));
+    }
+
+    #[test]
+    fn email_and_local_time() {
+        assert_eq!(
+            email_from(r#"{"oauthAccount":{"emailAddress":"a@example.com"}}"#).as_deref(),
+            Some("a@example.com")
+        );
+        assert_eq!(email_from("{}"), None);
+        let t = local_hm(1_700_000_000);
+        assert_eq!(t.len(), 9, "{t}");
+        assert!(["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].contains(&&t[..3]));
     }
 
     #[test]
     fn codex_reads_last_rate_limits() {
-        let log = "{\"x\":1}\n{\"payload\":{\"rate_limits\":{\"primary\":{\"used_percent\":41.0,\"window_minutes\":300},\"plan_type\":\"plus\"}}}\n";
+        let log = "{\"x\":1}\n{\"payload\":{\"rate_limits\":{\"primary\":{\"used_percent\":41.0,\"window_minutes\":300,\"resets_at\":1700000000},\"plan_type\":\"plus\"}}}\n";
         let u = codex_from(log);
         assert_eq!(
             u.windows,
             vec![Window {
                 label: "5h".into(),
-                percent: 41
+                percent: 41,
+                resets_at: Some(1_700_000_000)
             }]
         );
         assert_eq!(u.plan.as_deref(), Some("plus"));
