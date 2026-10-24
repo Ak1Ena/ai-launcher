@@ -1,4 +1,4 @@
-//! App state and behaviour: the sidebar of accounts, tabs of running CLIs, and failover
+//! App state and behaviour: the home list of accounts, tabs of running CLIs, and failover
 //! moving a tab's session to the next account when its claude stops on a rate limit.
 
 use crate::config::{self, Entry, Kind, Paths};
@@ -17,7 +17,9 @@ pub const SWITCH_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Focus {
-    Sidebar,
+    /// the home list of accounts
+    Home,
+    /// the current tab's CLI
     Pane,
 }
 
@@ -94,11 +96,11 @@ pub struct App {
     mod_dir: PathBuf,
     next_handoff: usize,
     pub modal: Option<Modal>,
-    /// a short message under the sidebar, and when it goes away
+    /// a short message under the home list, and when it goes away
     pub flash: Option<(String, Instant)>,
     /// a press started inside the pane: drags and release follow it outside
     pane_drag: bool,
-    /// sidebar row and time of the last click, for double-click to open
+    /// home row and time of the last click, for double-click to open
     last_click: Option<(usize, Instant)>,
     /// newer version found on npm
     pub update: Option<String>,
@@ -128,7 +130,7 @@ impl App {
             selected: 0,
             tabs: Vec::new(),
             current: 0,
-            focus: Focus::Sidebar,
+            focus: Focus::Home,
             quit: false,
             pane_size: (24, 80),
             first_args: Some(args),
@@ -231,6 +233,10 @@ impl App {
         // alt-1..9 and alt-← → switch tabs from anywhere, even while typing in a CLI
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
+                KeyCode::Char('0') => {
+                    self.focus = Focus::Home;
+                    return;
+                }
                 KeyCode::Char(c @ '1'..='9') => return self.show_tab(c as usize - '1' as usize),
                 KeyCode::Left if !self.tabs.is_empty() => {
                     return self.show_tab((self.current + self.tabs.len() - 1) % self.tabs.len());
@@ -241,20 +247,20 @@ impl App {
                 _ => {}
             }
         }
-        // ctrl-\ moves between the sidebar and the running CLI
+        // ctrl-\ moves between home and the last CLI tab
         // terminals send it as 0x1c, which crossterm reads as ctrl-4
         if matches!(key.code, KeyCode::Char('\\' | '4'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             self.focus = match self.focus {
-                Focus::Pane => Focus::Sidebar,
-                Focus::Sidebar if !self.tabs.is_empty() => Focus::Pane,
+                Focus::Pane => Focus::Home,
+                Focus::Home if !self.tabs.is_empty() => Focus::Pane,
                 f => f,
             };
             return;
         }
         match self.focus {
-            Focus::Sidebar => self.sidebar_key(key),
+            Focus::Home => self.home_key(key),
             Focus::Pane => self.pane_key(key),
         }
     }
@@ -273,7 +279,7 @@ impl App {
         }
     }
 
-    fn sidebar_key(&mut self, key: KeyEvent) {
+    fn home_key(&mut self, key: KeyEvent) {
         let id = self.rows.get(self.selected).map(|r| r.entry.id.clone());
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
@@ -345,7 +351,7 @@ impl App {
                 if let Some(Notice::Switch { from, .. }) = &tab.notice {
                     tab.notice = Some(Notice::NoneLeft { from: from.clone() });
                 }
-                self.focus = Focus::Sidebar;
+                self.focus = Focus::Home;
             }
             (
                 Some(Notice::Switch { .. } | Notice::NoneLeft { .. }),
@@ -414,6 +420,22 @@ impl App {
         );
         config::save_weight(&self.paths, &id, w);
         self.say(format!("{id} weight {w}"));
+    }
+
+    /// Whether a CLI tab fills the screen (otherwise home does).
+    pub fn in_tab(&self) -> bool {
+        self.focus == Focus::Pane && self.current < self.tabs.len()
+    }
+
+    /// Where tab `t` would fail over to next, from the rows (no file reads: this runs every frame).
+    pub fn next_target(&self, t: usize) -> Option<&str> {
+        let tried = &self.tabs.get(t)?.tried;
+        self.rows
+            .iter()
+            .find(|r| {
+                r.priority.is_some() && r.on && r.limited.is_none() && !tried.contains(&r.entry.id)
+            })
+            .map(|r| r.entry.id.as_str())
     }
 
     fn show_tab(&mut self, n: usize) {
@@ -666,6 +688,7 @@ impl App {
                     Button::Failover => config::set_failover(&self.paths, !self.failover),
                     Button::Mode => self.toggle_mode(),
                     Button::Auto => self.open_auto(),
+                    Button::Home => self.focus = Focus::Home,
                 }
                 return self.refresh();
             }
@@ -683,7 +706,7 @@ impl App {
                     .is_some_and(|(r, t)| r == *i && t.elapsed() < Duration::from_millis(500));
                 self.last_click = (!again).then(|| (*i, Instant::now()));
                 self.selected = *i;
-                self.focus = Focus::Sidebar;
+                self.focus = Focus::Home;
                 if again && let Some(id) = self.rows.get(*i).map(|r| r.entry.id.clone()) {
                     self.open(&id);
                 }
@@ -743,7 +766,7 @@ impl App {
             self.current = self.current.min(self.tabs.len().saturating_sub(1));
         }
         if self.tabs.is_empty() {
-            self.focus = Focus::Sidebar;
+            self.focus = Focus::Home;
         }
     }
 
@@ -1121,7 +1144,7 @@ mod tests {
             email: Some("全角@example.com".into()),
         };
         let draw_all = |a: &App| {
-            for (w, h) in [(20, 5), (40, 10), (120, 40)] {
+            for (w, h) in [(20, 5), (30, 10), (40, 10), (120, 40)] {
                 let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
                 t.draw(|f| {
                     crate::ui::draw(f, a);
@@ -1135,8 +1158,66 @@ mod tests {
         draw_all(&a);
         a.open("t1");
         draw_all(&a);
-        a.focus = Focus::Sidebar;
+        a.focus = Focus::Home;
         draw_all(&a);
+    }
+
+    #[test]
+    fn home_hits_match_what_is_drawn_and_nothing_overlaps() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut a = app();
+        a.wrr = true;
+        a.open("t1");
+        a.focus = Focus::Home;
+        for (w, h) in [(30, 10), (80, 24), (130, 20)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let mut hits = Hits::default();
+            t.draw(|f| hits = crate::ui::draw(f, &a)).unwrap();
+            let buf = t.backend().buffer();
+            let text = |r: &Rect| -> String {
+                (r.x..r.right())
+                    .map(|x| buf[(x, r.y)].symbol().to_string())
+                    .collect()
+            };
+            assert!(!hits.switches.is_empty(), "{w}x{h}");
+            for (r, i) in &hits.switches {
+                let on = a.rows[*i].on;
+                assert_eq!(text(r), if on { " ● on  " } else { " ○ off " }, "{w}x{h}");
+            }
+            let mut drawn: Vec<Rect> = hits.buttons.iter().map(|(r, _)| *r).collect();
+            drawn.extend(hits.tabs.iter().map(|(r, _)| *r));
+            for (n, r) in drawn.iter().enumerate() {
+                assert!(r.right() <= w, "{w}x{h}: {r:?} off screen");
+                for o in &drawn[n + 1..] {
+                    assert!(!r.intersects(*o), "{w}x{h}: {r:?} overlaps {o:?}");
+                }
+            }
+            assert!(hits.pane.is_empty(), "home has no pane");
+            // clicking `✻ home` from a tab comes back here
+            let home = hits
+                .buttons
+                .iter()
+                .find(|(_, b)| *b == Button::Home)
+                .unwrap()
+                .0;
+            a.focus = Focus::Pane;
+            click(&mut a, &hits, home.x, home.y);
+            assert!(a.focus == Focus::Home);
+        }
+    }
+
+    #[test]
+    fn ctrl_backslash_and_alt_0_go_home_and_back() {
+        let mut a = app();
+        a.open("t1");
+        a.open("t2");
+        a.on_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT));
+        a.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+        assert!(a.focus == Focus::Home && !a.in_tab());
+        a.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+        assert!(a.in_tab() && a.current == 0);
+        a.on_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
+        assert!(!a.in_tab());
     }
 
     fn key(a: &mut App, code: KeyCode) {

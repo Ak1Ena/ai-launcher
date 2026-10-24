@@ -158,7 +158,7 @@ pub enum Kind {
     Other,
 }
 
-/// Something the sidebar can start: a cla account (`claude/<name>`) or a provider.
+/// Something the home list can start: a cla account (`claude/<name>`) or a provider.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     pub id: String,
