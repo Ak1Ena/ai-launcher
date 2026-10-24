@@ -19,12 +19,12 @@ A bash command-line tool. `bin/ai` shows a picker of coding-agent CLIs with plan
 | `mods/failover/` | Claude Code mod. Its `classic.StopFailure` hook, on `rate_limit`, writes `$AI_FO_HANDOFF` and ends that claude. |
 | `plugins/<name>.sh` | Usage rows or a custom launch for the provider named `<name>`. `claude.sh` also implements `cla` / `cla-team`. |
 | `scripts/statusline-usage.sh` | Claude Code status line command that saves `rate_limits` to `$CLAUDE_CONFIG_DIR/usage/usage.json`. |
-| `tui/` | Rust TUI (`ai-launcher`): sidebar of accounts, each CLI in a tab, failover in place. |
+| `tui/` | Rust TUI (`ai-launcher`): `✻ home` tab listing accounts, each CLI in its own full-width tab, failover in place. |
 | `.github/workflows/` | `ci.yml` (branches/PRs), `release.yml` (build all platforms, draft release), `npm-publish.yml` (on publish). |
 | `npm/` | npm package files: `ai-launcher`, one package with every platform's binary in `bin/<platform>-<arch>/`. |
 | `scripts/npm-pack.sh` | Builds the npm packages from release binaries. |
 | `tests/check.sh` | Self-check of every feature against a fake `$HOME`. |
-| `docs/screenshot.png`, `docs/tui.png` | README images (bash picker, TUI), rendered from demo data. |
+| `docs/screenshot.png`, `docs/tui.png`, `docs/tui-tab.png` | README images (bash picker, TUI home, TUI tab), rendered from demo data. |
 
 ## Contracts to keep
 
