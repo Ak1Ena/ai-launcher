@@ -5,6 +5,7 @@
 use crate::app::{App, Focus, Modal, Notice, Row};
 use crate::config::Kind;
 use crate::form::{Confirm, Form, Input};
+use crate::usage;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -120,7 +121,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
                 notice(f, app, n, a.pane);
             }
         }
-        None => welcome(f, a.pane),
+        None => welcome(f, app, a.pane),
     }
     footer(f, app, a.footer);
     match &app.modal {
@@ -153,60 +154,63 @@ fn title_bar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         area,
     );
 
+    // right-aligned pills, each only drawn when it fits between the brand and the next pill
+    let brand_end = area.x + dw(brand) as u16;
+    let place = |right: u16, text: &str| {
+        let w = dw(text) as u16;
+        let x = right.checked_sub(w + 1)?;
+        (x > brand_end).then_some(Rect {
+            x,
+            width: w,
+            ..area
+        })
+    };
+    let mut limit = area.right();
+
     let switch = if app.failover {
         " failover ● on "
     } else {
         " failover ○ off "
     };
-    let sw = switch.chars().count() as u16;
-    let sw_rect = Rect {
-        x: area.right().saturating_sub(sw + 1),
-        width: sw,
-        ..area
-    };
-    let sw_style = if app.failover {
-        Style::new()
-            .fg(Color::Black)
-            .bg(GOOD)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().fg(MUTED).bg(RAISED)
-    };
-    f.render_widget(Paragraph::new(switch).style(sw_style), sw_rect);
-    hits.buttons.push((sw_rect, Button::Failover));
+    if let Some(r) = place(limit, switch) {
+        let style = if app.failover {
+            Style::new()
+                .fg(Color::Black)
+                .bg(GOOD)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(MUTED).bg(RAISED)
+        };
+        f.render_widget(Paragraph::new(switch).style(style), r);
+        hits.buttons.push((r, Button::Failover));
+        limit = r.x;
+    }
 
     let mode = if app.wrr {
-        " ⚖ round-robin "
+        " ⚖ mode: round-robin "
     } else {
-        " ⇢ failover "
+        " ⇢ mode: failover "
     };
-    let mw = mode.chars().count() as u16;
-    let mode_rect = Rect {
-        x: sw_rect.x.saturating_sub(mw + 1),
-        width: mw,
-        ..area
-    };
-    f.render_widget(
-        Paragraph::new(mode).style(Style::new().fg(Color::White).bg(RAISED)),
-        mode_rect,
-    );
-    hits.buttons.push((mode_rect, Button::Mode));
+    // the mode label only shows beside the switch
+    if limit < area.right()
+        && let Some(r) = place(limit, mode)
+    {
+        f.render_widget(
+            Paragraph::new(mode).style(Style::new().fg(Color::White).bg(RAISED)),
+            r,
+        );
+        hits.buttons.push((r, Button::Mode));
+        limit = r.x;
+    }
 
-    let mut limit = mode_rect.x;
     if let Some(v) = &app.update {
         let pill = format!(" ↑ v{v} available · npm i -g ai-launcher ");
-        let pw = pill.chars().count() as u16;
-        if let Some(px) = mode_rect.x.checked_sub(pw + 1) {
-            let r = Rect {
-                x: px,
-                width: pw,
-                ..area
-            };
+        if let Some(r) = place(limit, &pill) {
             f.render_widget(
                 Paragraph::new(pill).style(Style::new().fg(Color::Black).bg(WARN)),
                 r,
             );
-            limit = px;
+            limit = r.x;
         }
     }
 
@@ -382,7 +386,10 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     if let Some((msg, until)) = &app.flash
         && Instant::now() < *until
     {
-        f.render_widget(Paragraph::new(Span::styled(msg.as_str(), s(WARN))), flash);
+        f.render_widget(
+            Paragraph::new(Span::styled(ellipsize(msg, flash.width as usize), s(WARN))),
+            flash,
+        );
     }
 }
 
@@ -468,21 +475,45 @@ fn row_lines(
         };
         bottom.push(Span::styled(text, s(FAINT)));
     } else {
-        let w = if r.usage.windows.len() > 1 { 6 } else { 14 };
-        for (i, win) in r.usage.windows.iter().enumerate() {
-            if i > 0 {
-                bottom.push(Span::raw("  "));
+        let wins = &r.usage.windows;
+        let base = if wins.len() > 1 { 6 } else { 14 };
+        // the reset time goes after the most-used window, with bars a little shorter if needed
+        let most = (0..wins.len())
+            .max_by_key(|&i| wins[i].percent)
+            .unwrap_or(0);
+        let avail = (width as usize).saturating_sub(5);
+        let at = wins[most]
+            .resets_at
+            .map(|t| format!(" ↻ {}", usage::local_hm(t)));
+        let build = |w: usize, reset: bool| {
+            let mut out = Vec::new();
+            for (i, win) in wins.iter().enumerate() {
+                if i > 0 {
+                    out.push(Span::raw("  "));
+                }
+                out.extend(meter(&win.label, win.percent, w, false));
+                if let (true, true, Some(at)) = (reset, i == most, &at) {
+                    out.push(Span::styled(at.clone(), s(FAINT)));
+                }
             }
-            bottom.extend(meter(&win.label, win.percent, w));
-        }
-        if let Some(plan) = &r.usage.plan {
-            bottom.push(Span::styled(format!("  {plan}"), s(MUTED)));
-        }
+            if let Some(plan) = &r.usage.plan {
+                out.push(Span::styled(format!("  {plan}"), s(MUTED)));
+            }
+            out
+        };
+        let pick = [(base, true), (base - 1, true), (base - 2, true)]
+            .into_iter()
+            .map(|(w, reset)| build(w, reset))
+            .find(|sp| width_of(sp) <= avail)
+            .unwrap_or_else(|| build(base, false));
+        bottom.extend(pick);
     }
     (Line::from(top), Line::from(bottom))
 }
 
-fn meter(label: &str, pct: u8, w: usize) -> Vec<Span<'static>> {
+/// `5h █████░░░░░ 34%` like the bash picker: green < 60 <= yellow < 90 <= red.
+/// `pad` right-aligns the percent to 3 digits, for columns.
+fn meter(label: &str, pct: u8, w: usize, pad: bool) -> Vec<Span<'static>> {
     let color = if pct >= 90 {
         BAD
     } else if pct >= 60 {
@@ -490,13 +521,105 @@ fn meter(label: &str, pct: u8, w: usize) -> Vec<Span<'static>> {
     } else {
         GOOD
     };
-    let full = (pct as usize * w).div_ceil(100).min(w);
+    // any use shows at least one cell, and only 100% fills the bar
+    let full = match pct as usize {
+        0 => 0,
+        p => ((p * w + 50) / 100)
+            .max(1)
+            .min(if p < 100 { w.saturating_sub(1) } else { w }),
+    };
+    let pct = if pad {
+        format!(" {pct:>3}%")
+    } else {
+        format!(" {pct}%")
+    };
     vec![
-        Span::styled(format!("{label} "), s(MUTED)),
-        Span::styled("━".repeat(full), s(color)),
-        Span::styled("━".repeat(w - full), s(FAINT)),
-        Span::styled(format!(" {pct}%"), s(color)),
+        Span::styled(format!("{label:<2} "), s(MUTED)),
+        Span::styled("█".repeat(full), s(color)),
+        Span::styled("░".repeat(w - full), s(FAINT)),
+        Span::styled(pct, s(color).add_modifier(Modifier::BOLD)),
     ]
+}
+
+fn width_of(spans: &[Span]) -> usize {
+    spans.iter().map(Span::width).sum()
+}
+
+fn dw(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// `text` padded with spaces to `w` display columns.
+fn pad(text: &str, w: usize) -> String {
+    format!("{text}{}", " ".repeat(w.saturating_sub(dw(text))))
+}
+
+/// Cuts `text` to `max` display columns at a word boundary, ending in `…`.
+fn ellipsize(text: &str, max: usize) -> String {
+    if dw(text) <= max {
+        return text.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for word in text.split(' ') {
+        let next = if out.is_empty() {
+            word.to_string()
+        } else {
+            format!("{out} {word}")
+        };
+        if dw(&next) + 1 > max {
+            break;
+        }
+        out = next;
+    }
+    if out.is_empty() {
+        // the first word alone is too long: cut it
+        for c in text.chars() {
+            if dw(&out) + dw(&c.to_string()) + 1 > max {
+                break;
+            }
+            out.push(c);
+        }
+    }
+    out.push('…');
+    out
+}
+
+/// A key cap and what it does, for hint lines.
+fn hint(key: &'static str, what: &'static str) -> Vec<Span<'static>> {
+    vec![cap(key), Span::styled(format!(" {what}  "), s(MUTED))]
+}
+
+/// A hint line that fits in `max` columns: see `fit`. Every item ends in two spaces, which
+/// may run off the edge for the last one kept.
+fn hints(items: Vec<(u8, Vec<Span<'static>>)>, max: usize) -> Line<'static> {
+    let items = items
+        .into_iter()
+        .map(|(p, sp)| (p, width_of(&sp), sp))
+        .collect();
+    Line::from(fit(items, max + 2).concat())
+}
+
+/// Keeps the most important items (lowest priority number first) that fit in `max` columns,
+/// in their original order. Items are never cut.
+fn fit<T>(items: Vec<(u8, usize, T)>, max: usize) -> Vec<T> {
+    let mut by_prio: Vec<usize> = (0..items.len()).collect();
+    by_prio.sort_by_key(|&i| items[i].0);
+    let mut keep = vec![false; items.len()];
+    let mut used = 0;
+    for i in by_prio {
+        if used + items[i].1 <= max {
+            used += items[i].1;
+            keep[i] = true;
+        }
+    }
+    items
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(item, k)| k.then_some(item.2))
+        .collect()
 }
 
 fn hm(d: Duration) -> String {
@@ -516,72 +639,166 @@ fn cap(t: &'static str) -> Span<'static> {
     )
 }
 
-fn welcome(f: &mut Frame, area: Rect) {
-    let d = |t: &'static str| Span::styled(format!("  {t}"), s(MUTED));
-    let lines = vec![
-        Line::from(Span::styled(
-            "✻ ai-launcher",
-            s(ACCENT).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "Every AI coding CLI and account in one place.",
-            s(MUTED),
-        )),
-        Line::raw(""),
-        Line::from(vec![
-            cap("enter"),
-            d("open the account picked on the left, in a tab"),
-        ]),
-        Line::from(vec![
-            cap("a"),
-            d("add an account   "),
-            cap("e"),
-            d("edit   "),
-            cap("d"),
-            d("delete"),
-        ]),
-        Line::from(vec![
-            cap("⌥1-9"),
-            d("switch tabs, also while typing in a CLI (or click a tab)"),
-        ]),
-        Line::from(vec![cap("ctrl-\\"), d("move between the list and the CLI")]),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Failover",
+/// What the welcome table shows; `fit` tries these from richest to plainest.
+#[derive(Clone, Copy)]
+struct Cols {
+    bar: usize,
+    reset: bool,
+    age: bool,
+    second: bool,
+    email: bool,
+}
+
+/// One row per account like the bash picker: name, email, 5h and 7d bars with reset times.
+fn welcome(f: &mut Frame, app: &App, area: Rect) {
+    let now = usage::now_secs();
+    let name = |r: &Row| {
+        r.entry
+            .id
+            .strip_prefix("claude/")
+            .unwrap_or(&r.entry.id)
+            .to_string()
+    };
+    let who = |r: &Row| match (&r.usage.email, r.entry.kind) {
+        (Some(e), _) => e.clone(),
+        (None, Kind::Claude) => "not logged in".into(),
+        (None, _) => match &r.usage.plan {
+            Some(p) => format!("{} · {p}", r.entry.label),
+            None => r.entry.label.clone(),
+        },
+    };
+    let name_w = app.rows.iter().map(|r| dw(&name(r))).max().unwrap_or(0);
+    let who_w = app.rows.iter().map(|r| dw(&who(r))).max().unwrap_or(0);
+    // reset times per row and window, formatted once for all layouts tried below
+    let resets: Vec<Vec<String>> = app
+        .rows
+        .iter()
+        .map(|r| {
+            r.usage
+                .windows
+                .iter()
+                .map(|w| {
+                    w.resets_at
+                        .map(|t| format!("↻ {}", usage::local_hm(t)))
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect();
+    let row_line = |(r, resets): (&Row, &Vec<String>), c: Cols| -> Line<'static> {
+        let mut sp = vec![Span::styled(
+            format!("{}  ", pad(&name(r), name_w)),
             s(Color::White).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "When a Claude account hits its usage limit, the session moves to the next",
-            s(MUTED),
-        )),
-        Line::from(Span::styled(
-            "account in the failover order, in the same tab. Codex gets a handoff.",
-            s(MUTED),
-        )),
-        Line::raw(""),
-        Line::from(vec![
-            cap("f"),
-            d("on / off   "),
-            cap("shift-↑↓"),
-            d("order   "),
-            cap("space"),
-            d("skip   "),
-            cap("r"),
-            d("clear a limit"),
-        ]),
-        Line::from(vec![
-            cap("w"),
-            d("failover / weighted round-robin   "),
-            cap("n"),
-            d("open next   "),
-            cap("+-"),
-            d("weight   "),
-            cap("m"),
-            d("model"),
-        ]),
+        )];
+        if c.email {
+            let style = if r.usage.email.is_none() && r.entry.kind == Kind::Claude {
+                s(BAD)
+            } else {
+                s(MUTED)
+            };
+            sp.push(Span::styled(format!("{}  ", pad(&who(r), who_w)), style));
+        }
+        if r.usage.windows.is_empty() {
+            sp.push(Span::styled("no usage data", s(FAINT)));
+            return Line::from(sp);
+        }
+        for (i, w) in r
+            .usage
+            .windows
+            .iter()
+            .take(if c.second { 2 } else { 1 })
+            .enumerate()
+        {
+            if i > 0 {
+                sp.push(Span::raw("  "));
+            }
+            sp.extend(meter(&w.label, w.percent, c.bar, true));
+            if c.reset {
+                sp.push(Span::styled(format!(" {}", pad(&resets[i], 11)), s(FAINT)));
+            }
+        }
+        if let Some(note) = r
+            .usage
+            .saved_at
+            .and_then(|t| usage::age_note(t, now))
+            .filter(|_| c.age)
+        {
+            sp.push(Span::styled(format!(" · {note}"), s(FAINT)));
+        }
+        Line::from(sp)
+    };
+    let full = Cols {
+        bar: 10,
+        reset: true,
+        age: true,
+        second: true,
+        email: true,
+    };
+    let levels = [
+        full,
+        Cols { bar: 6, ..full },
+        Cols {
+            bar: 6,
+            age: false,
+            ..full
+        },
+        Cols {
+            reset: false,
+            age: false,
+            ..full
+        },
+        Cols {
+            reset: false,
+            age: false,
+            second: false,
+            ..full
+        },
+        Cols {
+            reset: false,
+            age: false,
+            second: false,
+            email: false,
+            ..full
+        },
     ];
-    let r = centered(area, 80, lines.len() as u16);
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), r);
+    let max = area.width.saturating_sub(2) as usize;
+    let table_w = |c: Cols| {
+        app.rows
+            .iter()
+            .zip(&resets)
+            .map(|rr| row_line(rr, c).width())
+            .max()
+            .unwrap_or(0)
+    };
+    let cols = levels
+        .into_iter()
+        .find(|&c| table_w(c) <= max)
+        .unwrap_or(levels[levels.len() - 1]);
+
+    let hint = hints(
+        vec![
+            (
+                0,
+                vec![Span::styled("✻  ", s(ACCENT).add_modifier(Modifier::BOLD))],
+            ),
+            (1, hint("enter", "open in a tab")),
+            (2, hint("a", "add")),
+            (3, hint("w", "mode")),
+            (4, hint("⌥1-9", "tabs")),
+        ],
+        max,
+    );
+    let mut lines = vec![hint, Line::raw("")];
+    if app.rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No accounts yet. Press a to add one.",
+            s(MUTED),
+        )));
+    }
+    lines.extend(app.rows.iter().zip(&resets).map(|rr| row_line(rr, cols)));
+    let w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let r = centered(area, w, lines.len() as u16);
+    f.render_widget(Paragraph::new(lines), r);
 }
 
 // ── windows over everything ──────────────────────────────
@@ -843,66 +1060,52 @@ fn confirm_window(f: &mut Frame, app: &App, c: &Confirm, area: Rect) {
 
 fn footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Block::new().style(Style::new().bg(PANEL)), area);
-    let d = |t: &'static str| Span::styled(format!(" {t}  "), s(MUTED));
-    let spans = if app.modal.is_some() {
+    // priority: 0 is kept longest when the bar is short
+    let items = if app.modal.is_some() {
         vec![
-            cap("tab"),
-            d("next"),
-            cap("enter"),
-            d("save / confirm"),
-            cap("esc"),
-            d("cancel"),
+            (1, hint("tab", "next")),
+            (0, hint("enter", "save / confirm")),
+            (0, hint("esc", "cancel")),
         ]
     } else if app.focus == Focus::Pane {
         vec![
-            cap("ctrl-\\"),
-            d("back to the list"),
-            cap("⌥1-9"),
-            d("switch tab"),
-            cap("⌥← →"),
-            d("prev / next tab"),
-            Span::styled("  keys go to the CLI · click a tab or the list", s(FAINT)),
+            (0, hint("ctrl-\\", "back to the list")),
+            (1, hint("⌥1-9", "switch tab")),
+            (2, hint("⌥← →", "prev / next tab")),
+            (
+                3,
+                vec![Span::styled(
+                    "  keys go to the CLI · click a tab or the list  ",
+                    s(FAINT),
+                )],
+            ),
         ]
     } else {
-        let mut spans = vec![
-            cap("enter"),
-            d("open"),
-            cap("a"),
-            d("add"),
-            cap("e"),
-            d("edit"),
-            cap("d"),
-            d("delete"),
-            cap("shift-↑↓"),
-            d("order"),
-            cap("space"),
-            d("skip"),
-            cap("f"),
-            d("failover"),
-            cap("w"),
-            d("mode"),
+        let mut items = vec![
+            (0, hint("enter", "open")),
+            (1, hint("a", "add")),
+            (3, hint("e", "edit")),
+            (3, hint("d", "delete")),
+            (2, hint("shift-↑↓", "order")),
+            (2, hint("space", "on/off")),
+            (1, hint("f", "failover")),
+            (1, hint("w", "mode")),
         ];
         if app.wrr {
-            spans.extend([
-                cap("n"),
-                d("auto"),
-                cap("+-"),
-                d("weight"),
-                cap("m"),
-                d("model"),
+            items.extend([
+                (1, hint("n", "auto")),
+                (2, hint("+-", "weight")),
+                (4, hint("m", "model")),
             ]);
         }
-        spans.extend([
-            cap("r"),
-            d("clear limit"),
-            cap("x"),
-            d("close tab"),
-            cap("q"),
-            d("quit"),
-        ]);
-        spans
+        items.push((4, hint("r", "clear limit")));
+        if !app.tabs.is_empty() {
+            items.push((1, hint("x", "close tab")));
+        }
+        items.push((0, hint("q", "quit")));
+        items
     };
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    f.render_widget(Paragraph::new(hints(items, area.width as usize)), area);
 }
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -913,5 +1116,54 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
         y: area.y + (area.height - h) / 2,
         width: w,
         height: h,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_drops_least_important_whole_items_and_keeps_order() {
+        let items = vec![(0, 5, "a"), (2, 6, "b"), (1, 4, "c"), (0, 3, "d")];
+        assert_eq!(fit(items.clone(), 100), vec!["a", "b", "c", "d"]);
+        assert_eq!(fit(items.clone(), 12), vec!["a", "c", "d"]);
+        assert_eq!(fit(items.clone(), 9), vec!["a", "d"]);
+        // a smaller item further down still gets in when a bigger one does not fit
+        assert_eq!(
+            fit(vec![(0, 5, "a"), (1, 9, "b"), (2, 2, "c")], 8),
+            vec!["a", "c"]
+        );
+        assert!(fit(items, 2).is_empty());
+    }
+
+    #[test]
+    fn hints_ignore_the_last_trailing_spaces() {
+        // " q " + " quit  " is 10 wide, 8 without the trailing spaces
+        let line = hints(vec![(0, hint("q", "quit"))], 8);
+        assert_eq!(line.width(), 10);
+        assert_eq!(hints(vec![(0, hint("q", "quit"))], 7).width(), 0);
+    }
+
+    #[test]
+    fn meter_fills_at_least_one_cell_and_never_all_below_100() {
+        let cells = |pct, w| meter("5h", pct, w, false)[1].content.chars().count();
+        assert_eq!(cells(0, 10), 0);
+        assert_eq!(cells(3, 10), 1);
+        assert_eq!(cells(12, 4), 1);
+        assert_eq!(cells(99, 10), 9);
+        assert_eq!(cells(100, 10), 10);
+    }
+
+    #[test]
+    fn ellipsize_cuts_at_words() {
+        assert_eq!(ellipsize("short", 10), "short");
+        assert_eq!(ellipsize("abcdefgh", 4), "abc…");
+        assert_eq!(ellipsize("abc", 0), "");
+        assert_eq!(ellipsize("全角文字 x", 5), "全角…");
+        assert_eq!(
+            ellipsize("Mode: round-robin. n opens next", 20),
+            "Mode: round-robin.…"
+        );
     }
 }

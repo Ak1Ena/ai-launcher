@@ -14,7 +14,9 @@ Works on macOS, Linux and Windows (PowerShell, CMD or WSL). Nothing extra to ins
 
 ## TUI (preview)
 
-A terminal UI that shows every account in a sidebar with its priority, on/off state and usage. Each CLI runs inside a tab on the right. When failover triggers, the session switches to the next account in the same tab, after a 5 second notice (press enter to switch now). When a newer version is on npm, a notice appears in the title bar (checked at most once a day in the background; set `AI_LAUNCHER_NO_UPDATE_CHECK=1` to disable).
+![ai-launcher TUI: failover order in the sidebar, usage table with reset times on the right](docs/tui.png)
+
+A terminal UI that shows every account in a sidebar with its priority, on/off state and usage. Until you open a tab, the right side shows a usage table like the bash picker: each account's email, 5-hour and weekly bars, and when each limit resets. Each CLI runs inside a tab on the right. Key hints that don't fit the terminal width are dropped, least important first. When failover triggers, the session switches to the next account in the same tab, after a 5 second notice (press enter to switch now). When a newer version is on npm, a notice appears in the title bar (checked at most once a day in the background; set `AI_LAUNCHER_NO_UPDATE_CHECK=1` to disable).
 
 Install:
 
@@ -72,7 +74,7 @@ On macOS, alt (⌥) keys need "Option as Meta" turned on in the terminal setting
 | click an account | select it; click it again to open it |
 | `+ Add` / `✎ Edit` / `✕ Delete` | add, edit or delete the selected account |
 | Failover switch (title bar) | failover on / off |
-| Mode label (title bar) | failover / round-robin |
+| Mode label (title bar, `mode: …`) | failover / round-robin |
 | `▶ Auto` (round-robin mode) | open the next account |
 | wheel | scroll a CLI's output (unless the CLI uses the mouse itself) |
 
