@@ -427,15 +427,15 @@ impl App {
         self.focus == Focus::Pane && self.current < self.tabs.len()
     }
 
-    /// Where tab `t` would fail over to next, from the rows (no file reads: this runs every frame).
+    /// Where tab `t` would fail over to next: `failover::pick` over the rows, which are the
+    /// order file and limit marks as of the last refresh (no file reads: this runs every frame).
     pub fn next_target(&self, t: usize) -> Option<&str> {
-        let tried = &self.tabs.get(t)?.tried;
-        self.rows
+        let members = self
+            .rows
             .iter()
-            .find(|r| {
-                r.priority.is_some() && r.on && r.limited.is_none() && !tried.contains(&r.entry.id)
-            })
-            .map(|r| r.entry.id.as_str())
+            .filter(|r| r.priority.is_some())
+            .map(|r| (r.entry.id.as_str(), r.on, r.limited.is_some()));
+        failover::pick(members, &self.tabs.get(t)?.tried)
     }
 
     fn show_tab(&mut self, n: usize) {
@@ -1169,6 +1169,8 @@ mod tests {
         a.wrr = true;
         a.open("t1");
         a.focus = Focus::Home;
+        // a weight wider than two digits still keeps the switch column in line
+        a.rows[0].weight = 150;
         for (w, h) in [(30, 10), (80, 24), (130, 20)] {
             let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             let mut hits = Hits::default();
@@ -1180,6 +1182,11 @@ mod tests {
                     .collect()
             };
             assert!(!hits.switches.is_empty(), "{w}x{h}");
+            assert!(
+                hits.switches
+                    .iter()
+                    .all(|(r, _)| r.x == hits.switches[0].0.x)
+            );
             for (r, i) in &hits.switches {
                 let on = a.rows[*i].on;
                 assert_eq!(text(r), if on { " ● on  " } else { " ○ off " }, "{w}x{h}");
@@ -1204,6 +1211,23 @@ mod tests {
             click(&mut a, &hits, home.x, home.y);
             assert!(a.focus == Focus::Home);
         }
+    }
+
+    #[test]
+    fn tab_status_line_shows_the_flash_message() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut a = app();
+        a.open("t1");
+        a.say("hello there");
+        let mut t = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &a);
+        })
+        .unwrap();
+        let buf = t.backend().buffer();
+        let last: String = (0..80).map(|x| buf[(x, 9)].symbol().to_string()).collect();
+        assert!(last.contains("hello there"), "{last}");
+        assert!(last.contains("ctrl-\\"), "{last}");
     }
 
     #[test]

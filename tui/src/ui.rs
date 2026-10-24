@@ -3,7 +3,7 @@
 //! one-line usage status; then modal windows (forms, failover notices). `draw` returns where
 //! everything clickable landed, for the mouse.
 
-use crate::app::{App, Modal, Notice, Row};
+use crate::app::{App, Modal, Notice};
 use crate::config::Kind;
 use crate::form::{Confirm, Form, Input};
 use crate::usage;
@@ -236,6 +236,12 @@ fn title_bar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
                 .fg(Color::Black)
                 .bg(ACCENT)
                 .add_modifier(Modifier::BOLD)
+        } else if i == app.current {
+            // the tab ctrl-\\ and x act on from home
+            Style::new()
+                .fg(ACCENT)
+                .bg(RAISED)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(MUTED).bg(RAISED)
         };
@@ -338,7 +344,7 @@ fn ellipsize(text: &str, max: usize) -> String {
 }
 
 /// A key cap and what it does, for hint lines.
-fn hint(key: &'static str, what: &'static str) -> Vec<Span<'static>> {
+fn hint(key: &'static str, what: impl std::fmt::Display) -> Vec<Span<'static>> {
     vec![cap(key), Span::styled(format!(" {what}  "), s(MUTED))]
 }
 
@@ -427,24 +433,34 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     .areas(inner);
     let focused = app.modal.is_none();
     let now = usage::now_secs();
-    let running = |r: &Row| {
-        app.tabs
-            .iter()
-            .any(|t| t.member == r.entry.id && t.pane.is_some() && t.notice.is_none())
-    };
-    let name_w = |r: &Row| dw(bare(&r.entry.id)) + if running(r) { 2 } else { 0 };
-    let who = |r: &Row| match (&r.usage.email, r.entry.kind) {
-        (Some(e), _) => e.clone(),
-        (None, Kind::Claude) => "not logged in".into(),
-        (None, _) => match &r.usage.plan {
-            Some(p) => format!("{} · {p}", r.entry.label),
-            None => r.entry.label.clone(),
-        },
-    };
-    let names_w = app.rows.iter().map(name_w).max().unwrap_or(0);
-    let who_w = app.rows.iter().map(|r| dw(&who(r))).max().unwrap_or(0);
+    // per row, worked out once a frame: CLI running in a tab, and the email or label
+    let running: Vec<bool> = app
+        .rows
+        .iter()
+        .map(|r| {
+            app.tabs
+                .iter()
+                .any(|t| t.member == r.entry.id && t.pane.is_some() && t.notice.is_none())
+        })
+        .collect();
+    let who: Vec<String> = app
+        .rows
+        .iter()
+        .map(|r| match (&r.usage.email, r.entry.kind) {
+            (Some(e), _) => e.clone(),
+            (None, Kind::Claude) => "not logged in".into(),
+            (None, _) => match &r.usage.plan {
+                Some(p) => format!("{} · {p}", r.entry.label),
+                None => r.entry.label.clone(),
+            },
+        })
+        .collect();
+    let name_w = |i: usize| dw(bare(&app.rows[i].entry.id)) + if running[i] { 2 } else { 0 };
+    let names_w = (0..app.rows.len()).map(name_w).max().unwrap_or(0);
+    let who_w = who.iter().map(|w| dw(w)).max().unwrap_or(0);
     // everything before the weight and switch
-    let left = |r: &Row, c: Cols| -> Vec<Span<'static>> {
+    let left = |i: usize, c: Cols| -> Vec<Span<'static>> {
+        let r = &app.rows[i];
         let off = r.priority.is_some() && !r.on;
         let mut sp = vec![match r.priority {
             Some(p) => Span::styled(
@@ -461,10 +477,10 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
                 s(Color::White).add_modifier(Modifier::BOLD)
             },
         ));
-        if running(r) {
+        if running[i] {
             sp.push(Span::styled(" ●", s(GOOD)));
         }
-        sp.push(Span::raw(" ".repeat(names_w - name_w(r) + 2)));
+        sp.push(Span::raw(" ".repeat(names_w - name_w(i) + 2)));
         if c.email {
             let style = if r.usage.email.is_none() && r.entry.kind == Kind::Claude {
                 s(BAD)
@@ -473,7 +489,7 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
             } else {
                 s(MUTED)
             };
-            sp.push(Span::styled(format!("{}  ", pad(&who(r), who_w)), style));
+            sp.push(Span::styled(format!("{}  ", pad(&who[i], who_w)), style));
         }
         if !c.usage {
             return sp;
@@ -519,25 +535,29 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         sp
     };
     // members end in `×weight` (round-robin) and the switch, both right after the widest usage
-    let tail = 2 + if app.wrr { 4 } else { 0 } + SWITCH_W as usize;
-    let lefts_w = |c: Cols| {
-        app.rows
-            .iter()
-            .filter(|r| r.priority.is_some())
-            .map(|r| width_of(&left(r, c)))
+    let weight_w = app
+        .rows
+        .iter()
+        .filter(|r| r.priority.is_some())
+        .map(|r| dw(&format!("×{} ", r.weight)))
+        .max()
+        .unwrap_or(0);
+    let tail = 2 + if app.wrr { weight_w } else { 0 } + SWITCH_W as usize;
+    let members_w = |lefts: &[Vec<Span<'static>>]| {
+        (0..app.rows.len())
+            .filter(|&i| app.rows[i].priority.is_some())
+            .map(|i| width_of(&lefts[i]))
             .max()
             .unwrap_or(0)
     };
-    let table_w = |c: Cols| {
-        let others = app
-            .rows
-            .iter()
-            .filter(|r| r.priority.is_none())
-            .map(|r| width_of(&left(r, c)))
+    let table_w = |lefts: &[Vec<Span<'static>>]| {
+        let others = (0..app.rows.len())
+            .filter(|&i| app.rows[i].priority.is_none())
+            .map(|i| width_of(&lefts[i]))
             .max()
             .unwrap_or(0);
         // a member row is never empty, so 0 means there are none
-        let members = match lefts_w(c) {
+        let members = match members_w(lefts) {
             0 => 0,
             w => w + tail,
         };
@@ -591,11 +611,16 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         },
         plain,
     ];
-    let cols = levels
-        .into_iter()
-        .find(|&c| table_w(c) <= list.width as usize)
-        .unwrap_or(plain);
-    let lw = lefts_w(cols);
+    let build = |c: Cols| (0..app.rows.len()).map(|i| left(i, c)).collect::<Vec<_>>();
+    let mut lefts = build(plain);
+    for c in levels {
+        let l = build(c);
+        if table_w(&l) <= list.width as usize {
+            lefts = l;
+            break;
+        }
+    }
+    let lw = members_w(&lefts);
 
     // section headers, and one line per account
     let mut lines: Vec<(Line, Option<usize>)> = Vec::new();
@@ -629,7 +654,7 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         } else {
             Span::raw(" ")
         }];
-        let l = left(r, cols);
+        let l = std::mem::take(&mut lefts[i]);
         let pad_to = lw.saturating_sub(width_of(&l));
         sp.extend(l);
         if r.priority.is_some() {
@@ -637,7 +662,7 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
             if app.wrr {
                 let off = !r.on || r.weight == 0;
                 sp.push(Span::styled(
-                    format!("×{:<2} ", r.weight),
+                    pad(&format!("×{} ", r.weight), weight_w),
                     s(if off { FAINT } else { MUTED }),
                 ));
             }
@@ -1031,8 +1056,10 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
         }
         items.push((4, hint("r", "clear limit")));
         if !app.tabs.is_empty() {
-            items.push((2, hint("ctrl-\\", "last tab")));
-            items.push((1, hint("x", "close tab")));
+            // both act on the current tab, which the tab bar marks while home shows
+            let n = app.current + 1;
+            items.push((2, hint("ctrl-\\", format!("tab {n}"))));
+            items.push((1, hint("x", format!("close {n}"))));
         }
         items.push((0, hint("q", "quit")));
         items
@@ -1057,7 +1084,20 @@ fn status_line(f: &mut Frame, app: &App, area: Rect) {
             s(ACCENT).add_modifier(Modifier::BOLD),
         )],
     );
-    if let Some(r) = app.rows.iter().find(|r| r.entry.id == tab.member) {
+    let home = hint("ctrl-\\", "home");
+    let row = app.rows.iter().find(|r| r.entry.id == tab.member);
+    if let Some((msg, until)) = &app.flash
+        && Instant::now() < *until
+    {
+        // a message takes the usage's place while it lasts
+        let room =
+            (area.width as usize).saturating_sub(dw(bare(&tab.member)) + 2 + width_of(&home));
+        add(
+            1,
+            false,
+            vec![Span::styled(format!("  {}", ellipsize(msg, room)), s(WARN))],
+        );
+    } else if let Some(r) = row {
         if let Some(left) = r.limited {
             add(
                 1,
@@ -1069,13 +1109,17 @@ fn status_line(f: &mut Frame, app: &App, area: Rect) {
             );
         }
         let wins = columns(&r.usage.windows, true);
-        let most = wins.iter().flatten().map(|w| w.percent).max();
-        for w in wins.into_iter().flatten() {
+        // the reset time after the most-used window only, the first on a tie
+        let most = (0..wins.len())
+            .filter(|&i| wins[i].is_some())
+            .max_by_key(|&i| (wins[i].map(|w| w.percent), std::cmp::Reverse(i)));
+        for (i, w) in wins.iter().enumerate() {
+            let Some(w) = w else { continue };
             let mut sp = vec![Span::raw("  ")];
             sp.extend(meter(&w.label, w.percent, 4, false));
             add(1, false, sp);
-            // the reset time after the most-used window; a 5h reset is always within a day
-            if let (Some(t), true) = (&w.reset, Some(w.percent) == most) {
+            if let (Some(t), true) = (&w.reset, most == Some(i)) {
+                // a 5h reset is always within a day
                 let t = if w.label == "5h" {
                     t.rsplit(' ').next().unwrap_or(t)
                 } else {
@@ -1084,17 +1128,19 @@ fn status_line(f: &mut Frame, app: &App, area: Rect) {
                 add(3, false, vec![Span::styled(format!(" ↻ {t}"), s(FAINT))]);
             }
         }
+        // launch() arms failover only for Claude entries
+        if app.failover
+            && r.entry.kind == Kind::Claude
+            && let Some(next) = app.next_target(app.current)
+        {
+            add(
+                2,
+                false,
+                vec![Span::styled(format!("  next: {}", bare(next)), s(MUTED))],
+            );
+        }
     }
-    if app.failover
-        && let Some(next) = app.next_target(app.current)
-    {
-        add(
-            2,
-            false,
-            vec![Span::styled(format!("  next: {}", bare(next)), s(MUTED))],
-        );
-    }
-    add(0, true, hint("ctrl-\\", "home"));
+    add(0, true, home);
     add(2, true, hint("⌥1-9", "tabs"));
     add(4, true, hint("⌥←→", "prev/next"));
     // the right side's last two spaces fall off the edge and leave a gap after the left side
