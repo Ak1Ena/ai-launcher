@@ -21,7 +21,7 @@ A terminal UI with two kinds of tabs:
 
 ![a Claude tab: the CLI fills the window, with the account's usage and the next failover account on the bottom line](docs/tui-tab.png)
 
-On a narrow terminal, columns and key hints that don't fit are dropped, least important first. When failover triggers, the tab shows a notice: it asks `[y/N]` before moving to the next account (Enter means no), or with auto-switch on (`s`) it counts down 5 seconds and moves by itself (a move to Codex always asks). When a newer version is on npm, a notice appears in the title bar (checked at most once a day in the background; set `AI_LAUNCHER_NO_UPDATE_CHECK=1` to disable).
+On a narrow terminal, columns and key hints that don't fit are dropped, least important first. When failover triggers, the tab shows a notice: it asks `[y/N]` before moving to the next account (Enter means no), or with auto-switch on (`s`) it counts down 5 seconds and moves by itself (Codex too; the notice says the conversation goes to OpenAI). When a newer version is on npm, a notice appears in the title bar (checked at most once a day in the background; set `AI_LAUNCHER_NO_UPDATE_CHECK=1` to disable).
 
 Install:
 
@@ -231,7 +231,7 @@ Antigravity (`agy`) can't have several accounts yet: it always reads `~/.gemini/
 
 When a Claude account hits its usage limit, the same session resumes on the next account in your priority order. Codex has no limit hook, so it only gets a written handoff of the session, and the session ends there: accounts below Codex in the order are not tried. New Codex accounts start at the bottom. Failover is off until you turn it on.
 
-You choose what happens when a limit hits with `ai failover auto on|off` (or `s` in the TUI); both read `<failover file>.auto`. Off (the default) asks `[y/N]` and Enter means no: `y` moves to the next account, `o` changes the order, `q` (or anything else) stops. On counts down (`AI_FO_WAIT` seconds, default 5) and then moves by itself: any key (Enter in the TUI) moves now, `o` changes the order, `q` stops. If the next member runs Codex, it always asks `[y/N]` and warns that the conversation will go to OpenAI (Codex), even with auto-switch on. Inside a `cla` session, `main` still means `~/.claude`, not the account you are in.
+You choose what happens when a limit hits with `ai failover auto on|off` (or `s` in the TUI); both read `<failover file>.auto`. Off (the default) asks `[y/N]` and Enter means no: `y` moves to the next account, `o` changes the order, `q` (or anything else) stops. On counts down (`AI_FO_WAIT` seconds, default 5) and then moves by itself: any key (Enter in the TUI) moves now, `o` changes the order, `q` stops. If the next member runs Codex, the card warns that the conversation will go to OpenAI (Codex); it asks or counts down like any other move, so keep Codex out of the order (or off) if it must never get your conversations unattended. Inside a `cla` session, `main` still means `~/.claude`, not the account you are in.
 
 ```bash
 ai failover on     # or ctrl-f in the picker
@@ -283,7 +283,7 @@ Needs jq. Not used in team mode. Limits: the cooldown is fixed, not the real res
 
 - `cla add` links `settings.json`, `hooks`, `plugins` and `projects` from `~/.claude` into the new account. So an `env` entry there (for example `ANTHROPIC_API_KEY`) or an `apiKeyHelper` applies to every account, and chat transcripts are shared through `projects`.
 - Delete is permanent, with no trash. `cla rm` (and delete in the TUI) logs the account out, then removes its folder with its login (`.credentials.json` on Linux), history and settings. It never follows links: the shared `~/.claude` files the account links to stay, and a symlinked account folder loses only the link. Deleting a Codex or Gemini agent removes only its own `~/.ai-accounts/<cli>/<name>` folder.
-- Auto-switch (`ai failover auto on`) moves a session to the next Claude account without asking, but a move to Codex always asks first, because it sends the conversation to OpenAI.
+- Auto-switch (`ai failover auto on`) moves a session to the next account without asking, Codex included, which sends the conversation to OpenAI. Turn Codex off in the order if that must not happen unattended.
 - `cla mv` never copies secrets. On macOS you log in again after a rename, because Claude ties the Keychain login to the folder path.
 
 ## Add usage bars for another agent

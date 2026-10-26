@@ -28,7 +28,7 @@ pub enum Notice {
     Switch {
         from: String,
         to: String,
-        /// `to` runs codex: the conversation goes to OpenAI, so it always asks
+        /// `to` runs codex: the notice says the conversation goes to OpenAI
         codex: bool,
         at: Option<Instant>,
     },
@@ -454,7 +454,7 @@ impl App {
         self.say(if self.auto_switch {
             "At a limit: ask before moving."
         } else {
-            "At a limit: move by itself (Codex still asks)."
+            "At a limit: move by itself, Codex too."
         });
     }
 
@@ -1091,8 +1091,7 @@ impl App {
             Some(to) => {
                 let codex = self.entry(&to).is_some_and(|e| e.kind == Kind::Codex);
                 Notice::Switch {
-                    at: (config::auto_switch_on(&self.paths) && !codex)
-                        .then(|| Instant::now() + SWITCH_WAIT),
+                    at: config::auto_switch_on(&self.paths).then(|| Instant::now() + SWITCH_WAIT),
                     codex,
                     from,
                     to,
@@ -1687,13 +1686,10 @@ mod tests {
         assert!(
             matches!(
                 &a.tabs[0].notice,
-                Some(Notice::Switch { to, codex: true, at: None, .. }) if to == "cx"
+                Some(Notice::Switch { to, codex: true, at: Some(_), .. }) if to == "cx"
             ),
-            "codex always waits for y, even with auto-switch on"
+            "with auto-switch on, codex counts down too (the notice keeps the OpenAI line)"
         );
-        a.tick();
-        key(&mut a, KeyCode::Enter);
-        assert!(matches!(a.tabs[0].notice, Some(Notice::Switch { .. })));
     }
 
     #[test]
