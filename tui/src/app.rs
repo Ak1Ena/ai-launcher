@@ -255,7 +255,8 @@ impl App {
         if self.modal.is_some() {
             return self.modal_key(key);
         }
-        // alt-1..9 and alt-← → switch tabs from anywhere, even while typing in a CLI
+        // alt-1..9 switch tabs from anywhere, even while typing in a CLI
+        // (alt-← → are left to the CLI, where they jump words)
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
                 KeyCode::Char('0') => {
@@ -263,12 +264,6 @@ impl App {
                     return;
                 }
                 KeyCode::Char(c @ '1'..='9') => return self.show_tab(c as usize - '1' as usize),
-                KeyCode::Left if !self.tabs.is_empty() => {
-                    return self.show_tab((self.current + self.tabs.len() - 1) % self.tabs.len());
-                }
-                KeyCode::Right if !self.tabs.is_empty() => {
-                    return self.show_tab((self.current + 1) % self.tabs.len());
-                }
                 _ => {}
             }
         }
@@ -1891,12 +1886,9 @@ mod tests {
         assert_eq!(a.current, 0);
         alt(&mut a, KeyCode::Char('2'));
         assert_eq!(a.current, 1);
-        alt(&mut a, KeyCode::Left);
-        assert_eq!(a.current, 0);
-        alt(&mut a, KeyCode::Left); // wraps
+        alt(&mut a, KeyCode::Left); // goes to the CLI as a word jump
+        alt(&mut a, KeyCode::Right);
         assert_eq!(a.current, 1);
-        alt(&mut a, KeyCode::Right); // wraps
-        assert_eq!(a.current, 0);
         assert!(a.focus == Focus::Pane);
     }
 
