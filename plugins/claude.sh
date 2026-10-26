@@ -4,7 +4,7 @@
 #   cla-team [name]     same, team mode (teammates in tmux split panes)
 #   cla add <name>      add an account and log in
 #   cla ls              list accounts and who is logged in
-#   cla rm <name>       remove an account (asks; moves it to .trash)
+#   cla rm <name>       delete an account for good (asks; logs out, removes its folder)
 #   cla mv <old> <new>  rename an account (macOS: log in again)
 #   cla <name> [team] [claude args]
 CLA_ROOT=${CLA_ROOT:-$HOME/.claude-accounts}
@@ -35,17 +35,23 @@ cla_main() {
       _cla_init "$root/$2" && CLAUDE_CONFIG_DIR=$(native_path "$root/$2") claude auth login ;;
     rm)
       _cla_old "${2:-}" && [ -d "$root/$2" ] || { echo "no account: ${2:-}"; return 1; }
-      if [ -z "${AI_YES:-}" ]; then
-        printf 'Remove %s? [y/N] ' "$2" >&2
-        local ans=; read -r ans || true
+      # only AI_YES=1 skips the question (AI_YES=0 still asks)
+      local ans=
+      if [ "${AI_YES:-}" != 1 ]; then
+        printf 'Delete account %s for good? Logs out and removes %s (its login, history and settings). [y/N] ' "$2" "$root/$2" >&2
+        read -r ans || true
         case $ans in y|Y) ;; *) echo "cancelled"; return 1 ;; esac
       fi
-      CLAUDE_CONFIG_DIR=$(native_path "$root/$2") claude auth logout
-      local to="$root/.trash/$2-$(date +%s)" n=2
-      mkdir -p "$root/.trash" || return 1
-      while [ -e "$to" ] || [ -L "$to" ]; do to="$root/.trash/$2-$(date +%s)-$n"; n=$((n + 1)); done
-      mv "$root/$2" "$to" || return 1
-      echo "removed $2, moved to $to (delete that folder to erase it for good)" ;;
+      if ! CLAUDE_CONFIG_DIR=$(native_path "$root/$2") claude auth logout; then
+        echo "warning: claude auth logout failed for $2 (on macOS its Keychain login may remain)" >&2
+        if [ "${AI_YES:-}" != 1 ]; then
+          printf 'Delete the folder anyway? [y/N] ' >&2
+          ans=; read -r ans || true
+          case $ans in y|Y) ;; *) echo "cancelled"; return 1 ;; esac
+        fi
+      fi
+      # rm -rf never follows links inside, and a symlinked account folder loses only the link
+      rm -rf "${root:?}/$2" && echo "deleted $2" ;;
     mv)
       [ -n "${2:-}" ] && [ -n "${3:-}" ] && [ -d "$root/$2" ] || { echo "usage: cla mv <old> <new>"; return 1; }
       _cla_old "$2" && _cla_name "$3" || return 1
@@ -139,7 +145,7 @@ _cla_name() {
 }
 # rm and the old name of mv: only block path tricks, so accounts made with older names still work
 _cla_old() {
-  case $1 in ''|.*|*/*) echo "bad name '$1'" >&2; return 1 ;; esac
+  case $1 in ''|.*|*/*|*\\*) echo "bad name '$1'" >&2; return 1 ;; esac
 }
 _cla_init() {
   mkdir -p "$1"

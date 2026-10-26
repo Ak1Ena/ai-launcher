@@ -13,6 +13,8 @@ use ratatui::layout::{Position, Rect};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+pub const SWITCH_WAIT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Focus {
     /// the home list of accounts
@@ -22,12 +24,13 @@ pub enum Focus {
 }
 
 pub enum Notice {
-    /// A limit was hit: move to `to` only when the user says yes (`y`).
+    /// A limit was hit: move to `to` at `at` (auto-switch on), else only when the user says `y`.
     Switch {
         from: String,
         to: String,
-        /// `to` runs codex: the conversation goes to OpenAI
+        /// `to` runs codex: the conversation goes to OpenAI, so it always asks
         codex: bool,
+        at: Option<Instant>,
     },
     /// A limit was hit and no member is left.
     NoneLeft {
@@ -94,6 +97,8 @@ pub struct App {
     pub failover: bool,
     /// weighted round-robin mode: Auto opens the next account by weight
     pub wrr: bool,
+    /// `<order>.auto`: a limit switches by itself after SWITCH_WAIT instead of asking
+    pub auto_switch: bool,
     /// entry `ai` opens on start, marked ★ on home
     pub default: String,
     pub deciding: Option<Deciding>,
@@ -132,6 +137,7 @@ impl App {
         let mut app = App {
             failover: config::failover_on(&paths),
             wrr: false,
+            auto_switch: false,
             default: String::new(),
             deciding: None,
             base_config: base_config(std::env::var_os("CLAUDE_CONFIG_DIR"), &paths),
@@ -191,6 +197,7 @@ impl App {
         self.rows = rows;
         self.failover = config::failover_on(&self.paths);
         self.wrr = config::wrr_on(&self.paths);
+        self.auto_switch = config::auto_switch_on(&self.paths);
         self.default = config::default_id(&self.paths);
         self.selected = selected
             .and_then(|id| self.rows.iter().position(|r| r.entry.id == id))
@@ -333,6 +340,7 @@ impl App {
             }
             KeyCode::Char('f') => config::set_failover(&self.paths, !self.failover),
             KeyCode::Char('w') => self.toggle_mode(),
+            KeyCode::Char('s') => self.toggle_auto_switch(),
             KeyCode::Char('n') => self.open_auto(),
             KeyCode::Char('m') => {
                 self.modal = Some(Modal::Form(Form::model(&config::model(&self.paths))))
@@ -370,7 +378,8 @@ impl App {
             return;
         };
         match (&tab.notice, key.code) {
-            (Some(Notice::Switch { .. }), KeyCode::Char('y' | 'Y')) => {
+            (Some(Notice::Switch { .. }), KeyCode::Char('y' | 'Y'))
+            | (Some(Notice::Switch { at: Some(_), .. }), KeyCode::Enter) => {
                 self.switch_now(self.current)
             }
             (Some(Notice::Switch { .. } | Notice::NoneLeft { .. }), KeyCode::Char('o')) => {
@@ -429,6 +438,23 @@ impl App {
             "Mode: failover."
         } else {
             "Round-robin: n or ▶ Auto opens next."
+        });
+    }
+
+    fn toggle_auto_switch(&mut self) {
+        config::set_auto_switch(&self.paths, !self.auto_switch);
+        // turned off: a running countdown stops and waits for `y`. Turned on: a waiting y/N stays as is.
+        if self.auto_switch {
+            for t in &mut self.tabs {
+                if let Some(Notice::Switch { at, .. }) = &mut t.notice {
+                    *at = None;
+                }
+            }
+        }
+        self.say(if self.auto_switch {
+            "At a limit: ask before moving."
+        } else {
+            "At a limit: move by itself (Codex still asks)."
         });
     }
 
@@ -505,10 +531,10 @@ impl App {
         };
         let what = match r.entry.id.strip_prefix("claude/") {
             Some(acct) => format!(
-                "Its folder moves to {}/.trash/{acct}-… and it is logged out (history and settings stay there). Its open tabs close.",
+                "It is logged out and {}/{acct} is deleted for good: its login, history and settings. Its open tabs close.",
                 self.paths.cla_root.display()
             ),
-            None => "It leaves the list. A Codex or Gemini login folder is kept, so adding it again logs back in. Its open tabs close.".into(),
+            None => "It leaves the list, and its own Codex or Gemini login folder (if any) is deleted for good. Its open tabs close.".into(),
         };
         self.modal = Some(Modal::Confirm(Confirm {
             id: r.entry.id.clone(),
@@ -606,11 +632,23 @@ impl App {
         if self.tabs.is_empty() {
             self.focus = Focus::Home;
         }
+        let mut logout_failed = false;
         let done = match id.strip_prefix("claude/") {
-            Some(acct) => config::trash_claude_account(&self.paths, acct).map(|_| ()),
-            None => config::put_provider(&self.paths, id, None),
+            Some(acct) => config::remove_claude_account(&self.paths, acct).map(|out| {
+                if !out {
+                    logout_failed = true;
+                }
+            }),
+            None => {
+                let command = self.entry(id).map(|e| e.command).unwrap_or_default();
+                config::put_provider(&self.paths, id, None)
+                    .and_then(|()| config::remove_login_dir(&self.paths, id, &command))
+            }
         };
         match done {
+            Ok(()) if logout_failed => self.say(format!(
+                "Deleted {id}, but its logout failed: on macOS its Keychain login may remain."
+            )),
             Ok(()) => self.say(format!("Deleted {id}.")),
             Err(e) => self.say(format!("Could not delete {id}: {e}")),
         }
@@ -716,6 +754,7 @@ impl App {
                     Button::Delete => self.start_delete(),
                     Button::Failover => config::set_failover(&self.paths, !self.failover),
                     Button::Mode => self.toggle_mode(),
+                    Button::AutoSwitch => self.toggle_auto_switch(),
                     Button::Auto => self.open_auto(),
                     Button::Home => self.focus = Focus::Home,
                 }
@@ -1013,6 +1052,12 @@ impl App {
             self.flash = None;
         }
         for t in 0..self.tabs.len() {
+            if let Some(Notice::Switch { at, .. }) = &self.tabs[t].notice {
+                if at.is_some_and(|at| Instant::now() >= at) {
+                    self.switch_now(t);
+                }
+                continue;
+            }
             if self.tabs[t].done {
                 continue;
             }
@@ -1043,11 +1088,16 @@ impl App {
         let from = self.label(&self.tabs[t].member);
         let next = failover::next_member(&self.paths, &self.entries(), &self.tabs[t].tried);
         self.tabs[t].notice = Some(match next {
-            Some(to) => Notice::Switch {
-                codex: self.entry(&to).is_some_and(|e| e.kind == Kind::Codex),
-                from,
-                to,
-            },
+            Some(to) => {
+                let codex = self.entry(&to).is_some_and(|e| e.kind == Kind::Codex);
+                Notice::Switch {
+                    at: (config::auto_switch_on(&self.paths) && !codex)
+                        .then(|| Instant::now() + SWITCH_WAIT),
+                    codex,
+                    from,
+                    to,
+                }
+            }
             None => Notice::NoneLeft { from },
         });
     }
@@ -1429,22 +1479,37 @@ mod tests {
     }
 
     #[test]
-    fn delete_claude_account_moves_it_to_trash() {
+    fn delete_claude_account_removes_it_for_good() {
         let mut a = app();
         select(&mut a, "claude/w");
         key(&mut a, KeyCode::Char('d'));
         key(&mut a, KeyCode::Char('y'));
         assert!(!a.paths.cla_root.join("w").exists());
-        let trashed: Vec<_> = fs::read_dir(a.paths.cla_root.join(".trash"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .collect();
-        assert!(
-            trashed
-                .iter()
-                .any(|e| e.file_name().to_string_lossy().starts_with("w-"))
-        );
+        assert_eq!(fs::read_dir(&a.paths.cla_root).unwrap().count(), 0);
         assert!(!ids(&a).contains(&"claude/w".to_string()));
+    }
+
+    #[test]
+    fn delete_codex_provider_removes_its_login_folder_only() {
+        let mut a = app();
+        let mut p = fs::read_to_string(&a.paths.providers).unwrap();
+        p.push_str("cx\tcodex\tCodex\ncx2\tcodex\tCodex 2\n");
+        fs::write(&a.paths.providers, p).unwrap();
+        let own = a.paths.ai_accounts.join("codex/cx2");
+        fs::create_dir_all(&own).unwrap();
+        fs::create_dir_all(&a.paths.codex_home).unwrap();
+        a.refresh();
+        select(&mut a, "cx2");
+        key(&mut a, KeyCode::Char('d'));
+        key(&mut a, KeyCode::Char('y'));
+        assert!(!own.exists() && a.paths.codex_home.exists());
+        select(&mut a, "cx");
+        key(&mut a, KeyCode::Char('d'));
+        key(&mut a, KeyCode::Char('y'));
+        assert!(
+            a.paths.codex_home.exists(),
+            "the main login is never deleted"
+        );
     }
 
     #[test]
@@ -1531,6 +1596,7 @@ mod tests {
             from: "w".into(),
             to: "t2".into(),
             codex: false,
+            at: None,
         });
         a.tick();
         key(&mut a, KeyCode::Enter);
@@ -1545,19 +1611,89 @@ mod tests {
     }
 
     #[test]
+    fn auto_switch_moves_by_itself_on_tick() {
+        let mut a = app();
+        config::set_auto_switch(&a.paths, true);
+        a.open("t1");
+        a.tabs[0].tried = vec!["t1".into()];
+        a.retry(0);
+        let Some(Notice::Switch { at: Some(at), .. }) = &mut a.tabs[0].notice else {
+            panic!("auto on: a countdown")
+        };
+        *at = Instant::now() - Duration::from_secs(1);
+        a.tick();
+        // failover is off here, so the switch ends the tab instead of moving it
+        assert!(matches!(a.tabs[0].notice, Some(Notice::Ended { .. })));
+        config::set_auto_switch(&a.paths, false);
+        a.retry(0);
+        assert!(matches!(
+            a.tabs[0].notice,
+            Some(Notice::Switch { at: None, .. })
+        ));
+    }
+
+    #[test]
+    fn auto_switch_off_stops_a_running_countdown() {
+        let mut a = app();
+        config::set_auto_switch(&a.paths, true);
+        a.refresh();
+        a.open("t1");
+        a.tabs[0].tried = vec!["t1".into()];
+        a.retry(0);
+        assert!(matches!(
+            a.tabs[0].notice,
+            Some(Notice::Switch { at: Some(_), .. })
+        ));
+        a.focus = Focus::Home;
+        key(&mut a, KeyCode::Char('s'));
+        assert!(!a.auto_switch);
+        assert!(
+            matches!(a.tabs[0].notice, Some(Notice::Switch { at: None, .. })),
+            "the notice drops its timer and waits for y"
+        );
+        key(&mut a, KeyCode::Char('s'));
+        assert!(a.auto_switch);
+        assert!(
+            matches!(a.tabs[0].notice, Some(Notice::Switch { at: None, .. })),
+            "turning it on leaves a waiting y/N as is"
+        );
+    }
+
+    #[test]
+    fn click_switch_pill_toggles_auto_switch() {
+        let mut a = app();
+        let hits = Hits {
+            buttons: vec![(r(5), Button::AutoSwitch)],
+            ..Hits::default()
+        };
+        assert!(!a.auto_switch);
+        click(&mut a, &hits, 1, 5);
+        assert!(a.auto_switch && config::auto_switch_on(&a.paths));
+        click(&mut a, &hits, 1, 5);
+        assert!(!a.auto_switch && !config::auto_switch_on(&a.paths));
+    }
+
+    #[test]
     fn switch_to_codex_is_flagged() {
         let mut a = app();
         let mut p = fs::read_to_string(&a.paths.providers).unwrap();
         p.push_str("cx\tcodex\tCodex\n");
         fs::write(&a.paths.providers, p).unwrap();
         a.refresh();
+        config::set_auto_switch(&a.paths, true);
         a.open("t1");
-        a.tabs[0].tried = vec!["claude/w".into()];
+        a.tabs[0].tried = vec!["claude/w".into(), "t1".into(), "t2".into()];
         a.retry(0);
-        assert!(matches!(
-            &a.tabs[0].notice,
-            Some(Notice::Switch { to, codex: true, .. }) if to == "cx"
-        ));
+        assert!(
+            matches!(
+                &a.tabs[0].notice,
+                Some(Notice::Switch { to, codex: true, at: None, .. }) if to == "cx"
+            ),
+            "codex always waits for y, even with auto-switch on"
+        );
+        a.tick();
+        key(&mut a, KeyCode::Enter);
+        assert!(matches!(a.tabs[0].notice, Some(Notice::Switch { .. })));
     }
 
     #[test]

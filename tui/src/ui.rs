@@ -34,6 +34,8 @@ pub enum Button {
     Failover,
     /// failover / weighted round-robin
     Mode,
+    /// at a limit: switch by itself or ask
+    AutoSwitch,
     /// open the next account by round-robin
     Auto,
     /// the `✻ home` tab
@@ -205,6 +207,20 @@ fn title_bar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         );
         hits.buttons.push((r, Button::Mode));
         limit = r.x;
+        // at a limit: switch by itself or ask (`s`)
+        let auto = if app.auto_switch {
+            " ⏵ switch: auto "
+        } else {
+            " ? switch: ask "
+        };
+        if let Some(r) = place(limit, auto) {
+            f.render_widget(
+                Paragraph::new(auto).style(Style::new().fg(Color::White).bg(RAISED)),
+                r,
+            );
+            hits.buttons.push((r, Button::AutoSwitch));
+            limit = r.x;
+        }
     }
 
     if let Some(v) = &app.update {
@@ -811,13 +827,22 @@ fn notice(f: &mut Frame, app: &App, n: &Notice, area: Rect) {
     let d = |t: &'static str| Span::styled(t, s(MUTED));
     let bold = s(Color::White).add_modifier(Modifier::BOLD);
     let (title, lines): (&str, Vec<Line>) = match n {
-        Notice::Switch { from, to, codex } => {
+        Notice::Switch {
+            from,
+            to,
+            codex,
+            at,
+        } => {
             let mut lines = vec![
                 Line::from(format!("{from} hit its usage limit.")),
                 Line::from(vec![
-                    Span::raw("→ Move this session to "),
+                    Span::raw(if at.is_some() {
+                        "→ Moving this session to "
+                    } else {
+                        "→ Move this session to "
+                    }),
                     Span::styled(app.label(to), bold),
-                    Span::raw("?"),
+                    Span::raw(if at.is_some() { "." } else { "?" }),
                 ]),
             ];
             if *codex {
@@ -826,16 +851,25 @@ fn notice(f: &mut Frame, app: &App, n: &Notice, area: Rect) {
                     s(WARN),
                 )));
             }
+            let keys = if let Some(at) = at {
+                let left = at.saturating_duration_since(Instant::now()).as_secs() + 1;
+                lines.extend([
+                    Line::raw(""),
+                    Line::from(Span::styled(format!("Switching in {left}s"), s(WARN))),
+                ]);
+                vec![keycap("enter"), d(" now   ")]
+            } else {
+                vec![keycap("y"), d(" move   ")]
+            };
             lines.extend([
                 Line::raw(""),
-                Line::from(vec![
-                    keycap("y"),
-                    d(" move   "),
-                    keycap("o"),
-                    d(" change order   "),
-                    keycap("q"),
-                    d(" stop"),
-                ]),
+                Line::from(
+                    [
+                        keys,
+                        vec![keycap("o"), d(" change order   "), keycap("q"), d(" stop")],
+                    ]
+                    .concat(),
+                ),
             ]);
             ("✻ Failover", lines)
         }
@@ -1034,7 +1068,10 @@ fn confirm_window(f: &mut Frame, app: &App, c: &Confirm, area: Rect) {
             Span::styled(" keep", s(MUTED)),
         ]),
     ];
-    let inner = window(f, area, "Delete", 64, lines.len() as u16 + 4);
+    // rows after wrapping (64 wide - borders - padding = 58), so a long path never hides the y / n line;
+    // shortcut: counts by width, so word wrap can still need a row more on a line of long words
+    let rows: usize = lines.iter().map(|l| l.width().div_ceil(58).max(1)).sum();
+    let inner = window(f, area, "Delete", 64, rows as u16 + 5);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
@@ -1059,6 +1096,17 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
             (3, hint("*", "default")),
             (1, hint("f", "failover")),
             (1, hint("w", "mode")),
+            (
+                2,
+                hint(
+                    "s",
+                    if app.auto_switch {
+                        "switch: auto"
+                    } else {
+                        "switch: ask"
+                    },
+                ),
+            ),
         ];
         if app.wrr {
             items.extend([

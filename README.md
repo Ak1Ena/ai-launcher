@@ -21,7 +21,7 @@ A terminal UI with two kinds of tabs:
 
 ![a Claude tab: the CLI fills the window, with the account's usage and the next failover account on the bottom line](docs/tui-tab.png)
 
-On a narrow terminal, columns and key hints that don't fit are dropped, least important first. When failover triggers, the tab shows a notice and asks `[y/N]` before moving to the next account (Enter means no). When a newer version is on npm, a notice appears in the title bar (checked at most once a day in the background; set `AI_LAUNCHER_NO_UPDATE_CHECK=1` to disable).
+On a narrow terminal, columns and key hints that don't fit are dropped, least important first. When failover triggers, the tab shows a notice: it asks `[y/N]` before moving to the next account (Enter means no), or with auto-switch on (`s`) it counts down 5 seconds and moves by itself (a move to Codex always asks). When a newer version is on npm, a notice appears in the title bar (checked at most once a day in the background; set `AI_LAUNCHER_NO_UPDATE_CHECK=1` to disable).
 
 Install:
 
@@ -48,6 +48,7 @@ It reads and writes the same config as the bash `ai` (providers file, failover o
 | `space` | turn the account's failover on / off (or click its `● on` / `○ off` switch); an off account is skipped when a limit hits |
 | `f` | failover on / off |
 | `w` | switch between failover and weighted round-robin |
+| `s` | at a limit: auto-switch after a countdown, or ask y/N (default); shown as `switch: auto` / `switch: ask` in the title bar (click it to toggle); turning it off stops a running countdown, which then waits for `y` |
 | `+` `-` | round-robin: raise / lower the account's weight (0 to 99, default 1; 0 is never picked) |
 | `n` | round-robin: open the next account (or click `▶ Auto`) |
 | `m` | set the Auto decision model |
@@ -63,7 +64,7 @@ Optionally let a model choose instead: press `m` and enter a model name (for exa
 
 In the add form, a Claude account opens its login in a tab. A Codex or Gemini login gets its own login folder when another one of that CLI exists. Other CLI runs any command you type.
 
-Delete asks first. A Claude account folder moves to `<accounts folder>/.trash`, so its login and history are kept.
+Delete asks first, then deletes for good. A Claude account is logged out and its folder (login, history, settings) is removed; if the logout fails, the flash says so (on macOS its Keychain login may remain). A Codex or Gemini account with its own login folder (`~/.ai-accounts/<cli>/<name>`) loses that folder too; the main `~/.codex` / `~/.gemini` (and the folder of a provider named `codex` / `gemini`) is never touched.
 
 | Key (anywhere) | Does |
 | --- | --- |
@@ -90,8 +91,9 @@ In a tab, every key goes to the CLI except these:
 | Key (in a tab) | Does |
 | --- | --- |
 | `y` | on a failover notice: move to the next account |
+| `enter` | on an auto-switch countdown: move now (does nothing on a `[y/N]` question) |
 | `o` | on a failover notice: go home to change the order or pick another account |
-| `q` / `esc` | on a failover notice: stop (no move); `enter` does nothing there |
+| `q` / `esc` | on a failover notice: stop (no move) |
 | `enter` | on an ended tab: restart it |
 | `x` | on an ended tab: close it |
 
@@ -193,7 +195,7 @@ When a newer version is on npm, the picker shows an `update X available` line. I
 | `ai ls` | List agents with their launch command and label |
 | `ai add [name] [command] [label]` | Add an agent. It asks for anything you leave out. |
 | `ai edit <name> [command] [label]` | Change the command or label. It asks, showing the current value. Press Enter to keep it. |
-| `ai rm <name>` | Delete an agent, after asking you to confirm. `ai add <name>` brings it back. |
+| `ai rm <name>` | Delete an agent, after asking you to confirm. A Codex or Gemini agent with its own login folder loses that folder for good; otherwise `ai add <name>` brings it back. |
 
 ```bash
 ai add aider "aider --model sonnet" "Aider"
@@ -209,7 +211,7 @@ Agents are saved in `~/.config/ai-launcher/providers`, one per line as `name<TAB
 | `cla add work` | Add an account and log in. Settings, skills and plugins are shared with `~/.claude`. |
 | `cla` / `cla-team` | Pick a Claude account, then start it normally or in team mode |
 | `cla work [team] [args]` | Start a specific account |
-| `cla ls`, `cla rm work`, `cla mv work job` | List, remove or rename accounts (`cla rm` asks to confirm; `AI_YES=1` skips the question) |
+| `cla ls`, `cla rm work`, `cla mv work job` | List, remove or rename accounts (`cla rm` asks to confirm, then logs out and deletes the folder for good: login, history and settings; only `AI_YES=1` skips the question; if logout fails it warns and asks again before deleting) |
 
 Accounts live in `~/.claude-accounts/<name>`. Set `CLA_ROOT` to use another folder.
 
@@ -221,7 +223,7 @@ Add another agent that runs the same CLI. The first one uses your normal login; 
 ai add personal codex "Codex personal"   # codex is already listed, so this is a separate login
 ```
 
-Start it from `ai` and log in. Each one gets its own row with its own usage bars (Codex). Logins live in `~/.ai-accounts/<cli>/<name>`, which the CLI gets as `CODEX_HOME` or `GEMINI_CLI_HOME`. Set `AI_ACCOUNTS` to use another folder. A new login starts with fresh settings: nothing is copied from the main one. `ai rm` keeps the folder, so adding the same name again gets the same login back.
+Start it from `ai` and log in. Each one gets its own row with its own usage bars (Codex). Logins live in `~/.ai-accounts/<cli>/<name>`, which the CLI gets as `CODEX_HOME` or `GEMINI_CLI_HOME`. Set `AI_ACCOUNTS` to use another folder. A new login starts with fresh settings: nothing is copied from the main one. `ai rm` (and delete in the TUI) deletes that folder for good, never the main `~/.codex` or `~/.gemini`.
 
 Antigravity (`agy`) can't have several accounts yet: it always reads `~/.gemini/antigravity-cli` and has no setting to move it.
 
@@ -229,12 +231,13 @@ Antigravity (`agy`) can't have several accounts yet: it always reads `~/.gemini/
 
 When a Claude account hits its usage limit, the same session resumes on the next account in your priority order. Codex has no limit hook, so it only gets a written handoff of the session, and the session ends there: accounts below Codex in the order are not tried. New Codex accounts start at the bottom. Failover is off until you turn it on.
 
-Failover never moves on its own. When a limit hits, it asks `[y/N]` and Enter means no: `y` moves to the next account, `o` changes the order, `q` (or anything else) stops. There is no timer. If the next member runs Codex, it warns that the conversation will go to OpenAI (Codex) before you answer. Inside a `cla` session, `main` still means `~/.claude`, not the account you are in.
+You choose what happens when a limit hits with `ai failover auto on|off` (or `s` in the TUI); both read `<failover file>.auto`. Off (the default) asks `[y/N]` and Enter means no: `y` moves to the next account, `o` changes the order, `q` (or anything else) stops. On counts down (`AI_FO_WAIT` seconds, default 5) and then moves by itself: any key (Enter in the TUI) moves now, `o` changes the order, `q` stops. If the next member runs Codex, it always asks `[y/N]` and warns that the conversation will go to OpenAI (Codex), even with auto-switch on. Inside a `cla` session, `main` still means `~/.claude`, not the account you are in.
 
 ```bash
 ai failover on     # or ctrl-f in the picker
 ai failover off
 ai failover ls     # members in order, with any limit still running
+ai failover auto on   # move by itself after a countdown (off: ask y/N, the default)
 ```
 
 Set the priority with `ai failover` (or `ctrl-o` in the picker). On that screen:
@@ -245,6 +248,7 @@ Set the priority with `ai failover` (or `ctrl-o` in the picker). On that screen:
 | `ctrl-x` | `x 2` | Turn the member on / off |
 | `ctrl-r` | `r 2` | Clear its limit |
 | `ctrl-f` | `f` | Turn failover on / off |
+| `ctrl-a` | `a` | Turn auto-switch on / off (the hint shows `auto-switch: on` / `off`) |
 
 ```bash
 ai failover order claude/work claude/personal codex   # put these first, in this order
@@ -255,6 +259,7 @@ ai failover clear claude/work                         # forget a limit (no name 
 | --- | --- | --- |
 | `AI_FO_COOLDOWN` | `18000` | Seconds an account is skipped after it hits its limit |
 | `AI_FO_STATE` | `${XDG_STATE_HOME:-~/.local/state}/ai-launcher/failover` | Where limit marks are kept |
+| `AI_FO_WAIT` | `5` | Countdown seconds before an auto-switch (bash) |
 | `AI_FO_PROMPT` | "...Continue the work exactly where you left off." | First message sent to the new account |
 
 Needs jq. Not used in team mode. Limits: the cooldown is fixed, not the real reset time (use `ctrl-r` if the limit ended sooner). Codex can't trigger a failover, so put it last. Not available on native Windows (Git Bash yet); use WSL.
@@ -277,7 +282,8 @@ Needs jq. Not used in team mode. Limits: the cooldown is fixed, not the real res
 ## Security
 
 - `cla add` links `settings.json`, `hooks`, `plugins` and `projects` from `~/.claude` into the new account. So an `env` entry there (for example `ANTHROPIC_API_KEY`) or an `apiKeyHelper` applies to every account, and chat transcripts are shared through `projects`.
-- `cla rm` moves the account to `<accounts folder>/.trash` instead of erasing it. That folder may still hold the login (`.credentials.json` on Linux). Delete it yourself to really remove it.
+- Delete is permanent, with no trash. `cla rm` (and delete in the TUI) logs the account out, then removes its folder with its login (`.credentials.json` on Linux), history and settings. It never follows links: the shared `~/.claude` files the account links to stay, and a symlinked account folder loses only the link. Deleting a Codex or Gemini agent removes only its own `~/.ai-accounts/<cli>/<name>` folder.
+- Auto-switch (`ai failover auto on`) moves a session to the next Claude account without asking, but a move to Codex always asks first, because it sends the conversation to OpenAI.
 - `cla mv` never copies secrets. On macOS you log in again after a rename, because Claude ties the Keychain login to the folder path.
 
 ## Add usage bars for another agent

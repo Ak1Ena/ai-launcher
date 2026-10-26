@@ -426,6 +426,20 @@ pub fn set_failover(paths: &Paths, on: bool) {
     }
 }
 
+/// `<order>.auto` exists: a limit switches by itself after a short countdown (shared with bash).
+/// Missing: ask y/N. A switch to Codex always asks.
+pub fn auto_switch_on(paths: &Paths) -> bool {
+    beside(paths, ".auto").exists()
+}
+
+pub fn set_auto_switch(paths: &Paths, on: bool) {
+    if on {
+        write_beside(paths, ".auto", "");
+    } else {
+        let _ = fs::remove_file(beside(paths, ".auto"));
+    }
+}
+
 fn limit_mark(paths: &Paths, id: &str) -> PathBuf {
     paths.fo_state.join("limited").join(id)
 }
@@ -586,36 +600,56 @@ pub fn add_claude_account(paths: &Paths, name: &str) -> std::io::Result<PathBuf>
     Ok(dir)
 }
 
-/// Moves a cla account folder to `<cla root>/.trash/` instead of erasing it (its login, history
-/// and settings stay recoverable). Folders starting with `.` are not accounts.
-pub fn trash_claude_account(paths: &Paths, name: &str) -> std::io::Result<PathBuf> {
-    let stamp = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let trash = paths.cla_root.join(".trash");
-    fs::create_dir_all(&trash)?;
+/// Logs a cla account out, then removes its folder for good (login, history, settings).
+/// A symlinked account folder loses only the link: nothing outside the cla root is touched.
+/// Ok(false): removed, but `claude auth logout` failed (on macOS the Keychain login may remain).
+pub fn remove_claude_account(paths: &Paths, name: &str) -> std::io::Result<bool> {
+    // not valid_name: accounts made with older names (spaces) must still delete
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("bad account name '{name}'"),
+        ));
+    }
     let from = paths.cla_root.join(name);
-    // log out first (as `cla rm`); failure is fine
-    let _ = std::process::Command::new("claude")
+    let logged_out = std::process::Command::new("claude")
         .args(["auth", "logout"])
         .env("CLAUDE_CONFIG_DIR", &from)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
-    let mut to = trash.join(format!("{name}-{stamp}"));
-    let mut n = 2;
-    while to.symlink_metadata().is_ok() {
-        to = trash.join(format!("{name}-{stamp}-{n}"));
-        n += 1;
+        .status()
+        .is_ok_and(|s| s.success());
+    remove_entry(&from)?;
+    Ok(logged_out)
+}
+
+/// Removes a folder, or only the link when `p` is a symlink (remove_dir_all never follows links).
+fn remove_entry(p: &Path) -> std::io::Result<()> {
+    if p.symlink_metadata()?.file_type().is_symlink() {
+        fs::remove_file(p)
+    } else {
+        fs::remove_dir_all(p)
     }
-    fs::rename(&from, &to)?;
-    Ok(to)
+}
+
+/// Removes a Codex/Gemini provider's own login folder (`<ai accounts>/<agent>/<name>`), if it has
+/// one. Never the main login (~/.codex, ~/.gemini), which is not under the ai accounts folder.
+pub fn remove_login_dir(paths: &Paths, name: &str, command: &str) -> std::io::Result<()> {
+    let a = agent(command);
+    // the provider named after its CLI is the main one: never delete a folder by that name (as `ai rm`)
+    if !valid_name(name) || (a != "codex" && a != "gemini") || name == a {
+        return Ok(());
+    }
+    let d = paths.ai_accounts.join(&a).join(name);
+    if d.symlink_metadata().is_err() {
+        return Ok(());
+    }
+    remove_entry(&d)
 }
 
 /// A 2nd provider of the same Codex/Gemini CLI gets its own login folder (as `ai add`).
-/// Kept on delete, so adding the same name again gets the same login back.
+/// Deleting the provider removes it (`remove_login_dir`).
 pub fn add_login_dir(paths: &Paths, name: &str, command: &str) -> Option<PathBuf> {
     let a = agent(command);
     if a != "codex" && a != "gemini" {
@@ -766,22 +800,69 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn add_account_retries_over_dangling_link_and_trash_names_are_unique() {
+    fn add_account_retries_over_dangling_link() {
         let p = tmp_paths("retry");
         let d = p.cla_root.join("w");
         fs::create_dir_all(&d).unwrap();
         std::os::unix::fs::symlink("/nonexistent/x", d.join("settings.json")).unwrap();
         add_claude_account(&p, "w").unwrap();
         add_claude_account(&p, "w").unwrap();
-        let a = trash_claude_account(&p, "w").unwrap();
-        fs::create_dir_all(p.cla_root.join("w")).unwrap();
-        let b = trash_claude_account(&p, "w").unwrap();
-        assert_ne!(a, b);
-        assert!(a.exists() && b.exists());
+        remove_claude_account(&p, "w").unwrap();
+        assert!(d.symlink_metadata().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_symlinked_account_drops_only_the_link() {
+        let p = tmp_paths("rmlink");
+        let outside = p.home.join("elsewhere");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), "x").unwrap();
+        fs::create_dir_all(&p.cla_root).unwrap();
+        std::os::unix::fs::symlink(&outside, p.cla_root.join("ln")).unwrap();
+        remove_claude_account(&p, "ln").unwrap();
+        assert!(p.cla_root.join("ln").symlink_metadata().is_err());
+        assert!(
+            outside.join("keep").exists(),
+            "the link's target is untouched"
+        );
     }
 
     #[test]
-    fn claude_account_add_and_trash() {
+    fn remove_login_dir_only_under_ai_accounts() {
+        let p = tmp_paths("rmlogin");
+        let d = p.ai_accounts.join("codex/work");
+        fs::create_dir_all(&d).unwrap();
+        fs::create_dir_all(&p.codex_home).unwrap();
+        remove_login_dir(&p, "..", "codex").unwrap();
+        remove_login_dir(&p, "aider", "aider").unwrap();
+        assert!(d.exists() && p.codex_home.exists());
+        remove_login_dir(&p, "work", "FOO=1 codex --x").unwrap();
+        assert!(!d.exists() && p.codex_home.exists());
+        remove_login_dir(&p, "work", "codex").unwrap();
+        let main = p.ai_accounts.join("codex/codex");
+        fs::create_dir_all(&main).unwrap();
+        remove_login_dir(&p, "codex", "codex").unwrap();
+        assert!(main.exists(), "the main codex provider keeps it");
+    }
+
+    #[test]
+    fn remove_claude_account_rejects_path_names() {
+        let p = tmp_paths("rmbad");
+        let keep = p.cla_root.join("a");
+        fs::create_dir_all(&keep).unwrap();
+        for bad in ["", ".", "..", "a/..", "../x", "a\\b"] {
+            assert!(remove_claude_account(&p, bad).is_err(), "{bad:?}");
+        }
+        assert!(keep.exists() && p.cla_root.exists());
+        let spaced = p.cla_root.join("my acct");
+        fs::create_dir_all(&spaced).unwrap();
+        remove_claude_account(&p, "my acct").unwrap();
+        assert!(!spaced.exists(), "old names with spaces still delete");
+    }
+
+    #[test]
+    fn claude_account_add_and_remove() {
         let p = tmp_paths("cla");
         let d = add_claude_account(&p, "work").unwrap();
         assert!(d.join("settings.json").exists());
@@ -791,10 +872,12 @@ mod tests {
                 .starts_with("claude\t")
         );
         assert_eq!(cla_accounts(&p.cla_root), vec!["work".to_string()]);
-        trash_claude_account(&p, "work").unwrap();
+        remove_claude_account(&p, "work").unwrap();
+        assert!(cla_accounts(&p.cla_root).is_empty());
+        assert!(!d.exists(), "removed for good");
         assert!(
-            cla_accounts(&p.cla_root).is_empty(),
-            "trash is not an account"
+            p.home.join(".claude/settings.json").exists(),
+            "shared settings it linked to stay"
         );
     }
 
@@ -850,7 +933,7 @@ mod tests {
     fn names_are_path_safe() {
         assert!(valid_name("work-2.a"));
         assert!(
-            !valid_name("..") && !valid_name("a/b") && !valid_name(".trash") && !valid_name("")
+            !valid_name("..") && !valid_name("a/b") && !valid_name(".hidden") && !valid_name("")
         );
     }
 }

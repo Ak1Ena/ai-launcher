@@ -121,6 +121,8 @@ ai rm   <name>                   delete an agent
 ai failover [on|off|ls]          when a Claude account hits its limit, resume the session on the
                                  next account (Codex last). No args: set priority, turn accounts on/off
 ai failover order <member>...    set priority from the command line
+ai failover auto [on|off]        at a limit, move by itself after a countdown (on) or ask y/N (off,
+                                 default). A move to Codex always asks
 ai trust [on|off|status]         share folder trust between agents (off by default)
 cla [name] [team] [args]         Claude accounts: pick or start one   (cla add|ls|rm|mv)
 cla-team [name] [args]           Claude team mode (needs tmux)
@@ -198,7 +200,7 @@ _ai_add() {
   _ai_add_login "$n"
 }
 # Another provider already runs this CLI: give this one its own login folder, so it is a
-# separate account. Kept on delete, so re-adding the same name gets the same login back.
+# separate account. `ai rm` deletes that folder with the provider.
 _ai_add_login() {
   local a o d; a=$(_ai_agent "$1")
   [ -n "$(_ai_account_env "$a")" ] || return 0
@@ -217,10 +219,16 @@ _ai_edit() {
   _ai_put "$n" "$c" "$l" && echo "saved $n -> $c"
 }
 _ai_rm() {
-  local n=${1:-} ans
+  local n=${1:-} ans d=
   [ -n "$n" ] && [ -n "$(_ai_get "$n" 1)" ] || { echo "no provider '$n'. see: ai ls"; return 1; }
-  read -r -p "delete provider '$n'? [y/N] " ans
-  case $ans in y|Y|yes) _ai_put "$n" && echo "deleted $n (bring back: ai add $n)" ;; *) return 1 ;; esac
+  # its own codex/gemini login, only ever $AI_ACCOUNTS/<agent>/<name> with a path-safe name (never ~/.codex)
+  # the provider named after its CLI (codex, gemini) is the main login: never delete a folder by that name
+  case $n in .*|*[!A-Za-z0-9._-]*) ;; *) [ "$n" = "$(_ai_agent "$n")" ] || d=$(_ai_account_dir "$n") ;; esac
+  read -r -p "delete provider '$n'${d:+ and its login folder $d for good (login, history, settings)}? [y/N] " ans
+  case $ans in y|Y|yes) ;; *) return 1 ;; esac
+  _ai_put "$n" || return 1
+  # rm -rf on a symlink path removes only the link
+  if [ -n "$d" ]; then rm -rf "${d:?}" && echo "deleted $n and $d"; else echo "deleted $n (bring back: ai add $n)"; fi
 }
 
 # the entry plain `ai` starts without the picker, in <failover>.default (shared with the TUI)
@@ -284,7 +292,7 @@ pad() {
 # ── picker: fzf when installed, else a numbered menu ──────
 # _ai_choose <title> <hint> <keys|order|""> <rows>. Prints "<action>\n<row>". Fails on cancel.
 # keys:  action = "" (launch) | team | add | edit | delete | failover | order
-# order: action = "" (back) | up | down | toggle | clear | failover   (the failover priority screen)
+# order: action = "" (back) | up | down | toggle | clear | failover | auto   (the failover priority screen)
 # Rows come as an argument, not stdin, so the menu can read the answer from the terminal
 # on stdin and draw on stderr: no /dev/tty needed (unreliable in Git Bash on Windows).
 _ai_choose() {
@@ -294,7 +302,7 @@ _ai_fzf() {
   local out key extra=()
   case ${3:-} in
     keys) extra=(--expect=ctrl-t,ctrl-a,ctrl-e,ctrl-x,ctrl-f,ctrl-o) ;;
-    order) extra=(--expect=ctrl-u,ctrl-d,ctrl-x,ctrl-r,ctrl-f) ;;
+    order) extra=(--expect=ctrl-u,ctrl-d,ctrl-x,ctrl-r,ctrl-f,ctrl-a) ;;
   esac
   out=$(fzf --ansi --delimiter="$TAB" --with-nth=3 --height=~16 --reverse --border=rounded \
       --border-label="$1" --prompt='  ' --pointer='▶' --info=hidden --no-scrollbar \
@@ -306,7 +314,7 @@ _ai_fzf() {
   case $3:$key in
     keys:ctrl-t) key=team ;; keys:ctrl-a) key=add ;; keys:ctrl-e) key=edit ;; keys:ctrl-x) key=delete ;;
     keys:ctrl-o) key=order ;; *:ctrl-f) key=failover ;;
-    order:ctrl-u) key=up ;; order:ctrl-d) key=down ;; order:ctrl-x) key=toggle ;; order:ctrl-r) key=clear ;;
+    order:ctrl-u) key=up ;; order:ctrl-d) key=down ;; order:ctrl-x) key=toggle ;; order:ctrl-r) key=clear ;; order:ctrl-a) key=auto ;;
   esac
   printf '%s\n%s\n' "$key" "${out#*"$NL"}"
 }
@@ -322,7 +330,7 @@ _ai_menu() {
     done
     case ${3:-} in
       keys) dim "  number = launch · t N = claude team · a = add · e N = edit · x N = delete · f = failover on/off · o = failover order · q = quit" ;;
-      order) dim "  u N = up · d N = down · x N = on/off · r N = clear limit · f = failover on/off · q = back" ;;
+      order) dim "  u N = up · d N = down · x N = on/off · r N = clear limit · f = failover on/off · a = auto-switch on/off · q = back" ;;
       *) dim "  number = choose · q = quit" ;;
     esac
     printf '\n'
@@ -331,7 +339,7 @@ _ai_menu() {
   set -- $ans
   case ${1:-q} in
     q) return 1 ;;
-    a) printf 'add\n\n'; return ;;
+    a) if [ "$mode" = order ]; then printf 'auto\n\n'; else printf 'add\n\n'; fi; return ;;
     f) printf 'failover\n\n'; return ;;
     o) printf 'order\n\n'; return ;;
     t) act=team; n=${2:-} ;;
