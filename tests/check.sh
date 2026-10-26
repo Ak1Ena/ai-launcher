@@ -57,18 +57,29 @@ rows=$( PATH=$T/bin:$PATH; _ai_rows )
 ok "each login has its own usage row" '[ "$(echo "$rows" | cut -f2 | tr "\n" " ")" = "codex work " ] && case $(echo "$rows" | line 2 | cut -f3 | plain) in *5h*7%*) true;; *) false;; esac'
 ok "launch points codex at its login" '[ "$(_ai_run work work)" = "$(native_path "$AI_ACCOUNTS/codex/work")" ]'
 _ai_put codex "$T/bin/codex"
+mkdir -p "$AI_ACCOUNTS/codex/zz"
+ok "main codex drops an inherited ai-account CODEX_HOME" '[ -z "$(export CODEX_HOME=$AI_ACCOUNTS/codex/zz; _ai_run codex codex)" ]'
+ok "main codex keeps a CODEX_HOME set elsewhere" '[ "$(export CODEX_HOME=$T/elsewhere; _ai_run codex codex)" = "$T/elsewhere" ]'
 ok "main login stays the default" '[ "$(_ai_run codex codex)" = "$CODEX_HOME" ]'
 _ai_add other "aider" >/dev/null <<<""
 ok "other CLIs never get a login folder" '[ ! -e "$AI_ACCOUNTS/aider" ]'
 ok "names must be path-safe"    '! _ai_add .. codex x >/dev/null && ! _ai_add a/b codex x >/dev/null'
 _ai_put work; _ai_add work codex "Codex work" >/dev/null
 ok "re-adding a name keeps its login" '[ "$(_ai_account_dir work)" = "$AI_ACCOUNTS/codex/work" ]'
+touch "$CODEX_HOME/auth.json"
+ok "ai rm: n keeps the login folder" '! _ai_rm work <<<"n" >/dev/null 2>&1; [ -d "$AI_ACCOUNTS/codex/work" ]'
+ok "ai rm: y deletes its login folder" '_ai_rm work <<<"y" >/dev/null 2>&1; [ ! -e "$AI_ACCOUNTS/codex/work" ] && [ -z "$(_ai_get work 1)" ]'
+mkdir -p "$AI_ACCOUNTS/codex/codex"; touch "$AI_ACCOUNTS/codex/codex/auth.json"
+ok "ai rm: main codex login untouched" '_ai_rm codex <<<"y" >/dev/null 2>&1; [ -z "$(_ai_get codex 1)" ] && [ -f "$CODEX_HOME/auth.json" ] && [ -f "$AI_ACCOUNTS/codex/codex/auth.json" ] && [ -d "$AI_ACCOUNTS/codex/zz" ]'
 
 # ── shared folder trust ──
 echo '{"projects":{}}' > "$HOME/.claude.json"
 printf '[projects."%s"]\ntrust_level = "trusted"\n' "$HOME/repo/a" > "$CODEX_HOME/config.toml"
 echo "{\"$HOME/repo/a\": \"DO_NOT_TRUST\"}" > "$HOME/.gemini/trustedFolders.json"
 echo '{"trustedWorkspaces":[]}' > "$HOME/.gemini/antigravity-cli/settings.json"
+_ai_trust_share "$HOME/repo/a"
+ok "no trust sharing without the flag" '! _ai_trust_claude_has "$HOME/repo/a"'
+ok "ai trust on makes the flag"  '[[ $(_ai_trust on) == *MCP* ]] && [ -e "${AI_PROVIDERS%/*}/trust.on" ] && _ai_trust status | grep -q ": on"'
 _ai_trust_share "$HOME/repo/a"; _ai_trust_share "$HOME/repo/a"; _ai_trust_share "$HOME/repo/b"
 ok "trust spreads to claude (all accounts)" '_ai_trust_claude_has "$HOME/repo/a" && jq -e ".projects[\"$HOME/repo/a\"].hasTrustDialogAccepted" "$CLA_ROOT/one/.claude.json" >/dev/null'
 ok "trust spreads to agy once"  '[ "$(jq ".trustedWorkspaces | length" "$HOME/.gemini/antigravity-cli/settings.json")" = 1 ]'
@@ -80,6 +91,22 @@ ok "account sync copies trust"  'jq -e ".projects[\"$HOME/repo/a\"].hasTrustDial
 ok "account sync keeps other fields" '[ "$(jq -r .oauthAccount.emailAddress "$CLA_ROOT/two/.claude.json")" = two@example.com ]'
 ok "account sync keeps permissions" '[ "$(ls -l "$CLA_ROOT/two/.claude.json" | cut -c1-10)" = "-rw-------" ]'
 
+# codex single-quoted header, json edit hardening
+mkdir -p "$HOME/repo/q" "$HOME/repo/u"
+printf "[projects.'%s']\ntrust_level = \"trusted\"\n[projects.'%s']\ntrust_level = \"untrusted\"\n" "$HOME/repo/q" "$HOME/repo/u" >> "$CODEX_HOME/config.toml"
+_ai_trust_codex_add "$HOME/repo/q"; _ai_trust_codex_add "$HOME/repo/u"
+ok "codex single-quoted header seen, no duplicate" '_ai_trust_codex_has "$HOME/repo/q" && [ "$(grep -c "repo/q" "$CODEX_HOME/config.toml")" = 1 ]'
+ok "codex single-quoted untrusted kept" '! _ai_trust_codex_has "$HOME/repo/u" && [ "$(grep -c "repo/u" "$CODEX_HOME/config.toml")" = 1 ]'
+J=$T/je.json; echo '{"a":1}' > "$J"; chmod 640 "$J"
+_ai_json_edit "$J" '.a = 2'; _ai_json_edit "$J" '.a = 3'
+ok "json edit applies, .bak made once" '[ "$(jq .a "$J")" = 3 ] && [ "$(jq .a "$J.ai-launcher.bak")" = 1 ]'
+ok "json edit keeps mode"        '[ "$(ls -l "$J" | cut -c1-10)" = "-rw-r-----" ]'
+echo '{bad' > "$T/bad.json"; _ai_json_edit "$T/bad.json" '.a = 1'
+ok "bad json input left untouched" '[ "$(cat "$T/bad.json")" = "{bad" ] && [ ! -e "$T/bad.json.ai-launcher.bak" ]'
+ln -s "$J" "$T/lnk.json"; _ai_json_edit "$T/lnk.json" '.a = 9'
+ok "json edit writes through symlink" '[ -L "$T/lnk.json" ] && [ "$(jq .a "$J")" = 9 ]'
+ok "no temp files left" '[ -z "$(ls "$T" | grep "^je\.json\." | grep -v "\.ai-launcher\.bak$")" ]'
+
 # ── Windows (Git Bash), faked with uname / cygpath functions ──
 mkdir -p "$HOME/repo/w"
 printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$HOME/repo/w" >> "$CODEX_HOME/config.toml"
@@ -90,7 +117,7 @@ ok "scripts keep LF endings"    '! grep -lq $'"'"'\r'"'"' "$REPO"/bin/ai "$REPO"
 ok ".cmd files use CRLF"        'grep -q $'"'"'\r$'"'"' "$REPO/bin/ai.cmd"'
 
 # ── failover ──
-AI_FO_WAIT=0; FO=$T/fo; mkdir -p "$FO/bin" "$FO/proj/-slug" "$FO/state/limited/claude"; AI_FO_STATE=$FO/state; AI_FO_ORDER=$T/cfg/failover; rm -f "$AI_FO_ORDER" "$AI_FO_ORDER.on"
+FO=$T/fo; mkdir -p "$FO/bin" "$FO/proj/-slug" "$FO/state/limited/claude"; AI_FO_STATE=$FO/state; AI_FO_ORDER=$T/cfg/failover; rm -f "$AI_FO_ORDER" "$AI_FO_ORDER.on"
 # stub claude: --help lists value flags; run as a provider command it logs its args and, unless resumed, "hits the limit"
 cat > "$FO/bin/claude" <<'EOS'
 #!/bin/sh
@@ -137,24 +164,68 @@ ok "split: keep flags and prompt" '( PATH=$FO/bin:$PATH; _fo_split -p "x" --mode
 # end to end: claude/one hits the limit, claude/two resumes S1
 export FO_LOG=$FO/log FO_TR=$FO/proj/-slug/S1.jsonl; : > "$FO_LOG"
 _ai_failover on >/dev/null 2>&1; _ai_failover order claude/one claude/two cx >/dev/null 2>&1
-( PATH=$FO/bin:$PATH; _fo_run claude/one -p hi --model m ) 2>/dev/null
+( PATH=$FO/bin:$PATH; _fo_run claude/one -p hi --model m ) 2>/dev/null <<<"y"
 ok "run: next account resumes the session" 'grep -q "^$CLA_ROOT/two|.*--model m --resume S1" "$FO_LOG"'
 ok "run: transcript copied to its config dir" '[ -f "$CLA_ROOT/two/projects/-slug/S1.jsonl" ]'
 ok "run: limit is remembered"     '_fo_limited claude/one >/dev/null'
 # claude/two off: the next stop is the codex provider, which gets a handoff with the transcript
 _ai_failover clear >/dev/null 2>&1; : > "$FO_LOG"; rm -f "$FO_LOG.codex"
 _fo_list | _fo_set claude/two off | _fo_save
-( PATH=$FO/bin:$PATH; _fo_run claude/one -p hi ) 2>/dev/null
+( PATH=$FO/bin:$PATH; _fo_run claude/one -p hi ) 2>"$FO/err" <<<"y"
 ok "run: codex gets a handoff"    'grep -q "hello world" "$FO_LOG.codex" && grep -q "half done" "$FO_LOG.codex"'
+ok "run: codex next warns it goes to OpenAI" 'grep -q "sends the conversation to OpenAI (Codex)" "$FO/err"'
+# enter at the switch card: default No, the next member never starts
+_ai_failover clear >/dev/null 2>&1; : > "$FO_LOG"; rm -f "$FO_LOG.codex"
+( PATH=$FO/bin:$PATH; _fo_run claude/one -p hi ) 2>/dev/null <<<""; noRC=$?
+ok "run: enter at the switch card does not move" '[ $noRC != 0 ] && [ ! -e "$FO_LOG.codex" ] && [ "$(wc -l < "$FO_LOG" | tr -d " ")" = 1 ]'
+# started inside a cla session: CLAUDE_CONFIG_DIR under CLA_ROOT is not main
+mkdir -p "$T/elsewhere"; : > "$FO_LOG"
+( CLAUDE_CONFIG_DIR=$CLA_ROOT/one; PATH=$FO/bin:$PATH; _fo_run cl2 ) </dev/null >/dev/null 2>&1
+( CLAUDE_CONFIG_DIR=$T/elsewhere; PATH=$FO/bin:$PATH; _fo_run cl2 ) </dev/null >/dev/null 2>&1
+ok "run: cla CLAUDE_CONFIG_DIR is not main" '[ "$(cut -d"|" -f1 "$FO_LOG" | tr "\n" " ")" = " $T/elsewhere " ]'
+_ai_failover clear >/dev/null 2>&1
+ok "run: transcript copy keeps its mode" '( chmod 600 "$FO_TR"; rm -rf "$CLA_ROOT/two/projects"; _fo_list | _fo_set claude/two on | _fo_save; _ai_failover clear >/dev/null 2>&1; PATH=$FO/bin:$PATH; _fo_run claude/one -p hi 2>/dev/null <<<"y" >/dev/null; [ "$(ls -l "$CLA_ROOT/two/projects/-slug/S1.jsonl" | cut -c1-10)" = "-rw-------" ] )'
 # q at the switch card: stops, next member never launched
 _ai_failover clear >/dev/null 2>&1; : > "$FO_LOG"; _fo_list | _fo_set claude/two on | _fo_save
-( PATH=$FO/bin:$PATH; AI_FO_WAIT=2 _fo_run claude/one -p hi ) 2>/dev/null <<<"q"; stoprc=$?
+( PATH=$FO/bin:$PATH; _fo_run claude/one -p hi ) 2>/dev/null <<<"q"; stoprc=$?
 ok "run: q at the switch card stops" '[ $stoprc != 0 ] && [ "$(wc -l < "$FO_LOG" | tr -d " ")" = 1 ] && ! grep -q "^$CLA_ROOT/two|" "$FO_LOG"'
+# auto-switch: <order>.auto
+ok "failover auto on writes the file" '_ai_failover auto on >/dev/null 2>&1; [ -e "$AI_FO_ORDER.auto" ] && _fo_auto'
+_ai_failover clear >/dev/null 2>&1; : > "$FO_LOG"
+( AI_FO_WAIT=2; PATH=$FO/bin:$PATH; _fo_run claude/one -p hi ) </dev/null >/dev/null 2>&1
+ok "auto: countdown moves with no input" 'grep -q "^$CLA_ROOT/two|.*--resume S1" "$FO_LOG"'
+_ai_failover clear >/dev/null 2>&1; : > "$FO_LOG"
+( AI_FO_WAIT=2; PATH=$FO/bin:$PATH; _fo_run claude/one -p hi ) 2>/dev/null <<<"q"; stoprc=$?
+ok "auto: q stops the countdown" '[ $stoprc != 0 ] && ! grep -q "^$CLA_ROOT/two|" "$FO_LOG"'
+_ai_failover clear >/dev/null 2>&1; : > "$FO_LOG"; rm -f "$FO_LOG.codex"
+_fo_list | _fo_set claude/two off | _fo_save
+( AI_FO_WAIT=2; PATH=$FO/bin:$PATH; _fo_run claude/one -p hi ) </dev/null >/dev/null 2>"$FO/err"; cxrc=$?
+ok "auto: codex next still asks (no input = no)" '[ $cxrc != 0 ] && [ ! -e "$FO_LOG.codex" ] && grep -q "sends the conversation to OpenAI (Codex)" "$FO/err" && grep -q "\[y/N\]" "$FO/err" && ! grep -q "switching in" "$FO/err"'
+_fo_list | _fo_set claude/two on | _fo_save; _ai_failover clear >/dev/null 2>&1; : > "$FO_LOG"
+# stdin stays open but silent: only the countdown running out can move it (y/N would wait for EOF at 4 s)
+sleep 4 | { s=$(date +%s); ( AI_FO_WAIT=2; PATH=$FO/bin:$PATH; _fo_run claude/one -p hi ) >/dev/null 2>&1; echo $(( $(date +%s) - s )) > "$FO/took"; }
+ok "auto: countdown runs out and moves" 'grep -q "^$CLA_ROOT/two|.*--resume S1" "$FO_LOG" && [ "$(cat "$FO/took")" -ge 2 ] && [ "$(cat "$FO/took")" -lt 4 ]'
+_ai_failover clear >/dev/null 2>&1
+ok "auto: wait counts down to go"   '[ "$(AI_FO_WAIT=1 _fo_wait 2>/dev/null </dev/null)" = go ] && [ "$(_fo_wait ask 2>/dev/null </dev/null)" = stop ]'
+ok "auto: ls shows the state" '_fo_show 2>&1 | grep -q "auto-switch on"'
+ok "failover auto off removes the file" '_ai_failover auto off >/dev/null 2>&1; [ ! -e "$AI_FO_ORDER.auto" ] && ! _fo_auto && _fo_show 2>&1 | grep -q "auto-switch off"'
 mrows=$(_fo_rows)
 ok "menu order: u 2 is up"        '[ "$(_ai_menu t "" order "$mrows" <<<"u 2" 2>/dev/null | head -1)" = up ]'
 ok "menu order: x 1 is toggle"    '[ "$(_ai_menu t "" order "$mrows" <<<"x 1" 2>/dev/null | head -1)" = toggle ]'
+ok "menu order: a is auto"        '[ "$(_ai_menu t "" order "$mrows" <<<"a" 2>/dev/null | head -1)" = auto ]'
+ok "menu keys: a is still add"    '[ "$(_ai_menu t "" keys "$mrows" <<<"a" 2>/dev/null | head -1)" = add ]'
+ok "fzf order: ctrl-a is auto"    '[ "$( fzf() { cat >/dev/null; printf "ctrl-a\nr\n"; }; _ai_fzf t "" order "$mrows" | head -1)" = auto ]'
+# the priority screen: auto toggles <order>.auto, and its hint shows the state
+FZ=$T/fz; rm -f "$AI_FO_ORDER.auto"
+ok "order screen: auto toggles auto-switch" '( fzf() { cat >/dev/null; [ -e "$FZ" ] && return 1; : > "$FZ"; printf "ctrl-a\n%s\n" "$(_fo_rows | head -1)"; }; _fo_ui >/dev/null 2>&1 ); [ -e "$AI_FO_ORDER.auto" ]'
+ok "order screen: hint shows auto-switch state" '( fzf() { cat >/dev/null; printf "%s\n" "$@" > "$FZ.args"; return 1; }; _fo_ui >/dev/null 2>&1 ); grep -q "ctrl-a auto-switch: on" "$FZ.args"'
+rm -f "$AI_FO_ORDER.auto" "$FZ"
 ok "menu keys: x 1 is delete"     '[ "$(_ai_menu t "" keys "$mrows" <<<"x 1" 2>/dev/null | head -1)" = delete ]'
 ok "menu keys: u 2 fails"         '! _ai_menu t "" keys "$mrows" <<<"u 2" >/dev/null 2>&1'
+# clear <member> never leaves limited/
+mkdir -p "$AI_FO_STATE/limited/claude"; touch "$AI_FO_STATE/keep" "$AI_FO_STATE/limited/claude/one"
+ok "clear rejects path tricks" '! _ai_failover clear ../.. >/dev/null 2>&1 && ! _ai_failover clear claude/../.. >/dev/null 2>&1 && ! _ai_failover clear "a\\b" >/dev/null 2>&1 && ! _ai_failover clear .x >/dev/null 2>&1 && [ -e "$AI_FO_STATE/keep" ] && [ -e "$AI_FO_STATE/limited/claude/one" ]'
+ok "clear claude/<account> still works" '_ai_failover clear claude/one >/dev/null 2>&1 && [ ! -e "$AI_FO_STATE/limited/claude/one" ] && [ -d "$AI_FO_STATE/limited/claude" ]'
 _ai_failover off >/dev/null 2>&1
 
 # ── failover: screens ──
@@ -165,10 +236,11 @@ ok "card: has top, body and bottom" '[ "$(echo "$card" | wc -l | tr -d " ")" = 4
 ok "label: claude account"        '[ "$(_fo_label claude/x)" = "Claude account x" ]'
 ok "label: provider with label"   '[ "$(_fo_label cl2)" = "Claude 2 (cl2)" ]'
 ok "label: provider without label" '[ "$(_fo_label other2)" = other2 ]'
-ok "wait: enter goes"             '[ "$(AI_FO_WAIT=2 _fo_wait 2>/dev/null <<<"")" = go ]'
-ok "wait: o is order"             '[ "$(AI_FO_WAIT=2 _fo_wait 2>/dev/null <<<"o")" = order ]'
-ok "wait: q is stop"              '[ "$(AI_FO_WAIT=2 _fo_wait 2>/dev/null <<<"q")" = stop ]'
-ok "wait: 0 seconds goes without input" '[ "$(AI_FO_WAIT=0 _fo_wait 2>/dev/null </dev/null)" = go ]'
+ok "wait: y moves"                '[ "$(_fo_wait 2>/dev/null <<<"y")" = go ] && [ "$(_fo_wait 2>/dev/null <<<"Y")" = go ]'
+ok "wait: enter stops (default No)" '[ "$(_fo_wait 2>/dev/null <<<"")" = stop ]'
+ok "wait: o is order"             '[ "$(_fo_wait 2>/dev/null <<<"o")" = order ]'
+ok "wait: q is stop"              '[ "$(_fo_wait 2>/dev/null <<<"q")" = stop ]'
+ok "wait: no input stops"         '[ "$(_fo_wait 2>/dev/null </dev/null)" = stop ]'
 _ai_failover order cl2 claude/two claude/one cx >/dev/null 2>&1
 shown=$(_fo_show 2>&1 | plain)
 ok "show: lists members in order" '[ "$(echo "$shown" | grep -o "cl2\|claude/two\|claude/one\|cx" | tr "\n" " ")" = "cl2 claude/two claude/one cx " ]'
@@ -183,6 +255,32 @@ ok "status line pipes to next"  '[ "$(cat "$T/sl.out")" = next ]'
 # ── entry point ──
 ok "ai help runs"               '"$REPO/bin/ai" help | grep -q "ai add"'
 ok "cla link runs cla"          '"$REPO/bin/cla" nope 2>&1 | grep -q "no account .nope."'
+# ── cla add/rm/mv safety ──
+ok "cla add rejects ../x"       '! "$REPO/bin/cla" add ../x >/dev/null 2>&1 && [ ! -e "$CLA_ROOT/../x" ]'
+ok "cla add rejects .x"         '! "$REPO/bin/cla" add .x >/dev/null 2>&1 && [ ! -e "$CLA_ROOT/.x" ]'
+mkdir -p "$CLA_ROOT/gone" "$T/clabin"; touch "$CLA_ROOT/gone/f"
+printf '#!/bin/sh\nexit 0\n' > "$T/clabin/claude"; chmod +x "$T/clabin/claude"
+printf '#!/bin/sh\necho called >> "%s/sec.log"\n' "$T" > "$T/clabin/security"; chmod +x "$T/clabin/security"
+ok "cla rm: AI_YES=0 still asks" 'echo n | AI_YES=0 PATH=$T/clabin:$PATH "$REPO/bin/cla" rm gone 2>&1 | grep -q "\[y/N\]"; [ -d "$CLA_ROOT/gone" ]'
+mkdir -p "$CLA_ROOT/b\\s"
+ok "cla rm rejects a backslash name" '! AI_YES=1 PATH=$T/clabin:$PATH "$REPO/bin/cla" rm "b\\s" >/dev/null 2>&1 && [ -d "$CLA_ROOT/b\\s" ]'
+rmdir "$CLA_ROOT/b\\s"
+mkdir -p "$T/badbin"; printf '#!/bin/sh\nexit 1\n' > "$T/badbin/claude"; chmod +x "$T/badbin/claude"
+ok "cla rm: failed logout warns and asks again" 'printf "y\nn\n" | PATH=$T/badbin:$PATH "$REPO/bin/cla" rm gone 2>&1 | grep -q "logout failed"; [ -d "$CLA_ROOT/gone" ]'
+ok "cla rm: failed logout, y again deletes" 'printf "y\ny\n" | PATH=$T/badbin:$PATH "$REPO/bin/cla" rm gone >/dev/null 2>&1; [ ! -e "$CLA_ROOT/gone" ]'
+mkdir -p "$CLA_ROOT/gone"; touch "$CLA_ROOT/gone/f"
+ok "cla rm: failed logout, AI_YES=1 deletes" 'AI_YES=1 PATH=$T/badbin:$PATH "$REPO/bin/cla" rm gone </dev/null >/dev/null 2>&1; [ ! -e "$CLA_ROOT/gone" ]'
+mkdir -p "$CLA_ROOT/gone"; touch "$CLA_ROOT/gone/f"
+ok "cla rm cancels without y"   'echo n | PATH=$T/clabin:$PATH "$REPO/bin/cla" rm gone >/dev/null 2>&1; [ -d "$CLA_ROOT/gone" ]'
+ok "cla rm with y deletes for good" 'echo y | PATH=$T/clabin:$PATH "$REPO/bin/cla" rm gone >/dev/null 2>&1; [ ! -e "$CLA_ROOT/gone" ] && [ ! -e "$CLA_ROOT/.trash" ]'
+mkdir -p "$T/keepme"; touch "$T/keepme/f"; ln -s "$T/keepme" "$CLA_ROOT/lnk"
+ok "cla rm of a linked account drops only the link" 'AI_YES=1 PATH=$T/clabin:$PATH "$REPO/bin/cla" rm lnk >/dev/null 2>&1; [ ! -L "$CLA_ROOT/lnk" ] && [ -f "$T/keepme/f" ]'
+mkdir -p "$CLA_ROOT/my acct" "$CLA_ROOT/yes1"
+ok "cla rm removes a folder with an old-style name" 'PATH=$T/clabin:$PATH AI_YES=1 "$REPO/bin/cla" rm "my acct" >/dev/null 2>&1; [ ! -d "$CLA_ROOT/my acct" ]'
+ok "cla rm: AI_YES=1 skips the confirm" 'PATH=$T/clabin:$PATH AI_YES=1 "$REPO/bin/cla" rm yes1 </dev/null >/dev/null 2>&1; [ ! -d "$CLA_ROOT/yes1" ]'
+mkdir -p "$CLA_ROOT/mva"
+ok "cla mv never calls security" 'PATH=$T/clabin:$PATH "$REPO/bin/cla" mv mva mvb >/dev/null 2>&1; [ -d "$CLA_ROOT/mvb" ] && [ ! -e "$T/sec.log" ]'
+rmdir "$CLA_ROOT/mvb"
 
 # ── failover: review fixes ──
 printf 'gone\toff\n' >> "$AI_FO_ORDER"; _fo_list | _fo_save

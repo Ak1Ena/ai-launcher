@@ -74,7 +74,7 @@ _ai_update_notice() {
 
 ai_main() {
   case ${1:-} in
-    ls|add|edit|rm|failover|default) local sub=$1; shift; "_ai_$sub" "$@"; return ;;
+    ls|add|edit|rm|failover|default|trust) local sub=$1; shift; "_ai_$sub" "$@"; return ;;
     cla) shift; cla_main "$@"; return ;;
     cla-team) shift; cla_team_main "$@"; return ;;
     help|-h|--help) _ai_help; return ;;
@@ -121,6 +121,9 @@ ai rm   <name>                   delete an agent
 ai failover [on|off|ls]          when a Claude account hits its limit, resume the session on the
                                  next account (Codex last). No args: set priority, turn accounts on/off
 ai failover order <member>...    set priority from the command line
+ai failover auto [on|off]        at a limit, move by itself after a countdown (on) or ask y/N (off,
+                                 default). A move to Codex always asks
+ai trust [on|off|status]         share folder trust between agents (off by default)
 cla [name] [team] [args]         Claude accounts: pick or start one   (cla add|ls|rm|mv)
 cla-team [name] [args]           Claude team mode (needs tmux)
 
@@ -129,6 +132,19 @@ Picker keys: enter launch · ctrl-t team · ctrl-a add · ctrl-e edit · ctrl-x 
 Without fzf you get a numbered menu: 2 = launch, t 2 = team, a = add, e 2 = edit, x 2 = delete,
 f = failover on/off, o = failover order.
 EOF
+}
+
+_ai_trust() {
+  local flag=${AI_PROVIDERS%/*}/trust.on
+  case ${1:-status} in
+    on) mkdir -p "${flag%/*}" && : > "$flag"
+        echo "shared trust on: a folder trusted in one agent is now trusted in all of them."
+        echo "Trusting a folder lets each agent load that folder's hooks, settings and MCP servers," 
+        echo "so only turn this on if you trust every folder you open. Turn off: ai trust off" ;;
+    off) rm -f "$flag"; echo "shared trust off" ;;
+    status) if [ -e "$flag" ]; then echo "shared trust: on"; else echo "shared trust: off (ai trust on)"; fi ;;
+    *) echo "usage: ai trust [on|off|status]"; return 1 ;;
+  esac
 }
 
 # ── providers file: name TAB command TAB label ─────────────
@@ -184,7 +200,7 @@ _ai_add() {
   _ai_add_login "$n"
 }
 # Another provider already runs this CLI: give this one its own login folder, so it is a
-# separate account. Kept on delete, so re-adding the same name gets the same login back.
+# separate account. `ai rm` deletes that folder with the provider.
 _ai_add_login() {
   local a o d; a=$(_ai_agent "$1")
   [ -n "$(_ai_account_env "$a")" ] || return 0
@@ -203,10 +219,16 @@ _ai_edit() {
   _ai_put "$n" "$c" "$l" && echo "saved $n -> $c"
 }
 _ai_rm() {
-  local n=${1:-} ans
+  local n=${1:-} ans d=
   [ -n "$n" ] && [ -n "$(_ai_get "$n" 1)" ] || { echo "no provider '$n'. see: ai ls"; return 1; }
-  read -r -p "delete provider '$n'? [y/N] " ans
-  case $ans in y|Y|yes) _ai_put "$n" && echo "deleted $n (bring back: ai add $n)" ;; *) return 1 ;; esac
+  # its own codex/gemini login, only ever $AI_ACCOUNTS/<agent>/<name> with a path-safe name (never ~/.codex)
+  # the provider named after its CLI (codex, gemini) is the main login: never delete a folder by that name
+  case $n in .*|*[!A-Za-z0-9._-]*) ;; *) [ "$n" = "$(_ai_agent "$n")" ] || d=$(_ai_account_dir "$n") ;; esac
+  read -r -p "delete provider '$n'${d:+ and its login folder $d for good (login, history, settings)}? [y/N] " ans
+  case $ans in y|Y|yes) ;; *) return 1 ;; esac
+  _ai_put "$n" || return 1
+  # rm -rf on a symlink path removes only the link
+  if [ -n "$d" ]; then rm -rf "${d:?}" && echo "deleted $n and $d"; else echo "deleted $n (bring back: ai add $n)"; fi
 }
 
 # the entry plain `ai` starts without the picker, in <failover>.default (shared with the TUI)
@@ -270,7 +292,7 @@ pad() {
 # ── picker: fzf when installed, else a numbered menu ──────
 # _ai_choose <title> <hint> <keys|order|""> <rows>. Prints "<action>\n<row>". Fails on cancel.
 # keys:  action = "" (launch) | team | add | edit | delete | failover | order
-# order: action = "" (back) | up | down | toggle | clear | failover   (the failover priority screen)
+# order: action = "" (back) | up | down | toggle | clear | failover | auto   (the failover priority screen)
 # Rows come as an argument, not stdin, so the menu can read the answer from the terminal
 # on stdin and draw on stderr: no /dev/tty needed (unreliable in Git Bash on Windows).
 _ai_choose() {
@@ -280,7 +302,7 @@ _ai_fzf() {
   local out key extra=()
   case ${3:-} in
     keys) extra=(--expect=ctrl-t,ctrl-a,ctrl-e,ctrl-x,ctrl-f,ctrl-o) ;;
-    order) extra=(--expect=ctrl-u,ctrl-d,ctrl-x,ctrl-r,ctrl-f) ;;
+    order) extra=(--expect=ctrl-u,ctrl-d,ctrl-x,ctrl-r,ctrl-f,ctrl-a) ;;
   esac
   out=$(fzf --ansi --delimiter="$TAB" --with-nth=3 --height=~16 --reverse --border=rounded \
       --border-label="$1" --prompt='  ' --pointer='▶' --info=hidden --no-scrollbar \
@@ -292,7 +314,7 @@ _ai_fzf() {
   case $3:$key in
     keys:ctrl-t) key=team ;; keys:ctrl-a) key=add ;; keys:ctrl-e) key=edit ;; keys:ctrl-x) key=delete ;;
     keys:ctrl-o) key=order ;; *:ctrl-f) key=failover ;;
-    order:ctrl-u) key=up ;; order:ctrl-d) key=down ;; order:ctrl-x) key=toggle ;; order:ctrl-r) key=clear ;;
+    order:ctrl-u) key=up ;; order:ctrl-d) key=down ;; order:ctrl-x) key=toggle ;; order:ctrl-r) key=clear ;; order:ctrl-a) key=auto ;;
   esac
   printf '%s\n%s\n' "$key" "${out#*"$NL"}"
 }
@@ -308,7 +330,7 @@ _ai_menu() {
     done
     case ${3:-} in
       keys) dim "  number = launch · t N = claude team · a = add · e N = edit · x N = delete · f = failover on/off · o = failover order · q = quit" ;;
-      order) dim "  u N = up · d N = down · x N = on/off · r N = clear limit · f = failover on/off · q = back" ;;
+      order) dim "  u N = up · d N = down · x N = on/off · r N = clear limit · f = failover on/off · a = auto-switch on/off · q = back" ;;
       *) dim "  number = choose · q = quit" ;;
     esac
     printf '\n'
@@ -317,7 +339,7 @@ _ai_menu() {
   set -- $ans
   case ${1:-q} in
     q) return 1 ;;
-    a) printf 'add\n\n'; return ;;
+    a) if [ "$mode" = order ]; then printf 'auto\n\n'; else printf 'add\n\n'; fi; return ;;
     f) printf 'failover\n\n'; return ;;
     o) printf 'order\n\n'; return ;;
     t) act=team; n=${2:-} ;;
@@ -332,10 +354,24 @@ _ai_menu() {
   printf '%s\n%s\n' "$act" "${rows[$((n - 1))]}"
 }
 
+# true when folder $1 is $2 or inside it, compared as resolved paths
+_fo_under() {
+  local d r
+  d=$(cd "$1" 2>/dev/null && pwd -P) && r=$(cd "$2" 2>/dev/null && pwd -P) || return 1
+  case $d/ in "$r"/*) return 0 ;; esac; return 1
+}
+
 # ── launch ─────────────────────────────────────────────────
 _ai_run() {
   local n=$1 id=$2 d; shift 2
   d=$(_ai_account_dir "$n") && export "$(_ai_account_env "$(_ai_agent "$n")")=$(native_path "$d")"
+  # a plain launch outside any account means the main login, not one inherited from a cla / ai-account session
+  if [ -z "$d" ]; then
+    case $(_ai_agent "$n") in
+      claude) [ -n "${CLAUDE_CONFIG_DIR:-}" ] && _fo_under "$CLAUDE_CONFIG_DIR" "$CLA_ROOT" && unset CLAUDE_CONFIG_DIR ;;
+      codex) [ -n "${CODEX_HOME:-}" ] && _fo_under "$CODEX_HOME" "$AI_ACCOUNTS" && unset CODEX_HOME ;;
+    esac
+  fi
   [ "$n" = claude ] || _ai_trust_share "$PWD"  # claude rows go through cla, which shares too
   if is_fn "_ai_${n}_run"; then "_ai_${n}_run" "$id" "$@"
   elif [ "$(_ai_agent "$n")" = claude ] && [ -z "${AI_TEAM:-}" ] && _fo_on; then _fo_run "$n" "$@"

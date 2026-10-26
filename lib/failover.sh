@@ -4,6 +4,7 @@
 # the last stop. Off until turned on. Needs jq.
 #   ai failover                    priority screen: move, turn accounts on/off, clear a limit
 #   ai failover on|off|ls
+#   ai failover auto [on|off]      at a limit, move by itself after a countdown, or ask y/N (default)
 #   ai failover order <member>...  put these first, in this order (names as `ai failover ls` shows)
 #   ai failover clear [member]     forget a limit hit (every one without a name)
 # Members: claude/<account> for each cla account, plus every provider that runs claude or codex.
@@ -15,6 +16,10 @@ AI_FO_PROMPT=${AI_FO_PROMPT:-"The previous account hit its usage limit and this 
 
 _fo_on() { [ -e "$AI_FO_ORDER.on" ] && has jq && ! is_windows; }
 _fo_state() { if _fo_on; then echo on; else echo off; fi; }
+# <order>.auto exists: switch by itself after AI_FO_WAIT seconds (shared with the TUI). A switch to Codex still asks.
+_fo_auto() { [ -e "$AI_FO_ORDER.auto" ]; }
+_fo_auto_word() { if _fo_auto; then echo on; else echo off; fi; }
+_fo_auto_text() { if _fo_auto; then echo "auto-switch on: moves by itself after ${AI_FO_WAIT:-5}s (Codex still asks)"; else echo "auto-switch off: asks y/N before moving"; fi; }
 
 _ai_failover() {
   case ${1:-} in
@@ -23,15 +28,28 @@ _ai_failover() {
         # shortcut: native Windows is off (the mod's kill, Windows transcript paths and the 32 KB
         # command line are unverified there); WSL works like Linux.
         is_windows && { _fo_card "✻ Failover" "Not supported on native Windows yet. Use WSL."; return 1; }
-        mkdir -p "$(dirname "$AI_FO_ORDER")" && : > "$AI_FO_ORDER.on" && _fo_card "✻ Failover" "Failover is $(_fo_on_text)" ;;
+        mkdir -p "$(dirname "$AI_FO_ORDER")" && : > "$AI_FO_ORDER.on" && _fo_card "✻ Failover" "Failover is $(_fo_on_text)" "$(_fo_auto_text)" ;;
     off) rm -f "$AI_FO_ORDER.on"; _fo_card "✻ Failover" "Failover is $(_fo_on_text)" ;;
     ls) _fo_show ;;
+    auto) case ${2:-} in
+            on) mkdir -p "$(dirname "$AI_FO_ORDER")" && : > "$AI_FO_ORDER.auto" ;;
+            off) rm -f "$AI_FO_ORDER.auto" ;;
+            '') ;;
+            *) _fo_card "✻ Failover" "ai failover auto [on|off]"; return 1 ;;
+          esac
+          _fo_card "✻ Failover" "$(_fo_auto_text)" ;;
     order) shift; _fo_list | _fo_reorder "$@" | _fo_save && _fo_show ;;
-    clear) rm -rf "${AI_FO_STATE:?}/limited/${2:-}" && _fo_card "✻ Failover" "Cleared the limit of ${2:-every account}" ;;
-    *) _fo_card "✻ Failover" "ai failover              priority screen" "ai failover on | off" "ai failover ls" \
+    clear) [ -z "${2:-}" ] || _fo_member_ok "$2" || { _fo_card "✻ Failover" "no member: $2"; return 1; }
+           rm -rf "${AI_FO_STATE:?}/limited/${2:-}" && _fo_card "✻ Failover" "Cleared the limit of ${2:-every account}" ;;
+    *) _fo_card "✻ Failover" "ai failover              priority screen" "ai failover on | off" "ai failover auto [on|off]" "ai failover ls" \
          "ai failover order <member>..." "ai failover clear [member]"; return 1 ;;
   esac
 }
+# a member name safe under limited/: claude/<account> or one plain name, no other '/', no '\', no leading '.'
+_fo_member_ok() {
+  case ${1#claude/} in ''|.*|*/*|*\\*) return 1 ;; esac
+}
+_fo_auto_toggle() { if _fo_auto; then _ai_failover auto off; else _ai_failover auto on; fi; }
 _fo_toggle() { if _fo_on; then _ai_failover off; else _ai_failover on; fi; }
 _fo_on_text() { if _fo_on; then printf '\033[1;32mon\033[0m'; else printf '\033[2moff\033[0m'; fi; }
 
@@ -53,25 +71,35 @@ _fo_show() {
   while IFS= read -r l; do [ -n "$l" ] && lines+=("$l"); done <<EOF
 $(_fo_rows | cut -f3)
 EOF
-  _fo_card "✻ Failover: $(_fo_state)" "$(dim 'top is tried first · change it: ai failover')" "" ${lines[@]+"${lines[@]}"}
+  _fo_card "✻ Failover: $(_fo_state)" "$(dim "top is tried first · change it: ai failover")" \
+    "$(dim "$(_fo_auto_text) · ai failover auto on|off")" "" ${lines[@]+"${lines[@]}"}
 }
 # who a member is, for people: its label and name
 _fo_label() {
   local l
   case $1 in claude/*) echo "Claude account ${1#claude/}" ;; *) l=$(_ai_get "$1" 3); echo "${l:-$1}${l:+ ($1)}" ;; esac
 }
-# countdown under a card. Prints go (enter, any key or time up) | order (o) | stop (q).
+# _fo_wait [ask]: under a card. Prints go | order (o) | stop.
+# Auto-switch on (and no "ask"): counts down AI_FO_WAIT s, any key or time up = go, q = stop.
+# Otherwise asks, default No: y = go, anything else (enter, end of input) = stop.
 _fo_wait() {
-  local i k rc
-  for ((i = ${AI_FO_WAIT:-5}; i > 0; i--)); do
-    printf '\r\033[2m  switching in %ds · enter now · o change order · q stop \033[0m' $i >&2
-    k=; IFS= read -r -s -n 1 -t 1 k; rc=$?
-    case $k in q|Q) printf '\n' >&2; echo stop; return ;; o|O) printf '\n' >&2; echo order; return ;; esac
-    [ $rc = 0 ] && break
-  done
-  printf '\n' >&2; echo go
+  local k= i rc
+  # drop keys typed before the prompt (a "y" meant for claude); only a terminal can hold type-ahead.
+  # shortcut: bash 3.2 read -t takes whole seconds, so this costs 1 s; upgrade when 3.2 is dropped.
+  if [ -t 0 ]; then while IFS= read -r -s -n 1 -t 1 k; do :; done; k=; fi
+  if _fo_auto && [ "${1:-}" != ask ]; then
+    for ((i = ${AI_FO_WAIT:-5}; i > 0; i--)); do
+      printf '\r\033[2m  switching in %ds · any key now · o change order · q stop \033[0m' $i >&2
+      k=; IFS= read -r -s -n 1 -t 1 k; rc=$?
+      case $k in q|Q) printf '\n' >&2; echo stop; return ;; o|O) printf '\n' >&2; echo order; return ;; esac
+      [ $rc = 0 ] && break
+    done
+    printf '\n' >&2; echo go; return
+  fi
+  printf '\033[2m  move? y yes · o change order · N stop [y/N] \033[0m' >&2
+  IFS= read -r -s -n 1 k; printf '\n' >&2
+  case $k in y|Y) echo go ;; o|O) echo order ;; *) echo stop ;; esac
 }
-
 # ── members and their priority ─────────────────────────────
 # every account failover can use: member TAB kind (claude|codex), in providers order
 _fo_members() {
@@ -145,8 +173,8 @@ _fo_ui() {
   while :; do
     rows=$(_fo_rows)
     [ -n "$rows" ] || { _fo_card "✻ Failover" "No Claude or Codex accounts yet." "Add one: cla add <name>  ·  ai add <name> codex"; return 1; }
-    out=$(_ai_choose " ✻ Failover: $(_fo_state) " \
-      'top = first · ctrl-u up · ctrl-d down · ctrl-x on/off · ctrl-r clear limit · ctrl-f failover on/off · esc back' \
+    out=$(_ai_choose " ✻ Failover: $(_fo_state) · auto-switch: $(_fo_auto_word) " \
+      "top = first · ctrl-u up · ctrl-d down · ctrl-x on/off · ctrl-r clear limit · ctrl-f failover on/off · ctrl-a auto-switch: $(_fo_auto_word) · esc back" \
       order "$rows") || return 0
     key=${out%%"$NL"*}; m=${out#*"$NL"}; m=${m%%"$TAB"*}
     case $key in
@@ -154,6 +182,7 @@ _fo_ui() {
       toggle) _fo_list | _fo_set "$m" | _fo_save ;;
       clear) rm -f "$AI_FO_STATE/limited/$m" ;;
       failover) _fo_toggle 2>/dev/null || { _fo_toggle; sleep 2; } ;;
+      auto) _fo_auto_toggle 2>/dev/null ;;
       *) return 0 ;;
     esac
   done
@@ -204,7 +233,9 @@ _fo_launch_claude() {
 }
 _fo_launch_codex() {
   local m=$1 d; shift
-  d=$(_ai_account_dir "$m") && { CODEX_HOME=$(native_path "$d"); export CODEX_HOME; }
+  if d=$(_ai_account_dir "$m"); then CODEX_HOME=$(native_path "$d"); export CODEX_HOME
+  # a CODEX_HOME inherited from an ai codex account is not the main login
+  elif [ -n "${CODEX_HOME:-}" ] && _fo_under "$CODEX_HOME" "$AI_ACCOUNTS"; then unset CODEX_HOME; fi
   _ai_exec "$(_ai_cmd "$m" codex)" "$@"
 }
 # markdown of a Claude transcript's main conversation, its last 60 KB (one argument must fit)
@@ -232,9 +263,11 @@ _fo_kind() { _fo_list | awk -F'\t' -v m="$1" '$1 == m { print $2; exit }'; }
 
 # _fo_run <member> [claude args]: start on <member>, move on at each limit.
 _fo_run() {
-  local m=$1 kind tried=" " sid= tr= rc dest first=1 history run
+  local m=$1 kind tried=" " sid= tr= rc dest first=1 history run k
   shift
   FO_BASE_CFG=${CLAUDE_CONFIG_DIR:-}
+  # inside a cla session the inherited folder is that account, not main (~/.claude)
+  [ -n "$FO_BASE_CFG" ] && _fo_under "$FO_BASE_CFG" "$CLA_ROOT" && FO_BASE_CFG=
   _fo_split "$@"
   mkdir -p "$AI_FO_STATE/limited"
   AI_FO_HANDOFF="$AI_FO_STATE/handoff.$$.json"; export AI_FO_HANDOFF
@@ -259,7 +292,7 @@ $history"
       # Sessions live per config folder. The <id>/ folder beside the transcript holds its subagent and tool files.
       dest=$(_fo_claude_dir "$m")/projects/$(basename "$(dirname "$tr")")
       mkdir -p "$dest" && { [ "$tr" -ef "$dest/$(basename "$tr")" ] || {
-        cp "$tr" "$dest/" && { [ ! -d "${tr%.jsonl}" ] || cp -R "${tr%.jsonl}" "$dest/"; }; }; } ||
+        cp -p "$tr" "$dest/" && { [ ! -d "${tr%.jsonl}" ] || cp -Rp "${tr%.jsonl}" "$dest/"; }; }; } ||
         { _fo_card "✻ Failover" "Could not copy the session to $(_fo_label "$m")" "$tr"; return 1; }
       run=(${FO_KEEP[@]+"${FO_KEEP[@]}"} --resume "$sid" "$AI_FO_PROMPT")
     fi
@@ -275,9 +308,11 @@ $history"
     printf '\033[H\033[2J' >&2   # a clean screen for the switch, not claude's exit text
     while :; do
       if m=$(_fo_next "$tried"); then
+        k=; [ "$(_fo_kind "$m")" = codex ] && k="This sends the conversation to OpenAI (Codex)."
         _fo_card "✻ Failover" "$(_fo_label "$prev") hit its usage limit." \
-          "→ Moving ${sid:+this session }to $(_fo_label "$m")."
-        case $(_fo_wait) in go) break ;; stop) return 1 ;; esac
+          "→ Move ${sid:+this session }to $(_fo_label "$m")?" ${k:+"$k"}
+        # going to codex (OpenAI) always asks, even with auto-switch on
+        case $(_fo_wait ${k:+ask}) in go) break ;; stop) return 1 ;; esac
       else
         _fo_card "✻ Failover" "$(_fo_label "$prev") hit its usage limit." "No other account is on and free right now."
         printf '\033[2m  o change order · any other key stops \033[0m' >&2
