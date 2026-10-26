@@ -6,14 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub const TYPES: [&str; 4] = ["Claude account", "Codex login", "Gemini login", "Other CLI"];
 
 pub enum Input {
-    Text {
-        value: String,
-        cursor: usize,
-    },
-    Choice {
-        options: &'static [&'static str],
-        at: usize,
-    },
+    Text { value: String, cursor: usize },
+    Choice { options: Vec<String>, at: usize },
 }
 
 pub struct Field {
@@ -36,15 +30,14 @@ impl Field {
         }
     }
 
-    pub fn choice(
-        label: &'static str,
-        options: &'static [&'static str],
-        hint: impl Into<String>,
-    ) -> Field {
+    pub fn choice(label: &'static str, options: &[&str], hint: impl Into<String>) -> Field {
         Field {
             label,
             hint: hint.into(),
-            input: Input::Choice { options, at: 0 },
+            input: Input::Choice {
+                options: options.iter().map(|o| o.to_string()).collect(),
+                at: 0,
+            },
             locked: false,
         }
     }
@@ -57,7 +50,7 @@ impl Field {
     pub fn value(&self) -> String {
         match &self.input {
             Input::Text { value, .. } => value.trim().to_string(),
-            Input::Choice { options, at } => options[*at].to_string(),
+            Input::Choice { options, at } => options[*at].clone(),
         }
     }
 
@@ -75,6 +68,10 @@ pub enum Purpose {
     Edit(String),
     /// the model that picks the account for an Auto launch
     Model,
+    /// install a plugin from a source
+    AddPlugin,
+    /// run one of plugin `<name>`'s actions
+    Action(String),
 }
 
 pub struct Form {
@@ -145,6 +142,47 @@ impl Form {
             focus: 0,
             error: None,
             auto: (true, true),
+        }
+    }
+
+    pub fn add_plugin() -> Form {
+        Form {
+            title: "Add a plugin".into(),
+            purpose: Purpose::AddPlugin,
+            fields: vec![Field::text(
+                "Source",
+                "",
+                "folder · git URL · owner/repo · cliproxy",
+            )],
+            focus: 0,
+            error: None,
+            auto: (true, true),
+        }
+    }
+
+    /// A plugin's action menu: `labels` from `plugin actions`.
+    pub fn actions(name: &str, labels: Vec<String>) -> Form {
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        Form {
+            title: format!("{name} actions"),
+            purpose: Purpose::Action(name.to_string()),
+            fields: vec![Field::choice("Action", &labels, "←  → to change")],
+            focus: 0,
+            error: None,
+            auto: (true, true),
+        }
+    }
+
+    /// The chosen option's position in a choice field.
+    pub fn index(&self, label: &str) -> usize {
+        match self
+            .fields
+            .iter()
+            .find(|f| f.label == label)
+            .map(|f| &f.input)
+        {
+            Some(Input::Choice { at, .. }) => *at,
+            _ => 0,
         }
     }
 

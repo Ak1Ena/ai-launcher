@@ -74,7 +74,7 @@ _ai_update_notice() {
 
 ai_main() {
   case ${1:-} in
-    ls|add|edit|rm|failover|default|trust) local sub=$1; shift; "_ai_$sub" "$@"; return ;;
+    ls|add|edit|rm|failover|default|trust|plugin) local sub=$1; shift; "_ai_$sub" "$@"; return ;;
     cla) shift; cla_main "$@"; return ;;
     cla-team) shift; cla_team_main "$@"; return ;;
     help|-h|--help) _ai_help; return ;;
@@ -82,7 +82,11 @@ ai_main() {
   local out key row name id d
   if [ "${1:-}" = pick ]; then shift
   elif d=$(head -1 "$AI_FO_ORDER.default" 2>/dev/null) && _ai_default_ok "$d"; then
-    case $d in claude/*) _ai_run claude "${d#claude/}" "$@" ;; *) _ai_run "$d" "$d" "$@" ;; esac
+    case $d in
+      claude/*) _ai_run claude "${d#claude/}" "$@" ;;
+      plugin:*) d=${d#plugin:}; _ai_plugin_launch "${d%%/*}" "${d#*/}" "$@" ;;
+      *) _ai_run "$d" "$d" "$@" ;;
+    esac
     return
   fi
   while :; do
@@ -94,6 +98,14 @@ ai_main() {
       keys "$(_ai_rows)") || return 0
     key=${out%%"$NL"*}; row=${out#*"$NL"}
     name=${row%%"$TAB"*}; id=${row#*"$TAB"}; id=${id%%"$TAB"*}
+    case $name in
+      plugin:*) case $key in
+          '') _ai_plugin_launch "${name#plugin:}" "$id" "$@"; return ;;
+          add|failover|order) ;;   # these never use the row
+          *) continue ;;           # team/edit/delete do not apply to a plugin row
+        esac ;;
+      '') case $key in add|failover|order) ;; *) continue ;; esac ;;   # a plugin's header or detail row
+    esac
     case $key in
       add) _ai_add ;;
       edit) _ai_edit "$name" ;;
@@ -124,6 +136,11 @@ ai failover order <member>...    set priority from the command line
 ai failover auto [on|off]        at a limit, move by itself after a countdown (on) or ask y/N (off,
                                  default). The card says when Codex (OpenAI) is next
 ai trust [on|off|status]         share folder trust between agents (off by default)
+ai plugin ls                     user plugins: their own picker section, never in failover
+ai plugin add <src> [name]       install from a folder, a git URL / owner/repo, or bundled (cliproxy)
+ai plugin update [name]          git pull the plugins installed from git
+ai plugin rm|on|off <name>       delete / turn on / turn off (off = never run)
+ai plugin do <name> <action>     run one of its actions (30 s limit)
 cla [name] [team] [args]         Claude accounts: pick or start one   (cla add|ls|rm|mv)
 cla-team [name] [args]           Claude team mode (needs tmux)
 
@@ -237,13 +254,16 @@ _ai_default() {
   case ${1:-} in
     '') if [ -s "$f" ]; then head -1 "$f"; else echo "no default. set one: ai default claude/<account> | <provider>"; fi ;;
     -) rm -f "$f"; echo "default cleared" ;;
-    *) _ai_default_ok "$1" || { echo "no account or provider '$1'. names: claude/<account> (cla ls) or ai ls"; return 1; }
+    *) _ai_default_ok "$1" || { echo "no account or provider '$1'. names: claude/<account> (cla ls), plugin:<name>/<id> or ai ls"; return 1; }
        mkdir -p "$(dirname "$f")" && echo "$1" > "$f" && echo "default: $1" ;;
   esac
 }
-# claude/<account> with its folder, or a provider other than claude itself (that one is the cla picker)
+# claude/<account> with its folder, plugin:<name>/<id> of an installed plugin that is on,
+# or a provider other than claude itself (that one is the cla picker)
 _ai_default_ok() {
   case $1 in
+    plugin:*/*) local p=${1#plugin:}; _ai_plugin_ready "${p%%/*}" && _ai_plugin_ok_id "${p#*/}" ;;
+    plugin:*) return 1 ;;
     claude/*) case ${1#claude/} in ''|.|..|*/*) return 1 ;; esac; [ -d "$CLA_ROOT/${1#claude/}" ] ;;
     ''|claude) return 1 ;;
     *) [ -n "$(_ai_get "$1" 1)" ] ;;
@@ -251,7 +271,7 @@ _ai_default_ok() {
 }
 
 # ── rows ───────────────────────────────────────────────────
-# every provider's rows, fetched in parallel, kept in providers-file order
+# every provider's rows, then every plugin's, fetched in parallel, kept in providers-file order
 _ai_rows() {
   local i=0 n r
   {
@@ -264,6 +284,9 @@ _ai_rows() {
       else
         _ai_row "$n" "$n" "$n" "$(_ai_get "$n" 3)" "$(dim 'no usage data')" | sed "s/^/$i$TAB/"
       fi
+    done
+    for n in $(_ai_plugin_names); do  # each plugin's section after the providers, 2 s limit each
+      i=$((i + 1)); _ai_plugin_rows "$n" | sed "s/^/$i$TAB/" &
     done
     wait
   } | sort -s -t "$TAB" -k1,1n | cut -f2-

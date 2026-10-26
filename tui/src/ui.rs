@@ -29,6 +29,10 @@ const SWITCH_W: u16 = 7;
 #[derive(Clone, Copy, PartialEq)]
 pub enum Button {
     Add,
+    /// install a plugin
+    AddPlugin,
+    /// the plugins window
+    Plugins,
     Edit,
     Delete,
     Failover,
@@ -51,6 +55,10 @@ pub struct Hits {
     pub buttons: Vec<(Rect, Button)>,
     /// each failover member's on/off switch, by row
     pub switches: Vec<(Rect, usize)>,
+    /// each plugin section's on/off pill, by plugin name
+    pub plugins: Vec<(Rect, String)>,
+    /// the plugins window's rows, by index into `app.plugins`
+    pub plugin_rows: Vec<(Rect, usize)>,
     /// form fields by index; `fields.len()` is the Save button
     pub fields: Vec<(Rect, usize)>,
     pub pane: Rect,
@@ -113,6 +121,9 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
             home(f, app, body, &mut hits);
             footer(f, app, bottom);
         }
+    }
+    if let Some(sel) = app.plugins_win {
+        plugins_window(f, app, sel, f.area(), &mut hits);
     }
     match &app.modal {
         Some(Modal::Form(form)) => form_window(f, form, f.area(), &mut hits),
@@ -477,11 +488,24 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
             + if running[i] { 2 } else { 0 }
             + if is_default(i) { 2 } else { 0 }
     };
-    let names_w = (0..app.rows.len()).map(name_w).max().unwrap_or(0);
-    let who_w = who.iter().map(|w| dw(w)).max().unwrap_or(0);
+    // plugin rows draw their own way and don't widen the table
+    let table_row = |i: usize| app.rows[i].entry.kind != Kind::Plugin;
+    let names_w = (0..app.rows.len())
+        .filter(|&i| table_row(i))
+        .map(name_w)
+        .max()
+        .unwrap_or(0);
+    let who_w = (0..app.rows.len())
+        .filter(|&i| table_row(i))
+        .map(|i| dw(&who[i]))
+        .max()
+        .unwrap_or(0);
     // everything before the weight and switch
     let left = |i: usize, c: Cols| -> Vec<Span<'static>> {
         let r = &app.rows[i];
+        if !table_row(i) {
+            return Vec::new();
+        }
         let off = r.priority.is_some() && !r.on;
         let mut sp = vec![match r.priority {
             Some(p) => Span::styled(
@@ -576,7 +600,7 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     };
     let table_w = |lefts: &[Vec<Span<'static>>]| {
         let others = (0..app.rows.len())
-            .filter(|&i| app.rows[i].priority.is_none())
+            .filter(|&i| app.rows[i].priority.is_none() && table_row(i))
             .map(|i| width_of(&lefts[i]))
             .max()
             .unwrap_or(0);
@@ -668,7 +692,68 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         );
     }
     let mut others = false;
+    // plugin section headers' on/off pills: (line, x offset, plugin)
+    let mut pills: Vec<(usize, usize, String)> = Vec::new();
+    let mut section = "";
     for (i, r) in app.rows.iter().enumerate() {
+        if r.entry.kind == Kind::Plugin {
+            let name = crate::plugins::split_id(&r.entry.id).map_or("", |(n, _)| n);
+            if name != section {
+                section = name;
+                let Some(p) = app.plugins.iter().find(|p| p.plugin.name == name) else {
+                    continue;
+                };
+                lines.push((Line::raw(""), None));
+                let title = format!("{}  ", p.title());
+                pills.push((lines.len(), dw(&title), name.to_string()));
+                lines.push((
+                    Line::from(vec![
+                        Span::styled(title, s(MUTED).add_modifier(Modifier::BOLD)),
+                        pill(p.plugin.on),
+                    ]),
+                    None,
+                ));
+            }
+            let mark = if i == app.selected && focused {
+                Span::styled("▌", s(ACCENT))
+            } else {
+                Span::raw(" ")
+            };
+            // an entry (`plugin:<name>/<id>`) or the section's state line (off, failed, …)
+            let entry = r.entry.id.contains('/');
+            let mut sp = vec![mark, Span::styled(" ·  ", s(FAINT))];
+            if entry {
+                sp.push(Span::styled(
+                    r.entry.label.clone(),
+                    s(Color::White).add_modifier(Modifier::BOLD),
+                ));
+                if app.default == r.entry.id {
+                    sp.push(Span::styled(" ★", s(ACCENT)));
+                }
+                if running[i] {
+                    sp.push(Span::styled(" ●", s(GOOD)));
+                }
+                let room = (list.width as usize).saturating_sub(width_of(&sp) + 2);
+                sp.push(Span::styled(
+                    format!("  {}", ellipsize(&r.status, room)),
+                    s(MUTED),
+                ));
+            } else {
+                sp.push(Span::styled(r.entry.label.clone(), s(FAINT)));
+            }
+            lines.push((Line::from(sp), Some(i)));
+            for d in &r.details {
+                let room = (list.width as usize).saturating_sub(7);
+                lines.push((
+                    Line::from(Span::styled(
+                        format!("       {}", ellipsize(d, room)),
+                        s(FAINT),
+                    )),
+                    None,
+                ));
+            }
+            continue;
+        }
         if r.priority.is_none() && !others {
             others = true;
             header(&mut lines, "OTHER CLIS");
@@ -729,6 +814,18 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
             height: 1,
             ..list
         };
+        if let Some((_, x, name)) = pills.iter().find(|(l, ..)| *l == skip + n)
+            && x + SWITCH_W as usize <= r.width as usize
+        {
+            hits.plugins.push((
+                Rect {
+                    x: r.x + *x as u16,
+                    width: SWITCH_W,
+                    ..r
+                },
+                name.clone(),
+            ));
+        }
         let style = match row {
             Some(i) if i == app.selected => Style::new().bg(if focused { SELECT } else { RAISED }),
             _ => Style::new(),
@@ -759,6 +856,8 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         (" + Add ", Button::Add),
         (" ✎ Edit ", Button::Edit),
         (" ✕ Delete ", Button::Delete),
+        (" + Plugin ", Button::AddPlugin),
+        (" ⚙ Plugins ", Button::Plugins),
     ];
     if app.wrr {
         labels.push((auto, Button::Auto));
@@ -811,6 +910,126 @@ fn window(f: &mut Frame, area: Rect, title: &str, w: u16, h: u16) -> Rect {
     let inner = block.inner(r);
     f.render_widget(block, r);
     inner
+}
+
+/// A plugin's on/off pill, SWITCH_W wide.
+fn pill(on: bool) -> Span<'static> {
+    if on {
+        Span::styled(
+            " ● on  ",
+            Style::new()
+                .fg(Color::Black)
+                .bg(GOOD)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(" ○ off ", Style::new().fg(MUTED).bg(RAISED))
+    }
+}
+
+/// Every installed plugin, one row each: NAME, STATE (a clickable pill), SOURCE, STATUS.
+fn plugins_window(f: &mut Frame, app: &App, sel: usize, area: Rect, hits: &mut Hits) {
+    // home's pills are under the window
+    hits.plugins.clear();
+    let n = app.plugins.len();
+    // header, rows, blank, hints; + borders and top padding
+    let inner = window(f, area, "Plugins", 80, n.max(1) as u16 + 6);
+    let w = inner.width as usize;
+    let nw = app
+        .plugins
+        .iter()
+        .map(|p| dw(&p.plugin.name))
+        .max()
+        .unwrap_or(0)
+        .clamp(4, 20);
+    // the rest after mark, name, pill, STATUS (up to 8) and the gaps between
+    let sw = w.saturating_sub(nw + SWITCH_W as usize + 16).max(6);
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "  {}  {}  {}  STATUS",
+            pad("NAME", nw),
+            pad("STATE", SWITCH_W as usize),
+            pad("SOURCE", sw)
+        ),
+        s(MUTED).add_modifier(Modifier::BOLD),
+    ))];
+    if n == 0 {
+        lines.push(Line::from(Span::styled(
+            "  No plugins yet · + add plugin",
+            s(MUTED),
+        )));
+    }
+    let sel = sel.min(n.saturating_sub(1));
+    for (i, p) in app.plugins.iter().enumerate() {
+        let status = p.status();
+        let color = match status {
+            "ok" => GOOD,
+            "failed" => BAD,
+            _ => MUTED,
+        };
+        let mark = if i == sel {
+            Span::styled("▌ ", s(ACCENT))
+        } else {
+            Span::raw("  ")
+        };
+        lines.push(
+            Line::from(vec![
+                mark,
+                Span::styled(
+                    pad(&ellipsize(&p.plugin.name, nw), nw),
+                    s(Color::White).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                pill(p.plugin.on),
+                Span::raw("  "),
+                Span::styled(
+                    pad(&ellipsize(&crate::plugins::source(&p.plugin), sw), sw),
+                    s(MUTED),
+                ),
+                Span::raw("  "),
+                Span::styled(status, s(color)),
+            ])
+            .style(if i == sel {
+                Style::new().bg(SELECT)
+            } else {
+                Style::new()
+            }),
+        );
+        let y = inner.y + 1 + i as u16;
+        if y < inner.bottom() {
+            let row = Rect {
+                y,
+                height: 1,
+                ..inner
+            };
+            hits.plugin_rows.push((row, i));
+            let x = inner.x + (2 + nw + 2) as u16;
+            if x + SWITCH_W <= inner.right() {
+                hits.plugins.push((
+                    Rect {
+                        x,
+                        width: SWITCH_W,
+                        ..row
+                    },
+                    p.plugin.name.clone(),
+                ));
+            }
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(hints(plugins_hints(), w));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn plugins_hints() -> Vec<(u8, Vec<Span<'static>>)> {
+    vec![
+        (1, hint("o", "on/off")),
+        (2, hint("u", "update")),
+        (1, hint("d", "remove")),
+        (0, hint("enter", "actions")),
+        (1, hint("+", "add plugin")),
+        (0, hint("esc", "close")),
+    ]
 }
 
 fn keycap(t: &'static str) -> Span<'static> {
@@ -964,7 +1183,10 @@ fn form_window(f: &mut Frame, form: &Form, area: Rect, hits: &mut Hits) {
         let content: Line = match &field.input {
             Input::Choice { options, at } => Line::from(vec![
                 Span::styled(" ‹ ", s(if focused { ACCENT } else { FAINT })),
-                Span::styled(options[*at], s(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    options[*at].as_str(),
+                    s(Color::White).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" › ", s(if focused { ACCENT } else { FAINT })),
             ]),
             Input::Text { value, cursor } if focused && !field.locked => {
@@ -1085,6 +1307,23 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
             (0, hint("enter", "save / confirm")),
             (0, hint("esc", "cancel")),
         ]
+    } else if app.plugins_win.is_some() {
+        plugins_hints()
+    } else if app
+        .rows
+        .get(app.selected)
+        .is_some_and(|r| r.entry.kind == Kind::Plugin)
+    {
+        vec![
+            (0, hint("enter", "open")),
+            (1, hint("a", "actions")),
+            (1, hint("o", "on/off")),
+            (3, hint("u", "update")),
+            (2, hint("d", "delete")),
+            (3, hint("*", "default")),
+            (2, hint("p", "add plugin")),
+            (0, hint("q", "quit")),
+        ]
     } else {
         let mut items = vec![
             (0, hint("enter", "open")),
@@ -1116,6 +1355,8 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
             ]);
         }
         items.push((4, hint("r", "clear limit")));
+        items.push((4, hint("p", "add plugin")));
+        items.push((4, hint("P", "plugins")));
         if !app.tabs.is_empty() {
             // both act on the current tab, which the tab bar marks while home shows
             let n = app.current + 1;

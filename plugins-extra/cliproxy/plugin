@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# cliproxy plugin for ai-launcher: one "all accounts" Claude Code channel through a local CLIProxyAPI.
+# Protocol: plugin rows | actions | do <start|stop|affinity|apply|mode-failover|mode-balance> | launch all [args...]   (see the README "Plugins")
+# API facts: docs/superpowers/notes/cliproxyapi.md. Never prints a key.
+D=${AI_PLUGIN_DIR:-$(cd "$(dirname "$0")" && pwd)}
+CONF=$D/config CACHE=$D/cache TAB=$(printf '\t')
+DOWN='proxy not running — start: brew services start cliproxyapi'
+has() { command -v "$1" >/dev/null 2>&1; }
+
+# ── config: key=value lines, never sourced ──
+[ -f "$CONF" ] || { (umask 077; cp "$D/config.example" "$CONF" 2>/dev/null || echo 'url=http://127.0.0.1:8317' > "$CONF"); chmod 600 "$CONF"; }
+url= key= key_env=CLIPROXY_API_KEY mgmt_key= mgmt_key_env=CLIPROXY_MGMT_KEY start_cmd= stop_cmd= mode=
+while IFS= read -r l || [ -n "$l" ]; do
+  l=${l%$'\r'}
+  case $l in '#'*) continue ;; *=*) ;; *) continue ;; esac
+  k=${l%%=*} v=${l#*=}; v=${v%% #*}; v=${v%%"$TAB"#*}
+  while case $v in *' '|*"$TAB") true ;; *) false ;; esac; do v=${v%?}; done
+  case $k in url|key|key_env|mgmt_key|mgmt_key_env|start_cmd|stop_cmd|mode) eval "$k=\$v" ;; esac
+done < "$CONF"
+url=${url:-http://127.0.0.1:8317}; url=${url%/}
+case $mode in balance) ;; *) mode=failover ;; esac
+envname() { case $1 in ''|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;; esac; }   # only a valid name reaches eval
+[ -n "$key" ] || ! envname "$key_env" || eval "key=\${$key_env:-}"
+[ -n "$mgmt_key" ] || ! envname "$mgmt_key_env" || eval "mgmt_key=\${$mgmt_key_env:-}"
+
+nokey() { echo "no key: set ${key_env:-CLIPROXY_API_KEY} or key= in $CONF"; }
+# one probe, 1 s (CLIPROXY_PROBE_SECS: test override). Any HTTP answer means up.
+up() {
+  if has curl; then curl -s -m "${CLIPROXY_PROBE_SECS:-1}" -o /dev/null "$url/"; return; fi
+  local hp=${url#*://} host port; hp=${hp%%/*}; host=${hp%:*}; port=${hp##*:}
+  [ "$host" = "$hp" ] && case $url in https*) port=443 ;; *) port=80 ;; esac
+  # shortcut: no 1 s cap without curl; fine for localhost (refused at once), a remote url can hang up to the core's 2 s
+  (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null
+}
+# curl with the key in a config read from stdin, never on the command line.
+# Prints the body, then the HTTP code as the last line.
+kcurl() {
+  local k=$1; shift; k=${k//\\/\\\\}; k=${k//\"/\\\"}
+  printf 'header = "Authorization: Bearer %s"\n' "$k" | curl -s -K - -w '\n%{http_code}' "$@"
+}
+hc() { case $1 in ''|000) echo 'no answer' ;; *) echo "HTTP $1" ;; esac; }
+# jq helpers: clean drops control chars from proxy-supplied text (no ESC, no forged row lines)
+JQDEF='def clean: tostring | gsub("[[:cntrl:]]"; "");
+  def strat: (. // "" | clean | ascii_downcase) as $s
+    | if $s == "" or $s == "rr" or $s == "roundrobin" then "round-robin"
+      elif $s == "wrr" or $s == "weightedroundrobin" then "weighted-round-robin"
+      elif $s == "ff" or $s == "fillfirst" then "fill-first" else $s end;'
+
+# ── usage cache: line 1 = fetch time, then detail lines ──
+refresh() {
+  local out code base=v8 cred=credentials call=requests/api-call creds q f line ai prov acct req
+  # routing: strategy, affinity, subagents (absent = true), disable-cooling, ttl ("-" = empty); no file = unknown (v0, refused, no answer)
+  out=$(kcurl "$mgmt_key" -m 5 "$url/v8/management/config/routing")
+  if [ "${out##*$'\n'}" = 200 ] && printf '%s\n' "${out%$'\n'*}" | jq -r "$JQDEF"'[(.strategy | strat), (.["session-affinity"] == true),
+      (.["session-affinity-subagents"] != false), (.cooldown["disable-cooling"]? == true),
+      (.["session-affinity-ttl"] // "" | clean | if . == "" then "-" else . end)] | @tsv' > "$CACHE/routing.$$" 2>/dev/null; then
+    mv "$CACHE/routing.$$" "$CACHE/routing"
+  else rm -f "$CACHE/routing" "$CACHE/routing.$$"; fi
+  out=$(kcurl "$mgmt_key" -m 10 "$url/v8/management/credentials"); code=${out##*$'\n'}
+  [ "$code" = 000 ] && code=
+  if [ "$code" = 404 ]; then
+    base=v0 cred=auth-files call=api-call
+    out=$(kcurl "$mgmt_key" -m 10 "$url/v0/management/auth-files"); code=${out##*$'\n'}
+    [ "$code" = 000 ] && code=
+  fi
+  find "$CACHE" -maxdepth 1 -type f -name '*.[0-9]*' -mmin +5 -exec rm -f {} + 2>/dev/null   # left by a killed refresh
+  creds=$CACHE/creds.$$ q=$CACHE/quota.$$ f=$CACHE/usage.$$
+  printf '%s\n' "${out%$'\n'*}" > "$creds"; : > "$q"
+  if [ "$code" != 200 ] || ! jq -e '.files|type=="array"' "$creds" >/dev/null 2>&1; then
+    case $code in
+      401|403) line="usage: management API refused ($code)" ;;
+      404) line="usage: management API off (set remote-management secret-key in the proxy config)" ;;
+      *) line="usage: management API unavailable (${code:-no answer})" ;;
+    esac
+    { date +%s; printf '  \t%s\n' "$line"; } > "$f"; mv "$f" "$CACHE/usage"; return
+  fi
+  # each enabled claude / codex login: its provider's own usage endpoint through the proxy (as the Management Center does)
+  jq -r '.files[] | select((.disabled != true) and ((.provider // .type // "") | ascii_downcase | test("^(claude|codex)$")))
+    | [.auth_index, (.provider // .type | ascii_downcase), (.id_token.chatgpt_account_id? // "")] | @tsv' "$creds" 2>/dev/null |
+  while IFS="$TAB" read -r ai prov acct; do
+    [ -n "$ai" ] || continue
+    jq -n --arg ai "$ai" --arg p "$prov" --arg acct "$acct" '{auth_index: $ai, method: "GET", data: ""} +
+      if $p == "claude" then {url: "https://api.anthropic.com/api/oauth/usage", header: {"Authorization": "Bearer $TOKEN$",
+        "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-cli/2.1.280 (external, cli)"}}
+      else {url: "https://chatgpt.com/backend-api/wham/usage", header: ({"Authorization": "Bearer $TOKEN$",
+        "Content-Type": "application/json", "User-Agent": "codex-tui/0.149.1"} + if $acct != "" then {"Chatgpt-Account-Id": $acct} else {} end)} end' > "$CACHE/req.$$"
+    out=$(kcurl "$mgmt_key" -m 20 -X POST -H 'Content-Type: application/json' --data-binary "@$CACHE/req.$$" "$url/$base/management/$call")
+    [ "${out##*$'\n'}" = 200 ] || continue
+    printf '%s\n' "${out%$'\n'*}" | jq -c --arg p "$prov" --arg ai "$ai" 'select(.status_code == 200) | {p: $p, ai: $ai, q: (.body | fromjson)}' >> "$q" 2>/dev/null
+  done
+  local models=
+  [ -n "$key" ] && models=$(kcurl "$key" -m 5 "$url/v1/models") && [ "${models##*$'\n'}" = 200 ] &&
+    models=$(printf '%s\n' "${models%$'\n'*}" | jq -r "$JQDEF"'[.data[]?.id | strings | clean] | join(", ") | if length > 100 then .[:99] + "…" else . end' 2>/dev/null) || models=
+  {
+    date +%s
+    jq -rn --argjson now "$(date +%s)" --slurpfile c "$creds" --slurpfile q "$q" "$JQDEF"'
+      def rep($s; $n): reduce range(0; $n) as $i (""; . + $s);
+      def num: if type == "number" then . elif type == "string" then (tonumber? // null) else null end;
+      def left: if type == "number" then (if . > 1e12 then . / 1000 else . end) - $now
+        elif type == "string" then ((try (sub("\\.[0-9]+"; "") | sub("(\\+00:00|Z)$"; "Z") | fromdateiso8601) catch null) // (tonumber? // null))
+          | if . == null then null elif . > 1e12 then . / 1000 - $now else . - $now end
+        else null end;
+      def in_: if . == null or . <= 0 then "" elif . >= 86400 then " ↻\(. / 86400 | floor)d"
+        elif . >= 3600 then " ↻\(. / 3600 | floor)h" else " ↻\([. / 60 | floor, 1] | max)m" end;
+      def bar($w; $l): ($l | map(.pct) | map(select(. != null))) as $ps
+        | if ($ps | length) == 0 then empty else
+          ((($ps | add) / ($ps | length)) | round) as $p | ([((($p + 5) / 10) | floor), 10] | min) as $n
+          | ($l | map(.left) | map(select(. != null and . > 0)) | min) as $s
+          | "\($w) \(rep("█"; $n))\(rep("░"; 10 - $n)) \(rep(" "; 3 - ($p | tostring | length)))\($p)%\($s | in_)" end;
+      # claude: utilization is a percent 0-100
+      def claude: [["5h", .five_hour], ["wk", .seven_day]][] | select(.[1] | type == "object")
+        | {w: .[0], pct: (.[1].utilization | num), left: (.[1].resets_at | left)};
+      # codex: 5h vs weekly by limit_window_seconds, else primary = 5h, secondary = weekly
+      def codex: (.rate_limit // .rateLimit // {}) as $r
+        | [["5h", ($r.primary_window // $r.primaryWindow)], ["wk", ($r.secondary_window // $r.secondaryWindow)]][]
+        | .[0] as $pos | .[1] | select(type == "object")
+        | (.limit_window_seconds // .limitWindowSeconds | num) as $sec
+        | {w: (if $sec == null then $pos elif $sec < 86400 then "5h" else "wk" end),
+           pct: ((.used_percent // .usedPercent | num) // (if ($r.limit_reached // $r.limitReached) == true or $r.allowed == false then 100 else null end)),
+           left: (((.reset_at // .resetAt) | left) // (.reset_after_seconds // .resetAfterSeconds | num))};
+      ([$q[] | .p as $p | .ai as $ai | .q | {p: $p, ai: $ai, ws: [if $p == "claude" then claude else codex end]}]) as $quota
+      # every enabled login of a provider limited (5h/weekly at 100%, or cooling down / unavailable) -> one warning line
+      | def allout($p; $label):
+          [$c[0].files[] | select((.disabled != true) and ((.provider // .type // "") | ascii_downcase) == $p)] as $fs
+          | if ($fs | length) == 0 then empty else
+            [$fs[] | . as $f
+              | [$quota[] | select(.p == $p and .ai == ($f.auth_index | tostring)) | .ws[] | select(.pct != null and .pct >= 100) | .left] as $ql
+              | [($f.cooldowns // [])[]? | (.remaining_seconds | num)] as $cl
+              | if $f.unavailable == true or ($cl | length) > 0 or ($ql | length) > 0
+                then {r: (($ql + $cl) | map(select(. != null)) | max)} else empty end] as $L
+            | if ($L | length) == ($fs | length) then "  \t⚠ all \($label) accounts limited"
+                + ([$L[].r | select(. != null and . > 0)] | min | if . == null then "" else " · next reset " + (in_ | ltrimstr(" ")) end)
+              else empty end end;
+      allout("claude"; "Claude"), allout("codex"; "Codex"),
+      ($c[0].files | map(. + {p: ((.provider // .type // "?") | clean | ascii_downcase)}) | group_by(.p)[]
+      | .[0].p as $p | length as $n
+      | ([$quota[] | select(.p == $p) | .ws[]]) as $ws
+      | [$p] + ([bar("5h"; [$ws[] | select(.w == "5h")]), bar("wk"; [$ws[] | select(.w == "wk")])])
+        + ["\($n) acct\(if $n == 1 then "" else "s" end)",
+           "\(map(.success | num // 0) | add) req", "\(map(.failed | num // 0) | add) failed"]
+      | "  \t" + join(" · "))' 2>/dev/null
+    [ -n "$models" ] && printf '  \tmodels: %s\n' "$models"
+  } > "$f"
+  mv "$f" "$CACHE/usage"
+}
+
+usage() {
+  if ! has curl; then printf '  \tusage needs curl\n'; return; fi
+  if ! has jq; then printf '  \tusage needs jq\n'; return; fi
+  [ -n "$mgmt_key" ] || { printf '  \tusage: set %s or mgmt_key= in config\n' "${mgmt_key_env:-CLIPROXY_MGMT_KEY}"; return; }
+  mkdir -p "$CACHE" && chmod 700 "$CACHE"
+  # a lock left by a killed refresh
+  [ -d "$CACHE/lock" ] && [ -n "$(find "$CACHE/lock" -maxdepth 0 -mmin +5 2>/dev/null)" ] && rm -rf "$CACHE/lock"
+  local ts=; [ -f "$CACHE/usage" ] && ts=$(head -1 "$CACHE/usage")
+  case $ts in ''|*[!0-9]*) ts=0 ;; esac
+  if [ -f "$CACHE/usage" ]; then tail -n +2 "$CACHE/usage" | grep -vF '⚠ all '; else printf '  \tloading usage…\n'; fi
+  [ $(( $(date +%s) - ts )) -lt 60 ] && return
+  mkdir "$CACHE/lock" 2>/dev/null || return 0   # a refresh is already running
+  # the job gets no stdout, so the caller is never held open while it runs
+  { refresh; rm -rf "$CACHE/lock" "$CACHE"/*.$$; } </dev/null >/dev/null 2>&1 &
+}
+
+# routing cache -> aff_state: on | off | unknown, r_strategy, r_cool, r_ttl, and mode_ok: yes | no | unknown
+routing() {
+  aff_state=unknown r_strategy= r_cool= r_ttl= mode_ok=unknown
+  [ -n "$mgmt_key" ] && [ -f "$CACHE/routing" ] || return 0
+  local a s
+  IFS="$TAB" read -r r_strategy a s r_cool r_ttl < "$CACHE/routing"
+  [ "$a" = true ] && [ "$s" = true ] && aff_state=on || aff_state=off
+  mode_ok=no
+  case $mode/$r_strategy/$r_cool in
+    failover/fill-first/false) mode_ok=yes ;;
+    balance/round-robin/*|balance/weighted-round-robin/*) [ $aff_state = on ] && mode_ok=yes ;;
+  esac
+}
+modename() { [ "$1" = balance ] && echo 'load balance' || echo failover; }
+
+# mode=<m> into the config: other lines kept, file stays 600
+setmode() {
+  ( umask 077; seen=
+    while IFS= read -r l || [ -n "$l" ]; do
+      case $l in mode=*) [ -n "$seen" ] && continue; l="mode=$1" seen=1 ;; esac
+      printf '%s\n' "$l"
+    done < "$CONF" > "$CONF.$$"
+    [ -n "$seen" ] || printf 'mode=%s\n' "$1" >> "$CONF.$$"
+  ) && chmod 600 "$CONF.$$" && mv "$CONF.$$" "$CONF"
+}
+# GET the v8 routing config: sets out (body) and code
+getrouting() {
+  out=$(kcurl "$mgmt_key" -m 5 "$url/v8/management/config/routing"); code=${out##*$'\n'}
+  out=${out%$'\n'*}
+}
+# affinity keys for a PATCH body; ttl 1h when the proxy has none
+affkeys() {
+  local ttl; ttl=$(printf '%s\n' "$out" | jq -r '.["session-affinity-ttl"] // "" | tostring' 2>/dev/null)
+  printf '"session-affinity":true,"session-affinity-subagents":true'
+  [ -n "$ttl" ] || printf ',"session-affinity-ttl":"1h"'
+}
+# make the proxy match $mode: one v8 config PATCH merge; v8 404 -> v0 strategy PUT only
+apply() {
+  [ -n "$mgmt_key" ] || { echo "mode: $(modename "$mode"); proxy not changed (no management key)"; return 0; }
+  has curl && has jq || { echo "mode: $(modename "$mode"); proxy not changed (needs curl and jq)"; return 1; }
+  local cur body s
+  rm -f "$CACHE/usage" "$CACHE/routing"
+  getrouting
+  if [ "$code" = 200 ]; then
+    cur=$(printf '%s\n' "$out" | jq -r "$JQDEF"'.strategy | strat' 2>/dev/null)
+    if [ "$mode" = failover ]; then body='{"routing":{"strategy":"fill-first","cooldown":{"disable-cooling":false}}}'
+    else s=round-robin; [ "$cur" = weighted-round-robin ] && s=$cur
+      body="{\"routing\":{\"strategy\":\"$s\",$(affkeys)}}"
+    fi
+    out=$(kcurl "$mgmt_key" -m 10 -X PATCH -H 'Content-Type: application/json' --data-binary "$body" "$url/v8/management/config"); code=${out##*$'\n'}
+  elif [ "$code" = 404 ]; then
+    s=fill-first
+    if [ "$mode" = balance ]; then
+      s=$(kcurl "$mgmt_key" -m 5 "$url/v0/management/routing/strategy")
+      s=$(printf '%s\n' "${s%$'\n'*}" | jq -r "$JQDEF"'.strategy | strat' 2>/dev/null)
+      [ "$s" = weighted-round-robin ] || s=round-robin
+    fi
+    out=$(kcurl "$mgmt_key" -m 10 -X PUT -H 'Content-Type: application/json' --data-binary "{\"value\":\"$s\"}" "$url/v0/management/routing/strategy"); code=${out##*$'\n'}
+  fi
+  if [ "$code" != 200 ]; then echo "could not apply mode $(modename "$mode") ($(hc "$code"))"; return 1; fi
+  case $mode in
+    failover) echo "proxy now uses failover: one account until it is limited, then the next" ;;
+    balance) echo "proxy now uses load balance: chats spread across accounts, each chat stays on one" ;;
+  esac
+}
+
+brew_has() { has brew && [ -d "$(brew --prefix 2>/dev/null)/opt/cliproxyapi" ]; }
+
+case ${1:-} in
+  rows)
+    printf 'section\tCLIPROXY · all accounts · %s\n' "$(modename "$mode")"
+    printf 'all\tClaude Code · all accounts\t'
+    if [ -z "$key" ]; then nokey; exit 0; fi
+    up || { echo "$DOWN"; exit 0; }
+    warn=; [ -f "$CACHE/usage" ] && warn=$(tail -n +2 "$CACHE/usage" | grep -F '⚠ all ')
+    case $warn in *'all Claude accounts limited'*) echo 'proxy up · Claude limited' ;; *) echo 'proxy up' ;; esac
+    [ -z "$warn" ] || printf '%s\n' "$warn"
+    routing
+    case $aff_state in
+      off) printf '  \t⚠ session affinity off: a chat can move between accounts and re-send its whole context — TUI: a, or ai plugin do cliproxy affinity\n' ;;
+      on) printf '  \trouting: %s · sticky per chat%s\n' "$r_strategy" "$([ "$r_ttl" = - ] || printf ' (%s)' "$r_ttl")" ;;
+    esac
+    s=$r_strategy; [ "$r_cool" = true ] && s="$s (cooling off)"
+    [ $mode_ok = no ] && printf '  \t⚠ proxy uses %s, plugin mode is %s — apply: TUI a, or ai plugin do cliproxy apply\n' "$s" "$(modename "$mode")"
+    usage ;;
+  actions)
+    if brew_has || [ -n "$start_cmd" ]; then printf 'start\tstart proxy\n'; fi
+    if brew_has || [ -n "$stop_cmd" ]; then printf 'stop\tstop proxy\n'; fi
+    printf 'mode-failover\tMode: failover (one account until limited)\nmode-balance\tMode: load balance\n'
+    routing
+    [ $mode_ok = no ] && printf 'apply\tApply %s to the proxy\n' "$(modename "$mode")"
+    [ -n "$mgmt_key" ] && [ "$aff_state" != on ] && printf 'affinity\tKeep each chat on one account\n'
+    exit 0 ;;
+  do)
+    if [ "${2:-}" = affinity ]; then
+      [ -n "$mgmt_key" ] || { echo "no management key: set ${mgmt_key_env:-CLIPROXY_MGMT_KEY} or mgmt_key= in $CONF"; exit 1; }
+      has curl && has jq || { echo "affinity needs curl and jq"; exit 1; }
+      getrouting
+      [ "$code" = 200 ] || { echo "session affinity not available ($(hc "$code"); needs CLIProxyAPI v8)"; exit 1; }
+      out=$(kcurl "$mgmt_key" -m 10 -X PATCH -H 'Content-Type: application/json' --data-binary "{\"routing\":{$(affkeys)}}" "$url/v8/management/config"); code=${out##*$'\n'}
+      rm -f "$CACHE/usage" "$CACHE/routing"
+      if [ "$code" = 200 ]; then echo "session affinity on: each chat now stays on one account"
+      else echo "could not turn on session affinity ($(hc "$code"))"; exit 1; fi
+      exit 0
+    fi
+    case ${2:-} in
+      apply) [ -n "$mgmt_key" ] || { echo "proxy not changed (no management key)"; exit 1; }; apply; exit ;;
+      mode-failover|mode-balance) mode=${2#mode-}; setmode "$mode" || { echo "could not write $CONF"; exit 1; }; apply; exit ;;
+    esac
+    case ${2:-} in start|stop) ;; *) echo "unknown action: ${2:-}"; exit 1 ;; esac
+    if brew_has; then exec brew services "$2" cliproxyapi; fi
+    cmd=$start_cmd; [ "$2" = stop ] && cmd=$stop_cmd
+    [ -n "$cmd" ] || { echo "no $2 command: install cliproxyapi with brew or set ${2}_cmd= in $CONF"; exit 1; }
+    exec bash -c "$cmd" ;;
+  launch)
+    [ "${2:-}" = all ] || { echo "unknown entry: ${2:-}" >&2; exit 1; }
+    shift 2
+    [ -n "$key" ] || { nokey >&2; exit 1; }
+    up || { echo "$DOWN" >&2; exit 1; }
+    unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY CLIPROXY_MGMT_KEY
+    ! envname "$mgmt_key_env" || unset "$mgmt_key_env"
+    export ANTHROPIC_BASE_URL=$url ANTHROPIC_AUTH_TOKEN=$key CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+    exec claude "$@" ;;
+  *) echo "usage: plugin rows | actions | do <start|stop|affinity|apply|mode-failover|mode-balance> | launch all [args...]" >&2; exit 1 ;;
+esac

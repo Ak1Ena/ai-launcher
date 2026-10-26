@@ -6,6 +6,7 @@ mod config;
 mod failover;
 mod form;
 mod pane;
+mod plugins;
 mod ui;
 mod update;
 mod usage;
@@ -63,6 +64,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut app::App) -> anyhow::R
         app.tick();
         if last_refresh.elapsed() > Duration::from_secs(10) {
             app.refresh();
+            app.reload_plugins();
             last_refresh = Instant::now();
         }
     }

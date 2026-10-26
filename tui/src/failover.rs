@@ -197,7 +197,7 @@ pub fn move_transcript(transcript: &Path, config_dir: &Path) -> std::io::Result<
     Ok(())
 }
 
-fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+pub fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::create_dir_all(to)?;
     for e in fs::read_dir(from)? {
         let e = e?;
