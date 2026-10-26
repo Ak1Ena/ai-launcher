@@ -200,13 +200,13 @@ ok "auto: q stops the countdown" '[ $stoprc != 0 ] && ! grep -q "^$CLA_ROOT/two|
 _ai_failover clear >/dev/null 2>&1; : > "$FO_LOG"; rm -f "$FO_LOG.codex"
 _fo_list | _fo_set claude/two off | _fo_save
 ( AI_FO_WAIT=2; PATH=$FO/bin:$PATH; _fo_run claude/one -p hi ) </dev/null >/dev/null 2>"$FO/err"; cxrc=$?
-ok "auto: codex next still asks (no input = no)" '[ $cxrc != 0 ] && [ ! -e "$FO_LOG.codex" ] && grep -q "sends the conversation to OpenAI (Codex)" "$FO/err" && grep -q "\[y/N\]" "$FO/err" && ! grep -q "switching in" "$FO/err"'
+ok "auto: codex next counts down too, with the OpenAI line" '[ -e "$FO_LOG.codex" ] && grep -q "sends the conversation to OpenAI (Codex)" "$FO/err" && grep -q "switching in" "$FO/err"'
 _fo_list | _fo_set claude/two on | _fo_save; _ai_failover clear >/dev/null 2>&1; : > "$FO_LOG"
 # stdin stays open but silent: only the countdown running out can move it (y/N would wait for EOF at 4 s)
 sleep 4 | { s=$(date +%s); ( AI_FO_WAIT=2; PATH=$FO/bin:$PATH; _fo_run claude/one -p hi ) >/dev/null 2>&1; echo $(( $(date +%s) - s )) > "$FO/took"; }
 ok "auto: countdown runs out and moves" 'grep -q "^$CLA_ROOT/two|.*--resume S1" "$FO_LOG" && [ "$(cat "$FO/took")" -ge 2 ] && [ "$(cat "$FO/took")" -lt 4 ]'
 _ai_failover clear >/dev/null 2>&1
-ok "auto: wait counts down to go"   '[ "$(AI_FO_WAIT=1 _fo_wait 2>/dev/null </dev/null)" = go ] && [ "$(_fo_wait ask 2>/dev/null </dev/null)" = stop ]'
+ok "auto: wait counts down to go"   '[ "$(AI_FO_WAIT=1 _fo_wait 2>/dev/null </dev/null)" = go ]'
 ok "auto: ls shows the state" '_fo_show 2>&1 | grep -q "auto-switch on"'
 ok "failover auto off removes the file" '_ai_failover auto off >/dev/null 2>&1; [ ! -e "$AI_FO_ORDER.auto" ] && ! _fo_auto && _fo_show 2>&1 | grep -q "auto-switch off"'
 mrows=$(_fo_rows)

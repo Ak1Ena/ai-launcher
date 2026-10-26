@@ -427,7 +427,7 @@ pub fn set_failover(paths: &Paths, on: bool) {
 }
 
 /// `<order>.auto` exists: a limit switches by itself after a short countdown (shared with bash).
-/// Missing: ask y/N. A switch to Codex always asks.
+/// Missing: ask y/N, Codex included.
 pub fn auto_switch_on(paths: &Paths) -> bool {
     beside(paths, ".auto").exists()
 }

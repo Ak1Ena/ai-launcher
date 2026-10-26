@@ -16,10 +16,10 @@ AI_FO_PROMPT=${AI_FO_PROMPT:-"The previous account hit its usage limit and this 
 
 _fo_on() { [ -e "$AI_FO_ORDER.on" ] && has jq && ! is_windows; }
 _fo_state() { if _fo_on; then echo on; else echo off; fi; }
-# <order>.auto exists: switch by itself after AI_FO_WAIT seconds (shared with the TUI). A switch to Codex still asks.
+# <order>.auto exists: switch by itself after AI_FO_WAIT seconds (shared with the TUI), Codex too.
 _fo_auto() { [ -e "$AI_FO_ORDER.auto" ]; }
 _fo_auto_word() { if _fo_auto; then echo on; else echo off; fi; }
-_fo_auto_text() { if _fo_auto; then echo "auto-switch on: moves by itself after ${AI_FO_WAIT:-5}s (Codex still asks)"; else echo "auto-switch off: asks y/N before moving"; fi; }
+_fo_auto_text() { if _fo_auto; then echo "auto-switch on: moves by itself after ${AI_FO_WAIT:-5}s, Codex too"; else echo "auto-switch off: asks y/N before moving"; fi; }
 
 _ai_failover() {
   case ${1:-} in
@@ -79,15 +79,15 @@ _fo_label() {
   local l
   case $1 in claude/*) echo "Claude account ${1#claude/}" ;; *) l=$(_ai_get "$1" 3); echo "${l:-$1}${l:+ ($1)}" ;; esac
 }
-# _fo_wait [ask]: under a card. Prints go | order (o) | stop.
-# Auto-switch on (and no "ask"): counts down AI_FO_WAIT s, any key or time up = go, q = stop.
+# _fo_wait: under a card. Prints go | order (o) | stop.
+# Auto-switch on: counts down AI_FO_WAIT s, any key or time up = go, q = stop.
 # Otherwise asks, default No: y = go, anything else (enter, end of input) = stop.
 _fo_wait() {
   local k= i rc
   # drop keys typed before the prompt (a "y" meant for claude); only a terminal can hold type-ahead.
   # shortcut: bash 3.2 read -t takes whole seconds, so this costs 1 s; upgrade when 3.2 is dropped.
   if [ -t 0 ]; then while IFS= read -r -s -n 1 -t 1 k; do :; done; k=; fi
-  if _fo_auto && [ "${1:-}" != ask ]; then
+  if _fo_auto; then
     for ((i = ${AI_FO_WAIT:-5}; i > 0; i--)); do
       printf '\r\033[2m  switching in %ds · any key now · o change order · q stop \033[0m' $i >&2
       k=; IFS= read -r -s -n 1 -t 1 k; rc=$?
@@ -311,8 +311,7 @@ $history"
         k=; [ "$(_fo_kind "$m")" = codex ] && k="This sends the conversation to OpenAI (Codex)."
         _fo_card "✻ Failover" "$(_fo_label "$prev") hit its usage limit." \
           "→ Move ${sid:+this session }to $(_fo_label "$m")?" ${k:+"$k"}
-        # going to codex (OpenAI) always asks, even with auto-switch on
-        case $(_fo_wait ${k:+ask}) in go) break ;; stop) return 1 ;; esac
+        case $(_fo_wait) in go) break ;; stop) return 1 ;; esac
       else
         _fo_card "✻ Failover" "$(_fo_label "$prev") hit its usage limit." "No other account is on and free right now."
         printf '\033[2m  o change order · any other key stops \033[0m' >&2

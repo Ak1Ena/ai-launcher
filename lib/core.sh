@@ -122,7 +122,7 @@ ai failover [on|off|ls]          when a Claude account hits its limit, resume th
                                  next account (Codex last). No args: set priority, turn accounts on/off
 ai failover order <member>...    set priority from the command line
 ai failover auto [on|off]        at a limit, move by itself after a countdown (on) or ask y/N (off,
-                                 default). A move to Codex always asks
+                                 default). The card says when Codex (OpenAI) is next
 ai trust [on|off|status]         share folder trust between agents (off by default)
 cla [name] [team] [args]         Claude accounts: pick or start one   (cla add|ls|rm|mv)
 cla-team [name] [args]           Claude team mode (needs tmux)
