@@ -191,3 +191,32 @@ Second check (actions and on/off), my calls:
   the folder name (`<name> · off`), so no title cache is needed. `ai plugin ls` shows on/off.
 - **cliproxy `start_cmd` / `stop_cmd`:** the config is parsed as `key=value`, never sourced; these
   two values run through `bash -c` like providers-file commands (user's own config).
+
+## Revision: two sections, merged usage (user, after review)
+
+The user wants, when the cliproxy plugin is on, two sections on the home list:
+1. The existing failover section, unchanged: cla accounts, failover works as today.
+2. The plugin's section, which looks like one more account ("all accounts merged") and shows usage
+   for all of the proxy's accounts together, by model.
+
+Both kinds of numbers are wanted (user: "1 and 2"):
+- **Request / token counts per model**, from CLIProxyAPI's own usage statistics
+  (`/v8/management/observability/usage/...`, management key, localhost only).
+- **Limit bars merged across accounts**, like the bars cla accounts show (5h / weekly). Limits are
+  per provider account, not per model, so these are one line per provider (Claude, Codex, Gemini…):
+  the average used % across that provider's accounts, the soonest reset, and `n accts`. Source: the
+  proxy's `/v8/management/credentials` list plus `/requests/api-call` to each provider's own usage
+  endpoint (how the CLIProxyAPI Management Center reads quotas). A provider without a usage endpoint
+  shows counts only.
+
+Protocol change: an entry line may be followed by detail lines `  <TAB><text>` (two spaces then a
+tab), shown indented under that entry in the TUI and the bash picker. Core does not interpret them.
+
+Plugin config gains `mgmt_key_env=CLIPROXY_MGMT_KEY` (or `mgmt_key=`). Without it, the row shows
+only up/down and a hint. Usage is fetched by the plugin at most once per 60 s and cached in
+`$AI_PLUGIN_DIR/cache/usage`; `rows` always answers from the cache within the 2 s limit and
+refreshes it in the background. Network: the plugin's own calls (to the localhost proxy, which then
+calls the providers) — not core's.
+
+To verify at build time (from CLIProxyAPI source, not guessed): the exact usage endpoint and whether
+it gives a per-model breakdown; the `/requests/api-call` body; each provider's usage endpoint.
