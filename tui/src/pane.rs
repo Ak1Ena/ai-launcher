@@ -196,6 +196,12 @@ impl Pane {
         }
     }
 
+    /// The link under (col, row), 0-based, joined across the rows a long line wrapped onto.
+    pub fn link_at(&self, col: u16, row: u16) -> Option<String> {
+        let p = self.screen.lock().unwrap_or_else(|e| e.into_inner());
+        link_at(p.screen(), col, row)
+    }
+
     pub fn key(&self, key: KeyEvent) {
         // typing jumps back to the live screen
         self.screen
@@ -330,6 +336,50 @@ pub fn encode_key(key: KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
     Some(out)
 }
 
+fn link_at(s: &vt100::Screen, col: u16, row: u16) -> Option<String> {
+    let (rows, cols) = s.size();
+    let mut top = row;
+    while top > 0 && s.row_wrapped(top - 1) {
+        top -= 1;
+    }
+    let mut bottom = row;
+    while bottom + 1 < rows && s.row_wrapped(bottom) {
+        bottom += 1;
+    }
+    // wrapped rows are full width, so the click's offset in the joined line is row * cols + col
+    let mut line: Vec<char> = Vec::new();
+    for (i, text) in s
+        .rows(0, cols)
+        .enumerate()
+        .skip(top as usize)
+        .take((bottom - top + 1) as usize)
+    {
+        let mut text: Vec<char> = text.chars().collect();
+        if (i as u16) < bottom {
+            text.resize(cols as usize, ' ');
+        }
+        line.extend(text);
+    }
+    let at = (row - top) as usize * cols as usize + col as usize;
+    if line.get(at).is_none_or(|c| c.is_whitespace()) {
+        return None;
+    }
+    let start = line[..at]
+        .iter()
+        .rposition(|c| c.is_whitespace())
+        .map_or(0, |i| i + 1);
+    let end = line[at..]
+        .iter()
+        .position(|c| c.is_whitespace())
+        .map_or(line.len(), |i| at + i);
+    let word: String = line[start..end].iter().collect();
+    let link = &word[word.find("http://").or_else(|| word.find("https://"))?..];
+    Some(
+        link.trim_end_matches(['.', ',', ')', '\'', '"'])
+            .to_string(),
+    )
+}
+
 /// Whether a CLI in `mode` asked for this kind of mouse event.
 fn mouse_reported(mode: vt100::MouseProtocolMode, kind: MouseEventKind) -> bool {
     use vt100::MouseProtocolMode as M;
@@ -391,6 +441,17 @@ mod tests {
             bracketed("a\x1b[201~rm -rf ~\n"),
             "\x1b[200~a[201~rm -rf ~\n\x1b[201~"
         );
+    }
+
+    #[test]
+    fn link_joins_wrapped_rows() {
+        let mut p = vt100::Parser::new(6, 10, 0);
+        p.process(b"go: https://a.b/cdefghij?x=1 now\r\nnext");
+        let want = Some("https://a.b/cdefghij?x=1".to_string());
+        assert_eq!(link_at(p.screen(), 5, 0), want);
+        assert_eq!(link_at(p.screen(), 2, 2), want);
+        assert_eq!(link_at(p.screen(), 0, 0), None);
+        assert_eq!(link_at(p.screen(), 1, 3), None);
     }
 
     #[test]

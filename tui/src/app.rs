@@ -497,10 +497,10 @@ impl App {
         };
         let what = match r.entry.id.strip_prefix("claude/") {
             Some(acct) => format!(
-                "Its folder moves to {}/.trash/{acct}-… and it is logged out (history and settings stay there).",
+                "Its folder moves to {}/.trash/{acct}-… and it is logged out (history and settings stay there). Its open tabs close.",
                 self.paths.cla_root.display()
             ),
-            None => "It leaves the list. A Codex or Gemini login folder is kept, so adding it again logs back in.".into(),
+            None => "It leaves the list. A Codex or Gemini login folder is kept, so adding it again logs back in. Its open tabs close.".into(),
         };
         self.modal = Some(Modal::Confirm(Confirm {
             id: r.entry.id.clone(),
@@ -592,12 +592,11 @@ impl App {
     }
 
     fn delete(&mut self, id: &str) {
-        if self
-            .tabs
-            .iter()
-            .any(|t| t.member == id && t.pane.is_some() && !t.done)
-        {
-            return self.say(format!("Close the running {id} tab first."));
+        // its tabs close first (a stuck login is the usual one): dropping a pane ends its CLI
+        self.tabs.retain(|t| t.member != id);
+        self.current = self.current.min(self.tabs.len().saturating_sub(1));
+        if self.tabs.is_empty() {
+            self.focus = Focus::Home;
         }
         let done = match id.strip_prefix("claude/") {
             Some(acct) => config::trash_claude_account(&self.paths, acct).map(|_| ()),
@@ -613,6 +612,9 @@ impl App {
     /// A new account's first tab: its login (`claude auth login`, `codex login`).
     fn open_login(&mut self, id: &str) {
         let Some(entry) = self.entry(id) else { return };
+        if let Some(i) = self.rows.iter().position(|r| r.entry.id == id) {
+            self.selected = i;
+        }
         let mut env: Vec<(String, Option<String>)> = Vec::new();
         let command = match entry.kind {
             Kind::Claude => {
@@ -667,7 +669,7 @@ impl App {
             }
         }
         self.say(format!(
-            "Log in to {} in this tab. When it ends, press enter to start it.",
+            "Log in to {} in this tab (click a link to copy it). When it ends, press enter to start it.",
             self.label(id)
         ));
     }
@@ -750,6 +752,18 @@ impl App {
                 && let Some(p) = &tab.pane
             {
                 let pane = hits.pane;
+                // a login link wraps over rows and the mouse is ours, so the terminal can't select it: a click copies it
+                if let MouseEventKind::Down(MouseButton::Left) = m.kind
+                    && inside(&pane)
+                    && let Some(link) = p.link_at(m.column - pane.x, m.row - pane.y)
+                {
+                    copy(&link);
+                    // the field, not say(): `tab` still borrows self.tabs
+                    self.flash = Some((
+                        "Copied the link. Open it on any device, then paste the code here.".into(),
+                        Instant::now() + Duration::from_secs(4),
+                    ));
+                }
                 let col = m
                     .column
                     .clamp(pane.x, pane.right().saturating_sub(1).max(pane.x));
@@ -1096,6 +1110,37 @@ impl App {
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Puts text on the clipboard: OSC 52 for the terminal (works over ssh), plus the OS tool when
+/// there is one, since some terminals (macOS Terminal) ignore OSC 52.
+fn copy(text: &str) {
+    use std::process::{Command, Stdio};
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::clipboard::CopyToClipboard::to_clipboard_from(text)
+    );
+    let tools: &[&[&str]] = &[
+        &["pbcopy"],
+        &["clip.exe"],
+        &["wl-copy"],
+        &["xclip", "-selection", "clipboard"],
+    ];
+    for t in tools {
+        if let Ok(mut c) = Command::new(t[0])
+            .args(&t[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut i) = c.stdin.take() {
+                let _ = std::io::Write::write_all(&mut i, text.as_bytes());
+            }
+            let _ = c.wait();
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
