@@ -6,7 +6,7 @@ T=$(cd "$(mktemp -d)" && pwd -P); trap 'rm -rf "$T"' EXIT   # resolved path: age
 export HOME=$T/home CLA_ROOT=$T/home/acc CODEX_HOME=$T/home/.codex AI_PROVIDERS=$T/cfg/providers AI_ACCOUNTS=$T/home/.ai-accounts
 mkdir -p "$HOME" "$CLA_ROOT/one/usage" "$CLA_ROOT/two/usage" "$CODEX_HOME/sessions/2026/01/01" \
   "$HOME/.gemini/antigravity-cli" "$HOME/repo/a" "$HOME/repo/b"
-. "$REPO/lib/core.sh"; . "$REPO/lib/trust.sh"; . "$REPO/lib/failover.sh"; for f in "$REPO"/plugins/*.sh; do . "$f"; done
+. "$REPO/lib/core.sh"; . "$REPO/lib/trust.sh"; . "$REPO/lib/failover.sh"; . "$REPO/lib/plugins.sh"; for f in "$REPO"/plugins/*.sh; do . "$f"; done
 fails=0
 ok() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
 plain() { sed $'s/\033\\[[0-9;]*m//g'; }
@@ -321,5 +321,110 @@ ok "default: ai pick skips it"         '[ "$(echo q | PATH=/usr/bin:/bin ai_main
 ok "default: claude/<account> valid"   '_ai_default_ok claude/one'
 _ai_put dflt; ok "default: gone -> picker" '[ "$(echo q | PATH=/usr/bin:/bin ai_main 2>/dev/null)" = "" ]'
 _ai_default - >/dev/null; ok "default: cleared" '[ ! -e "$AI_FO_ORDER.default" ]'
+
+# ── user plugins ──
+export AI_LAUNCHER_NO_UPDATE_CHECK=1
+PL=${AI_PROVIDERS%/*}/plugins
+mkplug() { mkdir -p "$PL/$1"; printf '#!/bin/sh\n%s\n' "$2" > "$PL/$1/plugin"; chmod +x "$PL/$1/plugin"; case $1 in slow|off) ;; *) "$PL/$1/plugin" rows >/dev/null 2>&1 ;; esac; }  # warm: macOS scans a new script on first run
+mkplug good 'case $1 in rows) printf "section\tGOOD STUFF\na\tAlpha\tready\n  \tdetail one\nb\tBeta\tidle\njunk\n" ;; do) echo "did $2"; echo oops >&2 ;; launch) shift; echo "launch $* in $AI_PLUGIN_DIR at $PWD" ;; esac'
+mkplug slow "sleep 31$$"  # pid in the number: other test runs' sleeps cannot match
+mkplug bad 'exit 1'
+mkplug off "touch $T/off.ran; printf 'section\tOFF\n'"; : > "$PL/off/.off"
+mkplug empty 'printf "section\tEMPTY\n"'
+mkplug x.y 'printf "section\tXY\n"'; mkdir -p "$PL/nofile"
+ok "plugins: names sorted, bad folders skipped" '[ "$(_ai_plugin_names | tr "\n" " ")" = "bad empty good off slow " ]'
+s=$(date +%s); prow=$(_ai_rows); took=$(( $(date +%s) - s ))
+ok "plugins: sections in name order" '[ "$(echo "$prow" | cut -f3 | plain | grep -o "bad: plugin failed\|EMPTY\|GOOD STUFF\|off · off\|slow: plugin failed" | tr "\n" "|")" = "bad: plugin failed|EMPTY|GOOD STUFF|off · off|slow: plugin failed|" ]'
+ok "plugins: a hung plugin times out fast" '[ $took -lt 5 ]'
+sleep 1
+ok "plugins: timeout kills the child tree" '! ps -A -o command | grep -q "^sleep 31$$\$"'
+ok "plugins: entries carry plugin:<name> and id" '[ "$(echo "$prow" | grep "^plugin:good" | cut -f2 | tr "\n" " ")" = "a b " ]'
+ok "plugins: detail line under its entry, not selectable" '[ "$(echo "$prow" | grep -A1 "^plugin:good${TAB}a${TAB}" | line 2 | cut -f1,2)" = "$TAB" ] && echo "$prow" | grep -A1 "^plugin:good${TAB}a${TAB}" | line 2 | grep -q "detail one"'
+ok "plugins: junk lines ignored" '! echo "$prow" | grep -q junk'
+ok "plugins: zero entries says so" 'echo "$prow" | grep -A1 EMPTY | line 2 | plain | grep -q "no entries"'
+ok "plugins: an off plugin is never run" '[ ! -e "$T/off.ran" ]'
+FZ=$T/pfz; rm -f "$FZ"
+pick() { fzf() { cat >/dev/null; [ -e "$FZ" ] && return 1; : > "$FZ"; printf "%s\n%s\n" "${KEY:-}" "$PICK"; }; cd "$HOME/repo/a"; ai_main "$@"; }
+ok "plugins: picking an entry runs plugin launch" '[ "$(PICK="plugin:good${TAB}a${TAB}x" pick pick --y 2>&1)" = "launch a --y in $PL/good at $HOME/repo/a" ]'
+rm -f "$FZ"
+ok "plugins: header rows do nothing" '[ -z "$(PICK="${TAB}${TAB}GOOD STUFF" pick pick 2>&1)" ]'
+rm -f "$FZ"
+ok "plugins: an off plugin never launches" '[ "$(PICK="plugin:off${TAB}a${TAB}x" pick pick 2>&1 | grep -c launch)" = 0 ] && [ ! -e "$T/off.ran" ]'
+cp "$AI_PROVIDERS" "$T/prov.bak"
+for k in team edit delete; do rm -f "$FZ"
+  ok "plugins: $k key on a plugin row does nothing" '[ "$(KEY=$k PICK="plugin:good${TAB}a${TAB}x" pick pick 2>&1 | grep -c launch)" = 0 ]'; done
+rm -f "$FZ"; ok "plugins: header row + team key just redraws" '[ -z "$(KEY=team PICK="${TAB}${TAB}GOOD STUFF" pick pick 2>&1)" ]'
+ok "plugins: providers file untouched by those keys" 'cmp -s "$AI_PROVIDERS" "$T/prov.bak" && ! grep -q "plugin:" "$AI_PROVIDERS"'
+rm -f "$FZ"
+mkplug multi 'printf "a\tAlpha\ts1\ts2\tS3\n  \td-a\nb d\tBad\tx\n  \td-dropped\nc\tCee\n"'
+mrow=$(_ai_plugin_rows multi | plain)
+ok "plugins: extra tab fields join into status" 'echo "$mrow" | grep -q "Alpha.*s1 s2 S3"'
+ok "plugins: detail after an invalid id is dropped" '! echo "$mrow" | grep -q d-dropped && echo "$mrow" | grep -q d-a && echo "$mrow" | grep -q Cee'
+rm -rf "$PL/multi"
+mkplug sec 'printf "a\tAlpha\nsection\tX\nb\tBeta\n"'
+mkplug crl 'printf "a\tAl\033[31mpha\001\tst\r\n  \td\033[1mx\r\n"'
+srow=$(_ai_plugin_rows sec | plain); crow=$(_ai_plugin_rows crl)
+ok "plugins: a later section line is ignored" '! echo "$srow" | grep -q "^plugin:sec${TAB}section" && echo "$srow" | grep -q Beta'
+ok "plugins: CR and control chars stripped" 'echo "$crow" | plain | grep -q "Al\[31mpha" && ! echo "$crow" | grep -q "$(printf "\r")" && ! echo "$crow" | grep -q "$(printf "\001")"'
+rm -rf "$PL/sec" "$PL/crl"
+mkdir -p "$T/src/myp" "$T/src/noplug" "$T/keepplug"; printf '#!/bin/sh\necho mine\n' > "$T/src/myp/plugin"; chmod +x "$T/src/myp/plugin"
+AI() { "$REPO/bin/ai" "$@"; }
+ok "plugin add: local folder" 'AI plugin add "$T/src/myp/" >/dev/null 2>&1 && [ -x "$PL/myp/plugin" ] && [ ! -e "$PL/myp/.source" ]'
+mkdir -p "$T/src/real"; cp "$T/src/myp/plugin" "$T/src/real/"; ln -s real "$T/src/lnkp"
+ok "plugin add: symlinked folder copies contents" 'AI plugin add "$T/src/lnkp" >/dev/null 2>&1 && [ -d "$PL/lnkp" ] && [ ! -L "$PL/lnkp" ] && [ -x "$PL/lnkp/plugin" ]; rm -rf "$PL/lnkp"'
+echo changed > "$T/src/myp/plugin"
+ok "plugin add: refuses to overwrite" '! AI plugin add "$T/src/myp" >/dev/null 2>&1 && grep -q mine "$PL/myp/plugin"'
+ok "plugin add: refuses a folder without plugin" '! AI plugin add "$T/src/noplug" >/dev/null 2>&1 && [ ! -e "$PL/noplug" ]'
+ok "plugin add: bundled cliproxy" 'AI plugin add cliproxy >/dev/null 2>&1 && [ -x "$PL/cliproxy/plugin" ]'
+mkdir -p "$T/src/ran"; printf '#!/bin/sh\ntouch "%s/ran.rows"\n' "$T" > "$T/src/ran/plugin"; chmod +x "$T/src/ran/plugin"
+ok "plugin add: runs rows once at install" 'AI plugin add "$T/src/ran" >/dev/null 2>&1 && [ -e "$T/ran.rows" ]'
+mkdir -p "$T/src/bad.name"; cp "$T/src/ran/plugin" "$T/src/bad.name/"
+ok "plugin add: folder basename with a dot refused" '! AI plugin add "$T/src/bad.name" >/dev/null 2>&1 && ! AI plugin add . >/dev/null 2>&1 && ! AI plugin add .. >/dev/null 2>&1'
+ok "plugin add: folder named like owner/repo wins over git" 'mkdir -p "$T/wd/own/repo" && cp "$T/src/ran/plugin" "$T/wd/own/repo/" && (cd "$T/wd" && AI plugin add own/repo >/dev/null 2>&1) && [ -x "$PL/repo/plugin" ] && [ ! -e "$PL/repo/.source" ]'
+ok "plugin add: ssh refused" '[ "$(AI plugin add git@github.com:o/r.git 2>&1)" = "use an https:// URL" ] && [ "$(AI plugin add ssh://h/o/r 2>&1)" = "use an https:// URL" ]'
+ok "plugin add: unusable source refused" '! AI plugin add "no such/thing" >/dev/null 2>&1 && ! AI plugin add a/b/c >/dev/null 2>&1 && ! AI plugin add http://x/y >/dev/null 2>&1 && ! AI plugin add nothere >/dev/null 2>&1'
+ok "plugin update: needs .source and .git" 'mkdir -p "$PL/ran/.git" && ! AI plugin update ran >/dev/null 2>&1 && rmdir "$PL/ran/.git" && echo u > "$PL/ran/.source" && ! AI plugin update ran >/dev/null 2>&1; rm -f "$PL/ran/.source"'
+ok "plugin add: bad names refused" '! AI plugin add "$T/src/myp" ../x >/dev/null 2>&1 && ! AI plugin add "$T/src/myp" a/b >/dev/null 2>&1 && ! AI plugin add "$T/src/myp" "a b" >/dev/null 2>&1 && [ ! -e "${PL%/*}/x" ] && [ ! -e "$PL/a" ] && [ ! -e "$PL/a b" ]'
+ok "plugin: other commands refuse bad names" '! AI plugin rm ../plugins <<<y >/dev/null 2>&1 && ! AI plugin off a/b >/dev/null 2>&1 && ! AI plugin do "../x" y >/dev/null 2>&1 && [ -d "$PL" ]'
+if has git; then
+  G=$T/gsrc; git init -q "$G"; printf '#!/bin/sh\necho v1\n' > "$G/plugin"; chmod +x "$G/plugin"
+  git -C "$G" add plugin; git -C "$G" -c user.email=t@example.com -c user.name=t commit -qm v1
+  git clone -q --bare "$G" "$T/g.git"
+  ok "plugin add: git url writes .source" 'AI plugin add "file://$T/g.git" gp >/dev/null 2>&1 && [ "$(cat "$PL/gp/.source")" = "file://$T/g.git" ] && grep -q v1 "$PL/gp/plugin"'
+  printf '#!/bin/sh\necho v2\n' > "$G/plugin"; git -C "$G" -c user.email=t@example.com -c user.name=t commit -qam v2; git -C "$G" push -q "$T/g.git" HEAD 2>/dev/null
+  ok "plugin update: pulls" 'AI plugin update gp >/dev/null 2>&1 && grep -q v2 "$PL/gp/plugin"'
+  ok "plugin add: git name from url with trailing slash" 'AI plugin add "file://$T/g.git/" >/dev/null 2>&1 && [ -x "$PL/g/plugin" ]; rm -rf "$PL/g"'
+fi
+ok "plugin off/on writes .off" 'AI plugin off myp >/dev/null && [ -e "$PL/myp/.off" ] && AI plugin on myp >/dev/null && [ ! -e "$PL/myp/.off" ]'
+mkdir -p "$PL/usr"; printf '#!/bin/sh\n:\n' > "$PL/usr/plugin"; chmod +x "$PL/usr/plugin"; echo "https://bob:s3cret@example.com/x.git" > "$PL/usr/.source"
+ok "plugin ls: userinfo hidden in source" '! AI plugin ls 2>&1 | grep -q s3cret && AI plugin ls 2>&1 | grep -q "https://example.com/x.git"'
+rm -rf "$PL/usr"
+ok "plugin ls: on/off" 'AI plugin ls 2>&1 | plain | grep "^off " | grep -q off && AI plugin ls 2>&1 | plain | grep "^good " | grep -q "GOOD STUFF"'
+out=$(AI plugin do good x 2>&1)
+ok "plugin do: captures stdout and stderr" 'case $out in *"did x"*oops*) true;; *) false;; esac'
+s=$(date +%s); AI_PLUGIN_DO_TIMEOUT=1 AI plugin do slow x >/dev/null 2>&1; dorc=$?; took=$(( $(date +%s) - s ))
+ok "plugin do: killed on timeout" '[ $dorc != 0 ] && [ $took -lt 4 ]'
+ok "plugin do: off plugin refused" '! AI plugin do off x >/dev/null 2>&1 && [ ! -e "$T/off.ran" ]'
+ok "plugin rm: n keeps it" '! AI plugin rm myp <<<n >/dev/null 2>&1; [ -d "$PL/myp" ]'
+ok "plugin rm: y removes it" 'AI plugin rm myp <<<y >/dev/null 2>&1 && [ ! -e "$PL/myp" ]'
+ok "plugin rm: AI_YES=1 skips the ask" 'AI_YES=1 AI plugin rm cliproxy </dev/null >/dev/null 2>&1 && [ ! -e "$PL/cliproxy" ]'
+touch "$T/keepplug/plugin"; ln -s "$T/keepplug" "$PL/lnk"
+ok "plugin rm: a link drops only the link" 'AI_YES=1 AI plugin rm lnk </dev/null >/dev/null 2>&1 && [ ! -L "$PL/lnk" ] && [ -f "$T/keepplug/plugin" ]'
+ok "default: plugin id accepted" '_ai_default plugin:good/a >/dev/null && [ "$(cat "$AI_FO_ORDER.default")" = plugin:good/a ]'
+ok "default: plugin launches with args" '[ "$(cd "$HOME/repo/a"; ai_main --z 2>&1)" = "launch a --z in $PL/good at $HOME/repo/a" ]'
+ok "default: bad plugin ids refused" '! _ai_default_ok plugin:nope/a && ! _ai_default_ok plugin:good/ && ! _ai_default_ok "plugin:../good/a" && ! _ai_default_ok "plugin:good/a b"'
+: > "$PL/good/.off"; : > "$FZ"   # the picker stub cancels at once
+ok "default: off plugin -> picker" '[ -z "$(pick 2>&1)" ]'
+rm -f "$PL/good/.off"; mv "$PL/good" "$T/good.away"
+ok "default: removed plugin -> picker" '[ -z "$(pick 2>&1)" ]'
+mv "$T/good.away" "$PL/good"; _ai_default - >/dev/null
+ok "failover never lists plugins" '! _fo_list | grep -q plugin'
+
+o=$(_ai_plugin_add https://tokentok@127.0.0.1:9/x.git leak 2>&1); rm -rf "$PL/leak"
+ok "plugins: add never prints the URL token" '! echo "$o" | grep -q tokentok && echo "$o" | grep -q "git clone failed"'
+ok "plugins: sanitizer strips userinfo anywhere" '[ "$(echo "x '"'"'https://u:tokentok@h/p'"'"' y" | _ai_plugin_nouser)" = "x '"'"'https://h/p'"'"' y" ]'
+
+# the bundled cliproxy plugin has its own suite (fake proxy, fake HOME)
+ok "cliproxy plugin suite" 'bash "$REPO/tests/cliproxy.sh" >/dev/null 2>&1'
 
 echo; if [ $fails -gt 0 ]; then echo "$fails failed"; exit 1; else echo "all passed"; fi

@@ -114,8 +114,10 @@ or a `curl` shim on PATH returning fixture JSON).
 
 - [ ] Tests first: no config → `rows` creates `config` (mode 600) and shows key hint; proxy down →
   `proxy not running — start: brew services start cliproxyapi`; up + keys → entry `all` plus detail
-  lines: one per provider with merged bars (avg %, soonest reset, `n accts`) and one per model
-  (`<model>  <n> req  <tokens> tok`); `rows` answers < 2 s from cache while refresh runs; cache
+  lines: one per provider with merged bars (avg %, soonest reset, `n accts`) and per provider the summed
+  request counters from `/credentials` (`<n> req · <f> failed`) and the provider's model names
+  (`/credentials/models` or `/v1/models`, comma list, truncated); NO per-model token counts (Task 1:
+  CLIProxyAPI has no aggregate; never read `usage/queue`, it drains events); `rows` answers < 2 s from cache while refresh runs; cache
   TTL 60 s; key never in any output; `launch all --foo` execs `claude --foo` with
   `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`
   and no `CLAUDE_CONFIG_DIR` (fake `claude` on PATH dumps env); launch with proxy down exits 1 with
@@ -132,4 +134,9 @@ or a `curl` shim on PATH returning fixture JSON).
 - [ ] Sonnet whole-branch review; fix findings.
 - [ ] Screenshots (fake data, fake proxy, `alice@example.com`): TUI home with failover section +
   CLIPROXY section with merged usage; plugin action menu; bash picker with plugin section. Attach to PR.
+- [ ] PR body has a "How to use" journey, one screenshot per step: (1) `ai plugin add cliproxy`
+  output; (2) set keys / config; (3) TUI home showing the CLIPROXY section with merged usage;
+  (4) `a` action menu (start/stop proxy); (5) Enter opens the "all accounts" tab running Claude Code;
+  (6) turn the plugin off / on; (7) `ai plugin add <git url>` for any other plugin. Plus a short GIF
+  of steps 3-5 if feasible.
 - [ ] Commit, push branch, open PR.

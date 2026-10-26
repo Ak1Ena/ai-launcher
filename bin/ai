@@ -10,5 +10,6 @@ AI_HOME=$(cd -P "$(dirname "$src")/.." && pwd)
 . "$AI_HOME/lib/core.sh"
 . "$AI_HOME/lib/trust.sh"
 . "$AI_HOME/lib/failover.sh"
+. "$AI_HOME/lib/plugins.sh"
 for f in "$AI_HOME"/plugins/*.sh; do [ -e "$f" ] && . "$f"; done
 ai_main "$@"

@@ -1,1 +1,10 @@
 url=http://127.0.0.1:8317
+key_env=CLIPROXY_API_KEY        # env var holding the proxy's client key
+# key=...                       # or the client key itself (this file stays mode 600)
+mgmt_key_env=CLIPROXY_MGMT_KEY  # env var holding the management key (merged usage)
+# mgmt_key=...                  # or the management key itself
+# start_cmd=...                 # start/stop commands when brew has no cliproxyapi
+# stop_cmd=...
+mode=failover                   # failover: one account until it is limited, then the next (same chat, no restart)
+                                # balance: spread chats across accounts, each chat stays on one
+                                # switch with: ai plugin do cliproxy mode-balance (or mode-failover), or TUI a

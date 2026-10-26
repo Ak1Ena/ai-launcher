@@ -15,6 +15,8 @@ pub struct Paths {
     pub fo_state: PathBuf,
     pub codex_home: PathBuf,
     pub cooldown: Duration,
+    /// user plugins: `$AI_PLUGINS`, else `plugins` beside the providers file
+    pub plugins: PathBuf,
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -49,6 +51,8 @@ impl Paths {
             .unwrap_or(18000);
         let ai_accounts = env_path("AI_ACCOUNTS").unwrap_or_else(|| home.join(".ai-accounts"));
         Paths {
+            plugins: env_path("AI_PLUGINS")
+                .unwrap_or_else(|| providers.parent().unwrap_or(Path::new(".")).join("plugins")),
             cla_root: env_path("CLA_ROOT").unwrap_or_else(|| home.join(".claude-accounts")),
             fo_order: env_path("AI_FO_ORDER").unwrap_or_else(|| {
                 providers
@@ -171,6 +175,8 @@ pub enum Kind {
     Claude,
     Codex,
     Other,
+    /// a plugin's entry (`plugin:<name>/<id>`), or its state line (`plugin:<name>`)
+    Plugin,
 }
 
 /// Something the home list can start: a cla account (`claude/<name>`) or a provider.
@@ -185,7 +191,7 @@ pub struct Entry {
 
 impl Entry {
     pub fn in_failover(&self) -> bool {
-        self.kind != Kind::Other
+        matches!(self.kind, Kind::Claude | Kind::Codex)
     }
 }
 
@@ -625,7 +631,7 @@ pub fn remove_claude_account(paths: &Paths, name: &str) -> std::io::Result<bool>
 }
 
 /// Removes a folder, or only the link when `p` is a symlink (remove_dir_all never follows links).
-fn remove_entry(p: &Path) -> std::io::Result<()> {
+pub fn remove_entry(p: &Path) -> std::io::Result<()> {
     if p.symlink_metadata()?.file_type().is_symlink() {
         fs::remove_file(p)
     } else {
@@ -703,8 +709,10 @@ mod tests {
             e("claude/a", Kind::Claude),
             e("g", Kind::Other),
             e("n", Kind::Claude),
+            e("plugin:x/all", Kind::Plugin),
         ];
-        let o = order_from("n\toff\ngone\ton\n", &es);
+        // a plugin entry is never a member, even when the saved order names it
+        let o = order_from("n\toff\ngone\ton\nplugin:x/all\ton\n", &es);
         assert_eq!(
             o,
             vec![
@@ -729,6 +737,7 @@ mod tests {
             fo_state: root.join("state"),
             codex_home: root.join("home/.codex"),
             cooldown: Duration::from_secs(60),
+            plugins: root.join("cfg/plugins"),
         }
     }
 

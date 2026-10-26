@@ -5,6 +5,7 @@ use crate::config::{self, Entry, Kind, Paths};
 use crate::failover::{self, Split};
 use crate::form::{Confirm, Form, Outcome, Purpose};
 use crate::pane::Pane;
+use crate::plugins;
 use crate::ui::{Button, Hits};
 use crate::usage::{self, Usage};
 use crate::wrr;
@@ -69,6 +70,54 @@ pub struct Row {
     pub usage: Usage,
     /// round-robin weight, for members
     pub weight: u32,
+    /// a plugin entry's status text and the detail lines under it
+    pub status: String,
+    pub details: Vec<String>,
+}
+
+/// One installed plugin as home shows it. Its `rows` run on a thread; the last good ones stay
+/// on screen meanwhile.
+pub struct PluginState {
+    pub plugin: plugins::Plugin,
+    /// None until the first `rows` answers; Some(None) when it failed
+    pub rows: Option<Option<plugins::Rows>>,
+    /// `plugin actions`: (action, label)
+    pub actions: Vec<(String, String)>,
+    loading: bool,
+    /// a `plugin do` runs (one at a time)
+    doing: bool,
+    /// `rows` ran once this session: later runs get the short timeout
+    ran: bool,
+}
+
+impl PluginState {
+    /// The plugins window's STATUS cell.
+    pub fn status(&self) -> &'static str {
+        match &self.rows {
+            _ if !self.plugin.on => "off",
+            None => "loading…",
+            Some(None) => "failed",
+            Some(Some(_)) => "ok",
+        }
+    }
+
+    /// The section header: the plugin's own title, else its folder name.
+    pub fn title(&self) -> String {
+        match &self.rows {
+            Some(Some(r)) if self.plugin.on && !r.title.is_empty() => r.title.clone(),
+            _ => self.plugin.name.clone(),
+        }
+    }
+}
+
+/// What a plugin thread sends back.
+enum PluginMsg {
+    Rows(String, Option<plugins::Rows>),
+    Actions(String, Vec<(String, String)>),
+    /// a `do` ended: the line for the flash bar
+    Done(String, String),
+    /// an add or update ended: the line for the flash bar
+    Changed(String),
 }
 
 /// An Auto launch waiting for the model's pick.
@@ -120,6 +169,12 @@ pub struct App {
     /// newer version found on npm
     pub update: Option<String>,
     update_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// installed plugins by name; their rows come after the CLIs on home
+    pub plugins: Vec<PluginState>,
+    /// the plugins window, open: its selected plugin (an index into `plugins`)
+    pub plugins_win: Option<usize>,
+    plugin_tx: std::sync::mpsc::Sender<PluginMsg>,
+    plugin_rx: std::sync::mpsc::Receiver<PluginMsg>,
 }
 
 impl App {
@@ -134,6 +189,7 @@ impl App {
 
     pub fn with_paths(paths: Paths, args: Vec<String>) -> App {
         let mod_dir = failover::install_mod(&paths);
+        let (plugin_tx, plugin_rx) = std::sync::mpsc::channel();
         let mut app = App {
             failover: config::failover_on(&paths),
             wrr: false,
@@ -159,8 +215,13 @@ impl App {
             last_click: None,
             update: None,
             update_rx: None,
+            plugins: Vec::new(),
+            plugins_win: None,
+            plugin_tx,
+            plugin_rx,
         };
         app.refresh();
+        app.reload_plugins();
         app
     }
 
@@ -194,6 +255,26 @@ impl App {
         for e in entries.into_iter().filter(|e| !e.in_failover()) {
             rows.push(self.row(e, None, false));
         }
+        let mut states = Vec::new();
+        for p in plugins::list(&self.paths) {
+            let old = self.plugins.iter().position(|s| s.plugin.name == p.name);
+            states.push(match old {
+                Some(i) => PluginState {
+                    plugin: p,
+                    ..self.plugins.swap_remove(i)
+                },
+                None => PluginState {
+                    plugin: p,
+                    rows: None,
+                    actions: Vec::new(),
+                    loading: false,
+                    doing: false,
+                    ran: false,
+                },
+            });
+        }
+        self.plugins = states;
+        rows.extend(self.plugins.iter().flat_map(plugin_rows));
         self.rows = rows;
         self.failover = config::failover_on(&self.paths);
         self.wrr = config::wrr_on(&self.paths);
@@ -205,11 +286,55 @@ impl App {
             .min(self.rows.len().saturating_sub(1));
     }
 
-    /// Opens the default entry in a tab, if it still exists.
+    /// Opens the default entry in a tab, if it still exists (a plugin's: installed and on;
+    /// its rows may not have loaded yet).
     pub fn open_default(&mut self) {
-        if let Some(e) = self.entry(&self.default.clone()) {
-            self.open(&e.id);
+        let id = self.default.clone();
+        if self.entry(&id).is_some_and(|e| e.kind != Kind::Plugin)
+            || plugins::resolve(&self.paths, &id).is_some()
+        {
+            self.open(&id);
         }
+    }
+
+    /// Runs `rows` (then `actions`) of every plugin that is on, each on its own thread, unless
+    /// one already runs. Results arrive in `tick`.
+    pub fn reload_plugins(&mut self) {
+        for s in self
+            .plugins
+            .iter_mut()
+            .filter(|s| s.plugin.on && !s.loading)
+        {
+            s.loading = true;
+            let timeout = if s.ran {
+                plugins::ROWS_TIMEOUT
+            } else {
+                plugins::FIRST_TIMEOUT
+            };
+            s.ran = true;
+            let (tx, name, dir) = (
+                self.plugin_tx.clone(),
+                s.plugin.name.clone(),
+                s.plugin.dir.clone(),
+            );
+            std::thread::spawn(move || {
+                let rows = plugins::run(&dir, &["rows"], timeout)
+                    .ok()
+                    .map(|t| plugins::parse_rows(&t));
+                let ok = rows.is_some();
+                let _ = tx.send(PluginMsg::Rows(name.clone(), rows));
+                if ok {
+                    let actions = plugins::run(&dir, &["actions"], timeout)
+                        .map(|t| plugins::parse_actions(&t))
+                        .unwrap_or_default();
+                    let _ = tx.send(PluginMsg::Actions(name, actions));
+                }
+            });
+        }
+    }
+
+    fn plugin(&mut self, name: &str) -> Option<&mut PluginState> {
+        self.plugins.iter_mut().find(|s| s.plugin.name == name)
     }
 
     fn row(&self, entry: Entry, priority: Option<usize>, on: bool) -> Row {
@@ -224,7 +349,7 @@ impl App {
             Kind::Codex => usage::codex(
                 &config::account_dir(&self.paths, &entry).unwrap_or(self.paths.codex_home.clone()),
             ),
-            Kind::Other => Usage::default(),
+            Kind::Other | Kind::Plugin => Usage::default(),
         };
         let limited = priority.and_then(|_| config::limited_left(&self.paths, &entry.id));
         Row {
@@ -234,6 +359,8 @@ impl App {
             limited,
             usage,
             weight: 1,
+            status: String::new(),
+            details: Vec::new(),
         }
     }
 
@@ -242,8 +369,11 @@ impl App {
     }
 
     pub fn label(&self, id: &str) -> String {
+        if let Some((name, None)) = plugins::split_id(id) {
+            return format!("plugin {name}");
+        }
         match self.entry(id) {
-            Some(e) if id.starts_with("claude/") => e.label,
+            Some(e) if id.starts_with("claude/") || e.kind == Kind::Plugin => e.label,
             Some(e) => format!("{} ({id})", e.label),
             None => id.to_string(),
         }
@@ -254,6 +384,9 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) {
         if self.modal.is_some() {
             return self.modal_key(key);
+        }
+        if self.plugins_win.is_some() {
+            return self.plugins_win_key(key);
         }
         // alt-1..9 switch tabs from anywhere, even while typing in a CLI
         // (alt-← → are left to the CLI, where they jump words)
@@ -301,6 +434,11 @@ impl App {
 
     fn home_key(&mut self, key: KeyEvent) {
         let id = self.rows.get(self.selected).map(|r| r.entry.id.clone());
+        if let Some((name, eid)) = id.as_deref().and_then(plugins::split_id)
+            && self.plugin_key(name, eid.is_some(), key.code)
+        {
+            return self.refresh();
+        }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Char('q') => self.quit = true,
@@ -349,6 +487,8 @@ impl App {
             }
             KeyCode::Char('x') => self.close_tab(),
             KeyCode::Char('a') => self.modal = Some(Modal::Form(Form::add())),
+            KeyCode::Char('p') => self.modal = Some(Modal::Form(Form::add_plugin())),
+            KeyCode::Char('P') => self.plugins_win = Some(0),
             KeyCode::Char('e') => self.start_edit(),
             KeyCode::Char('d') => self.start_delete(),
             KeyCode::Tab => {
@@ -409,6 +549,129 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Keys that mean something else on a plugin's row (`entry`: an entry, not its state line).
+    /// Returns whether the key was handled here.
+    fn plugin_key(&mut self, name: &str, entry: bool, code: KeyCode) -> bool {
+        let Some(s) = self.plugin(name) else {
+            return false;
+        };
+        let (on, dir) = (s.plugin.on, s.plugin.dir.clone());
+        match code {
+            KeyCode::Enter if !entry => self.say(if on {
+                format!("{name} has nothing to open right now.")
+            } else {
+                format!("{name} is off: press o to turn it on.")
+            }),
+            // a state line can't be the default: nothing would open
+            KeyCode::Char('*') if !entry => {}
+            KeyCode::Char('a') => self.plugin_actions(name),
+            KeyCode::Char('o') => self.toggle_plugin(name),
+            KeyCode::Char('u') if !plugins::from_git(&dir) => self.say(format!(
+                "{name} was not installed from git: nothing to update."
+            )),
+            KeyCode::Char('u') => {
+                let (paths, name) = (self.paths.clone(), name.to_string());
+                self.say(format!("Updating {name}…"));
+                self.in_background(move || match plugins::update(&paths, &name) {
+                    Ok(line) => format!("Updated {name}: {line}"),
+                    Err(e) => format!("Could not update {name}: {e}"),
+                });
+            }
+            KeyCode::Char('d') => {
+                self.modal = Some(Modal::Confirm(Confirm {
+                    id: format!("plugin:{name}"),
+                    what: format!(
+                        "Its folder {} is deleted for good (a linked folder loses only the link). Its open tabs close.",
+                        dir.display()
+                    ),
+                }))
+            }
+            KeyCode::Char('e') => self.say(format!(
+                "A plugin is edited in its folder: {}",
+                dir.display()
+            )),
+            _ => return false,
+        }
+        true
+    }
+
+    /// The plugins window: the selected plugin's keys are its home section's keys.
+    fn plugins_win_key(&mut self, key: KeyEvent) {
+        let last = self.plugins.len().saturating_sub(1);
+        let sel = self.plugins_win.unwrap_or(0).min(last);
+        let name = self.plugins.get(sel).map(|s| s.plugin.name.clone());
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.plugins_win = None,
+            KeyCode::Up | KeyCode::Char('k') => self.plugins_win = Some(sel.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => self.plugins_win = Some((sel + 1).min(last)),
+            KeyCode::Char('+' | 'p') => self.modal = Some(Modal::Form(Form::add_plugin())),
+            KeyCode::Enter | KeyCode::Char('a' | 'o' | 'u' | 'd') => {
+                if let Some(name) = name {
+                    let code = match key.code {
+                        KeyCode::Enter => KeyCode::Char('a'),
+                        c => c,
+                    };
+                    self.plugin_key(&name, false, code);
+                }
+            }
+            _ => {}
+        }
+        self.refresh();
+    }
+
+    /// Runs a plugin add or update on a thread (git may take a while); `job`'s line goes to
+    /// the flash bar, then plugins reload.
+    fn in_background(&self, job: impl FnOnce() -> String + Send + 'static) {
+        let tx = self.plugin_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(PluginMsg::Changed(job()));
+        });
+    }
+
+    fn toggle_plugin(&mut self, name: &str) {
+        let Some(on) = self.plugin(name).map(|s| s.plugin.on) else {
+            return;
+        };
+        match plugins::set_on(&self.paths, name, !on) {
+            Ok(()) => self.say(format!("{name} {}", if on { "off" } else { "on" })),
+            Err(e) => self.say(format!("Could not change {name}: {e}")),
+        }
+        self.refresh();
+        self.reload_plugins();
+    }
+
+    fn plugin_actions(&mut self, name: &str) {
+        let Some(s) = self.plugin(name) else { return };
+        if !s.plugin.on {
+            return self.say(format!("{name} is off: press o to turn it on."));
+        }
+        if s.actions.is_empty() {
+            return self.say(format!("{name} has no actions."));
+        }
+        let labels = s.actions.iter().map(|(_, l)| l.clone()).collect();
+        self.modal = Some(Modal::Form(Form::actions(name, labels)));
+    }
+
+    /// Runs `plugin do <action>` on a thread; its last output line goes to the flash bar, and
+    /// the plugin's rows reload after it.
+    fn run_do(&mut self, name: &str, action: &str) {
+        let tx = self.plugin_tx.clone();
+        let Some(s) = self.plugin(name) else { return };
+        if s.doing {
+            return self.say(format!("{name} is busy."));
+        }
+        s.doing = true;
+        let (name, dir, action) = (name.to_string(), s.plugin.dir.clone(), action.to_string());
+        self.say(format!("{name}: {action}…"));
+        std::thread::spawn(move || {
+            let line = match plugins::run(&dir, &["do", &action], plugins::DO_TIMEOUT) {
+                Ok(out) => plugins::last_line(&out).unwrap_or_else(|| format!("{action}: done")),
+                Err(e) => format!("{action} failed: {e}"),
+            };
+            let _ = tx.send(PluginMsg::Done(name, line));
+        });
     }
 
     /// Turns one account on or off for failover. Off accounts stay in the list but are skipped.
@@ -498,7 +761,24 @@ impl App {
 
     // ── add / edit / delete ───────────────────────────────
 
+    /// A plugin's row: its `e` / `d` (a hint, or delete the whole plugin), never the providers file.
+    fn plugin_row_key(&mut self, code: KeyCode) -> bool {
+        let Some(name) = self
+            .rows
+            .get(self.selected)
+            .and_then(|r| plugins::split_id(&r.entry.id))
+            .map(|(n, _)| n.to_string())
+        else {
+            return false;
+        };
+        self.plugin_key(&name, true, code);
+        true
+    }
+
     fn start_edit(&mut self) {
+        if self.plugin_row_key(KeyCode::Char('e')) {
+            return;
+        }
         let Some(r) = self.rows.get(self.selected) else {
             return;
         };
@@ -521,6 +801,9 @@ impl App {
     }
 
     fn start_delete(&mut self) {
+        if self.plugin_row_key(KeyCode::Char('d')) {
+            return;
+        }
         let Some(r) = self.rows.get(self.selected) else {
             return;
         };
@@ -562,6 +845,28 @@ impl App {
     fn save_form(&mut self, f: &Form) -> Result<(), String> {
         let (label, command) = (f.get("Label"), f.get("Command"));
         match &f.purpose {
+            Purpose::AddPlugin => {
+                let (paths, source) = (self.paths.clone(), plugins::expand_home(&f.get("Source")));
+                self.say(format!("Installing {}…", plugins::hide_userinfo(&source)));
+                self.in_background(move || match plugins::add(&paths, &source) {
+                    Ok(name) => format!(
+                        "Installed plugin {name} from {}.",
+                        plugins::hide_userinfo(&source)
+                    ),
+                    Err(e) => format!("Could not install {}: {e}", plugins::hide_userinfo(&source)),
+                });
+            }
+            Purpose::Action(name) => {
+                let action = self
+                    .plugins
+                    .iter()
+                    .find(|s| &s.plugin.name == name)
+                    .and_then(|s| s.actions.get(f.index("Action")))
+                    .map(|(a, _)| a.clone());
+                if let Some(a) = action {
+                    self.run_do(&name.clone(), &a);
+                }
+            }
             Purpose::Model => {
                 let model = f.get("Model");
                 if !config::valid_model(&model) {
@@ -575,6 +880,9 @@ impl App {
                 });
             }
             Purpose::Edit(id) => {
+                if plugins::split_id(id).is_some() {
+                    return Err("A plugin is edited in its own folder.".into());
+                }
                 if command.is_empty() {
                     return Err("The command can't be empty.".into());
                 }
@@ -621,6 +929,23 @@ impl App {
     }
 
     fn delete(&mut self, id: &str) {
+        if let Some((name, None)) = plugins::split_id(id) {
+            let prefix = format!("{id}/");
+            self.tabs.retain(|t| !t.member.starts_with(&prefix));
+            self.current = self.current.min(self.tabs.len().saturating_sub(1));
+            if self.tabs.is_empty() {
+                self.focus = Focus::Home;
+            }
+            match plugins::rm(&self.paths, name) {
+                Ok(()) => self.say(format!("Deleted plugin {name}.")),
+                Err(e) => self.say(format!("Could not delete {name}: {e}")),
+            }
+            return self.refresh();
+        }
+        // a plugin entry is never a providers line
+        if id.starts_with("plugin:") {
+            return;
+        }
         // its tabs close first (a stuck login is the usual one): dropping a pane ends its CLI
         self.tabs.retain(|t| t.member != id);
         self.current = self.current.min(self.tabs.len().saturating_sub(1));
@@ -684,6 +1009,7 @@ impl App {
                 }
                 entry.command.clone()
             }
+            Kind::Plugin => return,
         };
         self.next_handoff += 1;
         self.tabs.push(Tab {
@@ -734,6 +1060,17 @@ impl App {
             }
             return;
         }
+        if self.plugins_win.is_some() {
+            if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                if let Some((_, i)) = hits.plugin_rows.iter().find(|(r, _)| inside(r)) {
+                    self.plugins_win = Some(*i);
+                }
+                if let Some((_, name)) = hits.plugins.iter().find(|(r, _)| inside(r)) {
+                    self.toggle_plugin(&name.clone());
+                }
+            }
+            return;
+        }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
             if let Some((_, t)) = hits.closes.iter().find(|(r, _)| inside(r)) {
                 self.current = *t;
@@ -742,9 +1079,19 @@ impl App {
             if let Some((_, t)) = hits.tabs.iter().find(|(r, _)| inside(r)) {
                 return self.show_tab(*t);
             }
+            if let Some(name) = hits
+                .plugins
+                .iter()
+                .find(|(r, _)| inside(r))
+                .map(|(_, n)| n.clone())
+            {
+                return self.toggle_plugin(&name);
+            }
             if let Some((_, b)) = hits.buttons.iter().find(|(r, _)| inside(r)) {
                 match b {
                     Button::Add => self.modal = Some(Modal::Form(Form::add())),
+                    Button::AddPlugin => self.modal = Some(Modal::Form(Form::add_plugin())),
+                    Button::Plugins => self.plugins_win = Some(0),
                     Button::Edit => self.start_edit(),
                     Button::Delete => self.start_delete(),
                     Button::Failover => config::set_failover(&self.paths, !self.failover),
@@ -955,6 +1302,9 @@ impl App {
 
     fn launch(&mut self, t: usize, args: Vec<String>) {
         let id = self.tabs[t].member.clone();
+        if id.starts_with("plugin:") {
+            return self.launch_plugin(t, args);
+        }
         let Some(entry) = self.entry(&id) else {
             self.tabs[t].notice = Some(Notice::Error(format!("{id} is no longer in the list")));
             return;
@@ -1006,6 +1356,7 @@ impl App {
                     ));
                 }
             }
+            Kind::Plugin => {}
         }
         let (rows, cols) = self.pane_size;
         match Pane::spawn(&command, &args, &env, rows, cols) {
@@ -1020,8 +1371,74 @@ impl App {
         }
     }
 
+    /// A plugin tab: `<dir>/plugin launch <id>` in the PTY. Outside failover entirely: no
+    /// account folder, no failover mod, no handoff.
+    fn launch_plugin(&mut self, t: usize, args: Vec<String>) {
+        let id = self.tabs[t].member.clone();
+        let Some((p, eid)) = plugins::resolve(&self.paths, &id) else {
+            self.tabs[t].notice =
+                Some(Notice::Error(format!("{id} is off or no longer installed")));
+            return;
+        };
+        let exe = shell_quote(&p.dir.join("plugin").to_string_lossy());
+        // Windows has no exec bit: run it through Git Bash
+        let run = if cfg!(windows) { "bash" } else { "exec" };
+        let command = format!("{run} {exe} launch {}", shell_quote(&eid));
+        let env = vec![(
+            "AI_PLUGIN_DIR".to_string(),
+            Some(p.dir.to_string_lossy().into_owned()),
+        )];
+        let (rows, cols) = self.pane_size;
+        match Pane::spawn(&command, &args, &env, rows, cols) {
+            Ok(pane) => {
+                self.tabs[t].pane = Some(pane);
+                self.tabs[t].notice = None;
+                self.tabs[t].done = false;
+            }
+            Err(e) => {
+                self.tabs[t].notice = Some(Notice::Error(format!("could not start {id}: {e}")))
+            }
+        }
+    }
+
     /// Called every frame: notices CLIs that ended and runs due switches.
     pub fn tick(&mut self) {
+        let mut changed = false;
+        while let Ok(m) = self.plugin_rx.try_recv() {
+            changed = true;
+            match m {
+                PluginMsg::Rows(name, rows) => {
+                    if let Some(s) = self.plugin(&name) {
+                        s.loading = false;
+                        // a failure after good rows keeps them on screen
+                        if rows.is_some() || !matches!(s.rows, Some(Some(_))) {
+                            s.rows = Some(rows);
+                        }
+                    }
+                }
+                PluginMsg::Actions(name, actions) => {
+                    if let Some(s) = self.plugin(&name) {
+                        s.actions = actions;
+                    }
+                }
+                PluginMsg::Done(name, line) => {
+                    if let Some(s) = self.plugin(&name) {
+                        s.doing = false;
+                    }
+                    self.say(format!("{name}: {line}"));
+                    self.reload_plugins();
+                }
+                PluginMsg::Changed(line) => {
+                    self.say(line);
+                    // a new plugin needs its state before its rows can load
+                    self.refresh();
+                    self.reload_plugins();
+                }
+            }
+        }
+        if changed {
+            self.refresh();
+        }
         if let Some(v) = self.update_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.say(format!("Update v{v}: npm i -g ai-launcher"));
             self.update = Some(v);
@@ -1159,6 +1576,53 @@ impl App {
     }
 }
 
+/// A plugin's home rows: one per entry (`plugin:<name>/<id>`), or one state line
+/// (`plugin:<name>`) when it is off, loading, failed or empty, so its section is always reachable.
+fn plugin_rows(s: &PluginState) -> Vec<Row> {
+    let name = &s.plugin.name;
+    let row = |id: String, label: String, status: String, details: Vec<String>| Row {
+        entry: Entry {
+            id,
+            kind: Kind::Plugin,
+            label,
+            command: String::new(),
+        },
+        priority: None,
+        on: false,
+        limited: None,
+        usage: Usage::default(),
+        weight: 1,
+        status,
+        details,
+    };
+    let state = |text: String| {
+        vec![row(
+            format!("plugin:{name}"),
+            text,
+            String::new(),
+            Vec::new(),
+        )]
+    };
+    match &s.rows {
+        _ if !s.plugin.on => state(format!("{name} · off")),
+        None => state("loading…".into()),
+        Some(None) => state(format!("{name}: plugin failed")),
+        Some(Some(r)) if r.entries.is_empty() => state("no entries".into()),
+        Some(Some(r)) => r
+            .entries
+            .iter()
+            .map(|e| {
+                row(
+                    format!("plugin:{name}/{}", e.id),
+                    e.label.clone(),
+                    e.status.clone(),
+                    e.details.clone(),
+                )
+            })
+            .collect(),
+    }
+}
+
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
@@ -1226,6 +1690,7 @@ mod tests {
             ai_accounts: home.join("accts"),
             codex_home: home.join("codex"),
             cooldown: Duration::from_secs(60),
+            plugins: home.join("cfg/plugins"),
             providers,
             cla_root,
             home,
@@ -1913,5 +2378,517 @@ mod tests {
             1,
             "a default that no longer exists opens nothing"
         );
+    }
+
+    /// A plugin folder `<plugins>/<name>` whose `plugin` is this shell script.
+    #[cfg(unix)]
+    fn plugin_script(a: &App, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let d = a.paths.plugins.join(name);
+        fs::create_dir_all(&d).unwrap();
+        let p = d.join("plugin");
+        fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        plugins::tests::warm(&p);
+        d
+    }
+
+    const GOOD: &str = r#"case "$1" in
+rows) printf 'section\tGOOD\na\tAlpha\tready\n  \tdetail one\nb\tBeta\t\n' ;;
+actions) printf 'start\tstart it\n' ;;
+do) echo working; echo "started $2" ;;
+launch) echo "launched $2 $3"; sleep 1 ;;
+esac"#;
+
+    /// Ticks until `done` holds (5 s at most): plugin results arrive on threads.
+    fn settle(a: &mut App, done: impl Fn(&App) -> bool) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !done(a) && Instant::now() < end {
+            a.tick();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn label_of(a: &App, id: &str) -> String {
+        a.rows
+            .iter()
+            .find(|r| r.entry.id == id)
+            .map(|r| r.entry.label.clone())
+            .unwrap_or_default()
+    }
+
+    /// `app()` plus plugins: `good`, `bad` (fails), `slow` (hangs), `offp` (off; marks if run).
+    #[cfg(unix)]
+    fn plugin_app() -> App {
+        let a = app();
+        plugin_script(&a, "good", GOOD);
+        plugin_script(&a, "bad", "exit 1");
+        plugin_script(&a, "slow", "[ \"$1\" = warm ] || sleep 30");
+        let off = plugin_script(
+            &a,
+            "offp",
+            "[ \"$1\" = warm ] || touch \"$AI_PLUGIN_DIR/ran\"",
+        );
+        fs::write(off.join(".off"), "").unwrap();
+        // past the first run, so `slow` fails on the short timeout
+        let mut a = a;
+        a.refresh();
+        for s in &mut a.plugins {
+            s.ran = true;
+        }
+        a.reload_plugins();
+        a
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plugins_first_rows_get_the_long_timeout_later_ones_the_short() {
+        let mut a = app();
+        plugin_script(
+            &a,
+            "late",
+            "[ \"$1\" = rows ] && sleep 3 && printf 'x\\tX\\n'; true",
+        );
+        a.refresh();
+        a.reload_plugins();
+        settle(&mut a, |a| a.plugins.iter().all(|p| !p.loading));
+        assert_eq!(label_of(&a, "plugin:late/x"), "X", "first run waits");
+        a.reload_plugins();
+        settle(&mut a, |a| a.plugins.iter().all(|p| !p.loading));
+        assert!(
+            matches!(a.plugins[0].rows, Some(Some(_))),
+            "a later timeout keeps the last good rows"
+        );
+        let t = Instant::now();
+        // a later run is cut at 2 s: reload and time it
+        a.reload_plugins();
+        settle(&mut a, |a| a.plugins.iter().all(|p| !p.loading));
+        assert!(
+            t.elapsed() < Duration::from_millis(2900),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_and_delete_buttons_on_a_plugin_row_never_touch_the_providers_file() {
+        let mut a = plugin_app();
+        settle(&mut a, |a| ids(a).contains(&"plugin:good/a".to_string()));
+        let before = fs::read_to_string(&a.paths.providers).unwrap();
+        let hits = Hits {
+            buttons: vec![(r(5), Button::Edit), (r(6), Button::Delete)],
+            ..Hits::default()
+        };
+        select(&mut a, "plugin:good/a");
+        click(&mut a, &hits, 1, 5);
+        assert!(a.modal.is_none(), "no edit form for a plugin");
+        assert!(
+            a.flash
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("its folder")),
+            "{:?}",
+            a.flash
+        );
+        select(&mut a, "plugin:good/a");
+        click(&mut a, &hits, 1, 6);
+        let Some(Modal::Confirm(c)) = &a.modal else {
+            panic!("no confirm")
+        };
+        assert_eq!(c.id, "plugin:good");
+        key(&mut a, KeyCode::Char('y'));
+        assert!(!a.paths.plugins.join("good").exists());
+        assert_eq!(fs::read_to_string(&a.paths.providers).unwrap(), before);
+        // even a saved edit form never writes a plugin id
+        let f = Form::edit("plugin:x/y", "L", "true", false);
+        assert!(a.save_form(&f).is_err());
+        assert_eq!(fs::read_to_string(&a.paths.providers).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_sections_load_in_the_background_and_stay_out_of_failover() {
+        let mut a = plugin_app();
+        // the rows threads started inside plugin_app, after its (untimed) script warm-up
+        let t = Instant::now();
+        assert_eq!(label_of(&a, "plugin:good"), "loading…", "home never waits");
+        settle(&mut a, |a| a.plugins.iter().all(|p| !p.loading));
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+        let plugin_ids: Vec<String> = ids(&a)
+            .into_iter()
+            .filter(|i| i.starts_with("plugin:"))
+            .collect();
+        assert_eq!(
+            plugin_ids,
+            [
+                "plugin:bad",
+                "plugin:good/a",
+                "plugin:good/b",
+                "plugin:offp",
+                "plugin:slow"
+            ]
+        );
+        assert_eq!(label_of(&a, "plugin:bad"), "bad: plugin failed");
+        assert_eq!(label_of(&a, "plugin:slow"), "slow: plugin failed");
+        assert_eq!(label_of(&a, "plugin:offp"), "offp · off");
+        assert!(
+            !a.paths.plugins.join("offp/ran").exists(),
+            "an off plugin never runs"
+        );
+        let row = a
+            .rows
+            .iter()
+            .find(|r| r.entry.id == "plugin:good/a")
+            .unwrap();
+        assert_eq!(
+            (row.status.as_str(), row.details.clone()),
+            ("ready", vec!["detail one".to_string()])
+        );
+        assert!(row.priority.is_none());
+        let good = a.plugins.iter().find(|p| p.plugin.name == "good").unwrap();
+        assert_eq!(good.title(), "GOOD");
+        assert_eq!(
+            good.actions,
+            [("start".to_string(), "start it".to_string())]
+        );
+        // failover, round-robin and the order file never see a plugin
+        for (id, _) in config::order(&a.paths, &a.entries()) {
+            assert!(!id.starts_with("plugin:"), "{id}");
+        }
+        a.wrr = true;
+        assert!(
+            a.auto_candidates()
+                .iter()
+                .all(|(m, _)| !m.starts_with("plugin:"))
+        );
+        select(&mut a, "plugin:good/a");
+        key(&mut a, KeyCode::Char(' '));
+        assert!(
+            !fs::read_to_string(&a.paths.fo_order)
+                .unwrap_or_default()
+                .contains("plugin:")
+        );
+        // a failed refresh keeps the last good rows
+        plugin_script(&a, "good", "exit 1");
+        a.reload_plugins();
+        settle(&mut a, |a| a.plugins.iter().all(|p| !p.loading));
+        assert_eq!(label_of(&a, "plugin:good/a"), "Alpha");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_entry_opens_its_own_tab_and_the_default_resolves_only_when_on() {
+        let mut a = plugin_app();
+        settle(&mut a, |a| ids(a).contains(&"plugin:good/a".to_string()));
+        select(&mut a, "plugin:good/a");
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.tabs.len(), 1);
+        assert_eq!(a.tabs[0].member, "plugin:good/a");
+        assert!(a.tabs[0].notice.is_none());
+        let screen = |a: &App| {
+            a.tabs[0].pane.as_ref().map_or(String::new(), |p| {
+                p.screen.lock().unwrap().screen().contents()
+            })
+        };
+        settle(&mut a, |a| screen(a).contains("launched a"));
+        assert!(screen(&a).contains("launched a"), "{}", screen(&a));
+        assert!(!a.tabs[0].handoff.exists(), "no handoff for a plugin tab");
+
+        // the state line of a section opens nothing
+        a.focus = Focus::Home;
+        select(&mut a, "plugin:bad");
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.tabs.len(), 1);
+
+        config::set_default(&a.paths, "plugin:good/a");
+        let mut b = App::with_paths(a.paths.clone(), vec![]);
+        b.open_default();
+        assert_eq!(b.tabs.len(), 1, "opens before the plugin's rows loaded");
+        assert_eq!(b.tabs[0].member, "plugin:good/a");
+        plugins::set_on(&a.paths, "good", false).unwrap();
+        for d in ["plugin:good/a", "plugin:gone/a", "plugin:good"] {
+            config::set_default(&a.paths, d);
+            let mut b = App::with_paths(a.paths.clone(), vec![]);
+            b.open_default();
+            assert!(b.tabs.is_empty(), "{d}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn o_and_the_pill_toggle_a_plugin_and_d_deletes_it() {
+        let mut a = plugin_app();
+        settle(&mut a, |a| ids(a).contains(&"plugin:good/a".to_string()));
+        select(&mut a, "plugin:good/a");
+        key(&mut a, KeyCode::Char('o'));
+        assert!(a.paths.plugins.join("good/.off").exists());
+        assert_eq!(label_of(&a, "plugin:good"), "good · off");
+        select(&mut a, "plugin:good");
+        key(&mut a, KeyCode::Char('o'));
+        assert!(!a.paths.plugins.join("good/.off").exists());
+        let hits = Hits {
+            plugins: vec![(r(2), "good".into())],
+            ..Hits::default()
+        };
+        click(&mut a, &hits, 1, 2);
+        assert!(a.paths.plugins.join("good/.off").exists());
+        click(&mut a, &hits, 1, 2);
+        assert!(!a.paths.plugins.join("good/.off").exists());
+
+        select(&mut a, "plugin:bad");
+        key(&mut a, KeyCode::Char('d'));
+        assert!(matches!(a.modal, Some(Modal::Confirm(_))));
+        key(&mut a, KeyCode::Char('n'));
+        assert!(a.paths.plugins.join("bad").exists());
+        key(&mut a, KeyCode::Char('d'));
+        key(&mut a, KeyCode::Char('y'));
+        assert!(!a.paths.plugins.join("bad").exists());
+        assert!(!ids(&a).contains(&"plugin:bad".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runs_a_plugin_action_and_flashes_its_last_line() {
+        let mut a = plugin_app();
+        settle(&mut a, |a| {
+            a.plugins
+                .iter()
+                .any(|p| p.plugin.name == "good" && !p.actions.is_empty())
+        });
+        select(&mut a, "plugin:good/a");
+        key(&mut a, KeyCode::Char('a'));
+        let Some(Modal::Form(f)) = &a.modal else {
+            panic!("no action menu")
+        };
+        assert_eq!(f.get("Action"), "start it");
+        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Enter);
+        assert!(a.modal.is_none());
+        let flash = |a: &App| a.flash.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
+        settle(&mut a, |a| flash(a).contains("started"));
+        assert_eq!(flash(&a), "good: started start");
+        // no actions: a hint, no menu
+        select(&mut a, "plugin:bad");
+        key(&mut a, KeyCode::Char('a'));
+        assert!(a.modal.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p_adds_a_plugin_from_a_folder_and_refuses_a_second_time() {
+        let mut a = app();
+        let src = plugin_script(&a, "x", GOOD);
+        let src2 = a.paths.home.join("src/mine");
+        fs::create_dir_all(src2.parent().unwrap()).unwrap();
+        fs::rename(&src, &src2).unwrap();
+        let flash = |a: &App| a.flash.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
+        for want in ["Installed plugin mine", "already"] {
+            key(&mut a, KeyCode::Char('p'));
+            a.on_paste(&src2.to_string_lossy());
+            key(&mut a, KeyCode::Enter);
+            key(&mut a, KeyCode::Enter);
+            assert!(a.modal.is_none(), "the add runs in the background");
+            settle(&mut a, |a| flash(a).contains(want));
+            assert!(flash(&a).contains(want), "{}", flash(&a));
+        }
+        assert!(a.paths.plugins.join("mine/plugin").is_file());
+        assert!(
+            ids(&a).iter().any(|i| i.starts_with("plugin:mine")),
+            "its section shows at once"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_sections_draw_with_a_clickable_pill() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut a = plugin_app();
+        settle(&mut a, |a| a.plugins.iter().all(|p| !p.loading));
+        for (w, h) in [(20, 5), (40, 10), (120, 40)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let mut hits = Hits::default();
+            t.draw(|f| hits = crate::ui::draw(f, &a)).unwrap();
+            if w == 120 {
+                let text: String = t
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                for want in [
+                    "GOOD",
+                    "Alpha",
+                    "ready",
+                    "detail one",
+                    "offp · off",
+                    "bad: plugin failed",
+                ] {
+                    assert!(text.contains(want), "{want}");
+                }
+                let names: Vec<&str> = hits.plugins.iter().map(|(_, n)| n.as_str()).collect();
+                assert_eq!(names, ["bad", "good", "offp", "slow"]);
+            }
+        }
+    }
+
+    // ── plugins window ────────────────────────────────────
+
+    /// The screen as text lines, and where things were drawn.
+    fn screen(a: &App) -> (Vec<String>, Hits) {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut t = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        let mut hits = Hits::default();
+        t.draw(|f| hits = crate::ui::draw(f, a)).unwrap();
+        let b = t.backend().buffer();
+        let lines = (0..b.area.height)
+            .map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect())
+            .collect();
+        (lines, hits)
+    }
+
+    fn line_with(lines: &[String], text: &str) -> String {
+        lines
+            .iter()
+            .find(|l| l.contains(text))
+            .cloned()
+            .unwrap_or_else(|| panic!("no line with {text}:\n{}", lines.join("\n")))
+    }
+
+    fn pwin_select(a: &mut App, name: &str) {
+        a.plugins_win = a.plugins.iter().position(|s| s.plugin.name == name);
+        assert!(a.plugins_win.is_some(), "no plugin {name}");
+    }
+
+    #[test]
+    fn plugins_window_opens_with_shift_p_and_its_button_and_closes_on_esc_or_q() {
+        let mut a = app();
+        a.on_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        assert_eq!(a.plugins_win, Some(0));
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(a.plugins_win, None);
+        let (_, hits) = screen(&a);
+        let b = hits
+            .buttons
+            .iter()
+            .find(|(_, b)| *b == Button::Plugins)
+            .expect("a ⚙ Plugins button")
+            .0;
+        assert!(hits.buttons.iter().any(|(_, b)| *b == Button::AddPlugin));
+        click(&mut a, &hits, b.x, b.y);
+        assert_eq!(a.plugins_win, Some(0));
+        key(&mut a, KeyCode::Char('q'));
+        assert_eq!(a.plugins_win, None);
+        assert!(!a.quit, "q closes the window, not the app");
+    }
+
+    #[test]
+    fn plugins_window_empty_state() {
+        let mut a = app();
+        key(&mut a, KeyCode::Char('P'));
+        let (lines, _) = screen(&a);
+        line_with(&lines, "No plugins yet · + add plugin");
+        key(&mut a, KeyCode::Char('+'));
+        assert!(matches!(&a.modal, Some(Modal::Form(f)) if f.purpose == Purpose::AddPlugin));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugins_window_lists_every_plugin_with_state_source_and_status() {
+        let mut a = plugin_app();
+        let git = plugin_script(&a, "gitp", GOOD);
+        fs::write(
+            git.join(".source"),
+            "https://me:secret@example.com/x/gitp.git\n",
+        )
+        .unwrap();
+        plugins::add(&a.paths, "cliproxy").unwrap();
+        fs::write(a.paths.plugins.join("cliproxy/.off"), "").unwrap();
+        a.refresh();
+        a.reload_plugins();
+        settle(&mut a, |a| a.plugins.iter().all(|p| !p.loading));
+        key(&mut a, KeyCode::Char('P'));
+        let (lines, _) = screen(&a);
+        let names: Vec<&str> = a.plugins.iter().map(|s| s.plugin.name.as_str()).collect();
+        assert_eq!(names, ["bad", "cliproxy", "gitp", "good", "offp", "slow"]);
+        line_with(&lines, "NAME");
+        for (name, state, source, status) in [
+            ("good", "● on", "local", "ok"),
+            ("bad", "● on", "local", "failed"),
+            ("offp", "○ off", "local", "off"),
+            ("cliproxy", "○ off", "bundled", "off"),
+            ("gitp", "● on", "https://example.com/x/gitp.git", "ok"),
+        ] {
+            // the window's row, not home's section header under it
+            let l = lines
+                .iter()
+                .find(|l| l.contains(&format!(" {name} ")) && l.contains('│'))
+                .unwrap_or_else(|| panic!("no row for {name}:\n{}", lines.join("\n")));
+            assert!(l.contains(state), "{name}: {l}");
+            assert!(l.contains(source), "{name}: {l}");
+            let cells = l.split('│').find(|c| c.contains(name)).unwrap();
+            assert_eq!(cells.split_whitespace().last(), Some(status), "{name}: {l}");
+        }
+        assert!(!lines.iter().any(|l| l.contains("secret")));
+        line_with(&lines, " remove ");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugins_window_o_and_a_click_on_the_pill_toggle_the_off_file() {
+        let mut a = plugin_app();
+        let off = a.paths.plugins.join("good/.off");
+        key(&mut a, KeyCode::Char('P'));
+        pwin_select(&mut a, "good");
+        key(&mut a, KeyCode::Char('o'));
+        assert!(off.exists());
+        key(&mut a, KeyCode::Char('o'));
+        assert!(!off.exists());
+        // ↓ selects the next row; a click on a row selects it, on its pill toggles it
+        key(&mut a, KeyCode::Down);
+        assert_eq!(a.plugins[a.plugins_win.unwrap()].plugin.name, "offp");
+        let (_, hits) = screen(&a);
+        let (row, i) = hits.plugin_rows[0];
+        click(&mut a, &hits, row.x, row.y);
+        assert_eq!(a.plugins_win, Some(i));
+        let good = a
+            .plugins
+            .iter()
+            .position(|s| s.plugin.name == "good")
+            .unwrap();
+        let pill = hits.plugins.iter().find(|(_, n)| n == "good").unwrap().0;
+        click(&mut a, &hits, pill.x, pill.y);
+        assert_eq!(a.plugins_win, Some(good));
+        assert!(off.exists());
+        assert!(a.plugins_win.is_some(), "the window stays open");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugins_window_d_asks_then_removes_and_u_needs_git() {
+        let mut a = plugin_app();
+        key(&mut a, KeyCode::Char('P'));
+        pwin_select(&mut a, "bad");
+        key(&mut a, KeyCode::Char('u'));
+        assert!(
+            a.flash
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("not installed from git")),
+            "{:?}",
+            a.flash
+        );
+        key(&mut a, KeyCode::Char('d'));
+        let Some(Modal::Confirm(c)) = &a.modal else {
+            panic!("no confirm")
+        };
+        assert_eq!(c.id, "plugin:bad");
+        key(&mut a, KeyCode::Char('n'));
+        assert!(a.paths.plugins.join("bad").exists());
+        key(&mut a, KeyCode::Char('d'));
+        key(&mut a, KeyCode::Char('y'));
+        assert!(!a.paths.plugins.join("bad").exists());
+        assert!(a.plugins.iter().all(|s| s.plugin.name != "bad"));
+        assert!(a.plugins_win.is_some(), "back in the window");
+        screen(&a);
     }
 }

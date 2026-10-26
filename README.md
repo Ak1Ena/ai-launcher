@@ -263,6 +263,85 @@ ai failover clear claude/work                         # forget a limit (no name 
 
 Needs jq. Not used in team mode. Limits: the cooldown is fixed, not the real reset time (use `ctrl-r` if the limit ended sooner). Codex can't trigger a failover, so put it last. Not available on native Windows (Git Bash yet); use WSL.
 
+## Plugins
+
+A plugin adds your own launch entries to `ai`, with no change to this repo. It is a folder with an executable file called `plugin`, in any language (a bash script is fine). Each plugin gets its own section in the TUI home list and its own group in the bash picker. Plugin rows are never part of failover: no priority, no limit marks, no handoff. A limit inside a plugin session moves nothing.
+
+This is different from `plugins/<name>.sh` further down, which only adds usage bars for an agent that is already in the providers file.
+
+Plugins live in `~/.config/ai-launcher/plugins/<name>/` (beside the providers file; set `AI_PLUGINS` to use another folder). `<name>` is letters, digits, `_` or `-`.
+
+```bash
+ai plugin add cliproxy                 # a bundled plugin, by name
+ai plugin add ~/code/my-plugin         # a local folder (copied in)
+ai plugin add owner/repo               # a git repo (GitHub shorthand)
+ai plugin add https://example.com/x/y.git [name]   # or any https git URL
+ai plugin ls                           # installed plugins, on/off, section title, source
+ai plugin update [name]                # git pull --ff-only for git plugins (all when no name)
+ai plugin off <name>                   # stop it without removing it (on: start again)
+ai plugin rm <name>                    # asks [y/N], deletes the folder (a symlink loses only the link)
+ai plugin do <name> <action>           # run one of the plugin's actions
+```
+
+`add` looks at its argument in this order: a bundled name, then an existing local folder, then a git source. Git sources are HTTPS only: an `https://` URL, or `owner/repo`, which becomes `https://github.com/owner/repo.git`. It never overwrites an installed plugin and refuses a folder without an executable `plugin`. New plugins start on, and `add` runs the plugin's `rows` once right away (macOS scans a new script on its first run, which can take seconds). Git needs `git`. The TUI's `p` form follows the same rules and expands a leading `~/`.
+
+TUI keys on a plugin row: `a` actions, `o` on/off, `u` update, `d` delete, `e` show its folder. `p` (or the `+ Plugin` button) adds a plugin from anywhere on home. On a plugin row, `a`, `d` and `e` are plugin actions; adding an account stays on the button and on other rows.
+
+`P` (or the `⚙ Plugins` button) opens the Plugins window: every installed plugin with its state, source (`bundled`, its https URL, or `local`) and status (`ok`, `failed`, `off`, `loading…`). In it: `o` on/off, `u` update, `d` remove, Enter or `a` actions, `+` / `p` add, Esc closes.
+
+### Writing a plugin
+
+`ai` runs `plugin <command>` in your current folder, with no tty and the env var `AI_PLUGIN_DIR` set to the plugin's folder (keep config and cache there). On Windows it runs `bash <dir>/plugin`.
+
+| Command | Output | Limit |
+| --- | --- | --- |
+| `rows` | First line `section<TAB><title>`. Then one line per entry: `<id><TAB><label><TAB><status text>`. A line `  <TAB><text>` (two spaces, a tab) is a detail line shown under the entry above it. | 2 s (in the TUI, a plugin's first call in a session gets 10 s). A failure or timeout shows `<name>: plugin failed`. |
+| `actions` (optional) | One line per action: `<action><TAB><label>`. | 2 s (TUI first call: 10 s) |
+| `do <action>` | Runs the action. stdin is closed; stdout and stderr are shown. `rows` refreshes afterwards. | 30 s, then it is killed |
+| `launch <id> [args...]` | Runs the session in the foreground with the terminal (bash: `exec`, TUI: its own tab). | none |
+
+An entry `<id>` is letters, digits, `.`, `_` or `-`. Status and detail text is plain text; the bash picker shows ANSI colour, the TUI strips it. Other files refer to an entry as `plugin:<name>/<id>` (for example the default entry); an id that no longer exists is ignored. In the bash `ai`, launches share folder trust like any other (only with `ai trust on`); the TUI has no shared trust.
+
+Two marker files sit in the plugin folder. `.off` (empty) turns it off: it is never run, and its section shows `<name> · off`. `.source` holds the git URL it was installed from, used by `update`. A plugin is code you chose to run, with your permissions, so install only plugins you trust. `ai plugin add|update` with a git source is the only time `ai` touches the network for plugins; everything else is up to the plugin.
+
+### cliproxy
+
+The bundled `cliproxy` plugin starts Claude Code through [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), a local proxy that holds several logins (Claude, Codex, Gemini...) and spreads requests across them. You get one row, "Claude Code · all accounts", that works like one more account for all of them together. The failover section stays as it is.
+
+Needs CLIProxyAPI installed, logged in and running (`brew services start cliproxyapi`); the plugin does not install it or log in for you. It also needs `curl`, and `jq` for the usage lines.
+
+```bash
+export CLIPROXY_API_KEY=...    # a client key from the proxy's config
+export CLIPROXY_MGMT_KEY=...   # its management key (only for the usage lines)
+ai plugin add cliproxy
+```
+
+The first `rows` call creates `plugins/cliproxy/config` (mode 600). It is read as `key=value` lines, never run as a script:
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `url` | `http://127.0.0.1:8317` | Where the proxy listens |
+| `key_env` / `key` | `CLIPROXY_API_KEY` | Env var holding the client key, or the key itself (`key` wins) |
+| `mgmt_key_env` / `mgmt_key` | `CLIPROXY_MGMT_KEY` | Same, for the management key |
+| `start_cmd` / `stop_cmd` | none | Commands for the start / stop actions when brew has no `cliproxyapi` (run with `bash -c`) |
+| `mode` | `failover` | `failover` or `balance`: how the "all accounts" row uses accounts (see below) |
+
+Each line is `key=value`. A ` #` (space then `#`) or tab then `#` starts a comment, and a line starting with `#` is skipped. Quotes are not removed: `key="abc"` gives the key `"abc"` with the quotes.
+
+The row says `proxy up`, `proxy not running` with the start hint, or `no key`. With a management key it adds lines per provider: merged 5h and weekly bars (the average used % across that provider's accounts, with the soonest reset) for Claude and Codex, the number of accounts, request and failed counts, and the model names the proxy serves. It does not show tokens per model. The numbers are cached for 60 seconds and refresh in the background, so the row stays quick. Without a management key it shows a hint instead.
+
+Actions `start` and `stop` run `brew services` or your `start_cmd` / `stop_cmd` (`a` in the TUI, `ai plugin do cliproxy start`). Choosing the row runs `claude` with `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and gateway model discovery set for that session only, using your main `~/.claude`; nothing in `settings.json` changes and the key is never printed (both keys are also removed from claude's environment). If the proxy is down it prints the hint and does not start it. Pick GPT, Gemini or Claude models inside Claude Code with `/model`.
+
+**Keep the prompt cache.** Every account and every provider has its own prompt cache. If the proxy's load balancer moves a chat to another account, the whole context is read again at full price. Turn on CLIProxyAPI's session affinity so each chat stays on one account: the section shows `⚠ session affinity off` when it is off, and the action **Keep each chat on one account** (`a` in the TUI, `ai plugin do cliproxy affinity`) sets `routing.session-affinity` and `session-affinity-subagents` to true (TTL `1h` if none is set) through the management API. It changes the proxy only when you choose it. Switching `/model` to another provider in the middle of a chat always re-sends the whole context, because caches are not shared between providers, so pick the model at the start of a chat.
+
+**Failover or load balance.** The section title shows the mode: `CLIPROXY · all accounts · failover` or `· load balance`.
+- **failover** (default): one account until it is limited, then the next. The chat keeps going in the same Claude Code session with its whole history, with no restart. The first request on the new account reads the context once more without the cache. The plugin sets the proxy's `routing.strategy` to `fill-first` and `routing.cooldown.disable-cooling` to false (with cooling off, the proxy would keep picking a limited account).
+- **balance**: chats are spread across accounts, and session affinity keeps each chat on one account. The plugin sets `round-robin` (it keeps `weighted-round-robin` if the proxy already uses it) and turns session affinity on.
+
+Switch with the actions **Mode: failover** / **Mode: load balance** (`a` in the TUI, or `ai plugin do cliproxy mode-failover` / `mode-balance`). They write `mode=` into the config, then change the proxy with one `PATCH /v8/management/config`; an older proxy without v8 gets only the strategy, through `PUT /v0/management/routing/strategy`. Without a management key only the config changes, and the plugin says `proxy not changed (no management key)`. When the proxy does not match the mode, the section shows `⚠ proxy uses <strategy>, plugin mode is <mode>` and an **Apply** action (`ai plugin do cliproxy apply`). The proxy's config changes only on these actions and on **Keep each chat on one account**. Session affinity and the mode check need a management key and a proxy with the v8 management API.
+
+**When every account is limited.** The section shows `⚠ all Claude accounts limited · next reset ↻…` (the same for Codex). CLIProxyAPI has no built-in fallback to another model: when every Claude account is limited, Claude Code gets HTTP 429 `model_cooldown` from the proxy. Pick another model yourself with `/model`, or wait for the reset.
+
 ## How it works
 
 **Usage.** Nothing is fetched from the internet:
