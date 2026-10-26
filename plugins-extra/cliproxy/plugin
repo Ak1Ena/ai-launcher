@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# cliproxy plugin for ai-launcher (stub, filled by the build)
+exit 1
