@@ -316,10 +316,18 @@ fn name_of(source: &str) -> String {
     last.strip_suffix(".git").unwrap_or(last).to_string()
 }
 
-/// A leading `~/` means $HOME.
+/// $HOME, or %USERPROFILE% on Windows where HOME is often unset.
+fn home() -> Option<String> {
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|h| !h.is_empty())
+}
+
+/// A leading `~/` means the home folder.
 pub fn expand_home(s: &str) -> String {
-    match (s.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(h)) if !h.is_empty() => format!("{}/{rest}", h.trim_end_matches('/')),
+    match (s.strip_prefix("~/"), home()) {
+        (Some(rest), Some(h)) => format!("{}/{rest}", h.trim_end_matches(['/', '\\'])),
         _ => s.to_string(),
     }
 }
@@ -784,10 +792,10 @@ pub mod tests {
         ])
         .unwrap_err();
         assert!(!e.contains("tok"), "{e}");
-        let h = std::env::var("HOME").unwrap();
+        let h = home().unwrap();
         assert_eq!(
             expand_home("~/x/y"),
-            format!("{}/x/y", h.trim_end_matches('/'))
+            format!("{}/x/y", h.trim_end_matches(['/', '\\']))
         );
         assert_eq!(expand_home("~x"), "~x");
     }
