@@ -74,7 +74,7 @@ _ai_update_notice() {
 
 ai_main() {
   case ${1:-} in
-    ls|add|edit|rm|failover|default) local sub=$1; shift; "_ai_$sub" "$@"; return ;;
+    ls|add|edit|rm|failover|default|trust) local sub=$1; shift; "_ai_$sub" "$@"; return ;;
     cla) shift; cla_main "$@"; return ;;
     cla-team) shift; cla_team_main "$@"; return ;;
     help|-h|--help) _ai_help; return ;;
@@ -121,6 +121,7 @@ ai rm   <name>                   delete an agent
 ai failover [on|off|ls]          when a Claude account hits its limit, resume the session on the
                                  next account (Codex last). No args: set priority, turn accounts on/off
 ai failover order <member>...    set priority from the command line
+ai trust [on|off|status]         share folder trust between agents (off by default)
 cla [name] [team] [args]         Claude accounts: pick or start one   (cla add|ls|rm|mv)
 cla-team [name] [args]           Claude team mode (needs tmux)
 
@@ -129,6 +130,19 @@ Picker keys: enter launch · ctrl-t team · ctrl-a add · ctrl-e edit · ctrl-x 
 Without fzf you get a numbered menu: 2 = launch, t 2 = team, a = add, e 2 = edit, x 2 = delete,
 f = failover on/off, o = failover order.
 EOF
+}
+
+_ai_trust() {
+  local flag=${AI_PROVIDERS%/*}/trust.on
+  case ${1:-status} in
+    on) mkdir -p "${flag%/*}" && : > "$flag"
+        echo "shared trust on: a folder trusted in one agent is now trusted in all of them."
+        echo "Trusting a folder lets each agent load that folder's hooks, settings and MCP servers," 
+        echo "so only turn this on if you trust every folder you open. Turn off: ai trust off" ;;
+    off) rm -f "$flag"; echo "shared trust off" ;;
+    status) if [ -e "$flag" ]; then echo "shared trust: on"; else echo "shared trust: off (ai trust on)"; fi ;;
+    *) echo "usage: ai trust [on|off|status]"; return 1 ;;
+  esac
 }
 
 # ── providers file: name TAB command TAB label ─────────────
@@ -332,10 +346,24 @@ _ai_menu() {
   printf '%s\n%s\n' "$act" "${rows[$((n - 1))]}"
 }
 
+# true when folder $1 is $2 or inside it, compared as resolved paths
+_fo_under() {
+  local d r
+  d=$(cd "$1" 2>/dev/null && pwd -P) && r=$(cd "$2" 2>/dev/null && pwd -P) || return 1
+  case $d/ in "$r"/*) return 0 ;; esac; return 1
+}
+
 # ── launch ─────────────────────────────────────────────────
 _ai_run() {
   local n=$1 id=$2 d; shift 2
   d=$(_ai_account_dir "$n") && export "$(_ai_account_env "$(_ai_agent "$n")")=$(native_path "$d")"
+  # a plain launch outside any account means the main login, not one inherited from a cla / ai-account session
+  if [ -z "$d" ]; then
+    case $(_ai_agent "$n") in
+      claude) [ -n "${CLAUDE_CONFIG_DIR:-}" ] && _fo_under "$CLAUDE_CONFIG_DIR" "$CLA_ROOT" && unset CLAUDE_CONFIG_DIR ;;
+      codex) [ -n "${CODEX_HOME:-}" ] && _fo_under "$CODEX_HOME" "$AI_ACCOUNTS" && unset CODEX_HOME ;;
+    esac
+  fi
   [ "$n" = claude ] || _ai_trust_share "$PWD"  # claude rows go through cla, which shares too
   if is_fn "_ai_${n}_run"; then "_ai_${n}_run" "$id" "$@"
   elif [ "$(_ai_agent "$n")" = claude ] && [ -z "${AI_TEAM:-}" ] && _fo_on; then _fo_run "$n" "$@"

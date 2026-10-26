@@ -7,7 +7,7 @@ One command for all your AI coding agents. Type `ai` to see every agent and acco
 - **Every agent in one list.** Claude Code (several accounts), Codex, Gemini, Antigravity, Kimi, OpenCode, Qwen, or any CLI you add.
 - **Usage at a glance.** Shows 5-hour and weekly limits with reset times. Bars turn yellow at 60% and red at 90%.
 - **Your own launch commands.** Add, edit or delete agents and their commands, from the command line or inside the picker.
-- **Trust a folder once.** If any agent trusts the folder, every agent you start through `ai` trusts it too, so they stop asking.
+- **Trust a folder once** (after `ai trust on`). If any agent trusts the folder, every agent you start through `ai` trusts it too, so they stop asking.
 - **No API calls.** Usage comes from files the agents already write on your machine.
 
 There are two front ends with the same config: the TUI shown above (`npm i -g ai-launcher`), and a plain-bash picker that needs nothing installed ([Use it](#use-it)). Both work on macOS, Linux and Windows (PowerShell, CMD or WSL).
@@ -21,7 +21,7 @@ A terminal UI with two kinds of tabs:
 
 ![a Claude tab: the CLI fills the window, with the account's usage and the next failover account on the bottom line](docs/tui-tab.png)
 
-On a narrow terminal, columns and key hints that don't fit are dropped, least important first. When failover triggers, the session switches to the next account in the same tab, after a 5 second notice (press enter to switch now). When a newer version is on npm, a notice appears in the title bar (checked at most once a day in the background; set `AI_LAUNCHER_NO_UPDATE_CHECK=1` to disable).
+On a narrow terminal, columns and key hints that don't fit are dropped, least important first. When failover triggers, the tab shows a notice and asks `[y/N]` before moving to the next account (Enter means no). When a newer version is on npm, a notice appears in the title bar (checked at most once a day in the background; set `AI_LAUNCHER_NO_UPDATE_CHECK=1` to disable).
 
 Install:
 
@@ -89,9 +89,10 @@ In a tab, every key goes to the CLI except these:
 
 | Key (in a tab) | Does |
 | --- | --- |
-| `enter` | on a failover notice: switch now; on an ended tab: restart it |
-| `o` | on a failover notice: go home to pick another account |
-| `q` / `esc` | on a failover notice: stay on the ended session |
+| `y` | on a failover notice: move to the next account |
+| `o` | on a failover notice: go home to change the order or pick another account |
+| `q` / `esc` | on a failover notice: stop (no move); `enter` does nothing there |
+| `enter` | on an ended tab: restart it |
 | `x` | on an ended tab: close it |
 
 ## Install
@@ -208,7 +209,7 @@ Agents are saved in `~/.config/ai-launcher/providers`, one per line as `name<TAB
 | `cla add work` | Add an account and log in. Settings, skills and plugins are shared with `~/.claude`. |
 | `cla` / `cla-team` | Pick a Claude account, then start it normally or in team mode |
 | `cla work [team] [args]` | Start a specific account |
-| `cla ls`, `cla rm work`, `cla mv work job` | List, remove or rename accounts |
+| `cla ls`, `cla rm work`, `cla mv work job` | List, remove or rename accounts (`cla rm` asks to confirm; `AI_YES=1` skips the question) |
 
 Accounts live in `~/.claude-accounts/<name>`. Set `CLA_ROOT` to use another folder.
 
@@ -227,6 +228,8 @@ Antigravity (`agy`) can't have several accounts yet: it always reads `~/.gemini/
 ### Failover
 
 When a Claude account hits its usage limit, the same session resumes on the next account in your priority order. Codex has no limit hook, so it only gets a written handoff of the session, and the session ends there: accounts below Codex in the order are not tried. New Codex accounts start at the bottom. Failover is off until you turn it on.
+
+Failover never moves on its own. When a limit hits, it asks `[y/N]` and Enter means no: `y` moves to the next account, `o` changes the order, `q` (or anything else) stops. There is no timer. If the next member runs Codex, it warns that the conversation will go to OpenAI (Codex) before you answer. Inside a `cla` session, `main` still means `~/.claude`, not the account you are in.
 
 ```bash
 ai failover on     # or ctrl-f in the picker
@@ -264,10 +267,18 @@ Needs jq. Not used in team mode. Limits: the cooldown is fixed, not the real res
 - **Other agents** don't save usage, so they show "no usage data".
 
 **Folder trust.** When you start an agent through `ai` or `cla`, it checks whether the folder is trusted by any of Claude (main config and every account), Codex, Gemini, Qwen or Antigravity. If one trusts it, the folder is marked trusted in the others too.
+- Sharing is off by default. Turn it on with `ai trust on` (`ai trust off` to stop, `ai trust status` to check). A trusted folder lets each agent load that folder's hooks, settings and MCP servers, so only turn it on if you trust every folder you open.
 - Only that exact folder is shared. Parent folders don't count.
 - A folder you marked untrusted in an agent stays untrusted there.
+- Even with sharing off, `cla` still copies the main account's accepted folder trust into the cla accounts (Claude to Claude only, nothing to other agents).
 
 **Staying awake.** On macOS, agents run under `caffeinate -i` so the machine doesn't sleep mid-task.
+
+## Security
+
+- `cla add` links `settings.json`, `hooks`, `plugins` and `projects` from `~/.claude` into the new account. So an `env` entry there (for example `ANTHROPIC_API_KEY`) or an `apiKeyHelper` applies to every account, and chat transcripts are shared through `projects`.
+- `cla rm` moves the account to `<accounts folder>/.trash` instead of erasing it. That folder may still hold the login (`.credentials.json` on Linux). Delete it yourself to really remove it.
+- `cla mv` never copies secrets. On macOS you log in again after a rename, because Claude ties the Keychain login to the folder path.
 
 ## Add usage bars for another agent
 

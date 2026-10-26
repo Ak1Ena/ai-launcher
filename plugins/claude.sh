@@ -4,8 +4,8 @@
 #   cla-team [name]     same, team mode (teammates in tmux split panes)
 #   cla add <name>      add an account and log in
 #   cla ls              list accounts and who is logged in
-#   cla rm <name>       remove an account
-#   cla mv <old> <new>  rename an account (keeps login)
+#   cla rm <name>       remove an account (asks; moves it to .trash)
+#   cla mv <old> <new>  rename an account (macOS: log in again)
 #   cla <name> [team] [claude args]
 CLA_ROOT=${CLA_ROOT:-$HOME/.claude-accounts}
 
@@ -31,27 +31,29 @@ cla_main() {
       done ;;
     add)
       [ -n "${2:-}" ] || { echo "usage: cla add <name>"; return 1; }
+      _cla_name "$2" || return 1
       _cla_init "$root/$2" && CLAUDE_CONFIG_DIR=$(native_path "$root/$2") claude auth login ;;
     rm)
-      [ -n "${2:-}" ] && [ -d "$root/$2" ] || { echo "no account: ${2:-}"; return 1; }
-      CLAUDE_CONFIG_DIR=$(native_path "$root/$2") claude auth logout; rm -rf "${root:?}/$2" && echo "removed $2" ;;
+      _cla_old "${2:-}" && [ -d "$root/$2" ] || { echo "no account: ${2:-}"; return 1; }
+      if [ -z "${AI_YES:-}" ]; then
+        printf 'Remove %s? [y/N] ' "$2" >&2
+        local ans=; read -r ans || true
+        case $ans in y|Y) ;; *) echo "cancelled"; return 1 ;; esac
+      fi
+      CLAUDE_CONFIG_DIR=$(native_path "$root/$2") claude auth logout
+      local to="$root/.trash/$2-$(date +%s)" n=2
+      mkdir -p "$root/.trash" || return 1
+      while [ -e "$to" ] || [ -L "$to" ]; do to="$root/.trash/$2-$(date +%s)-$n"; n=$((n + 1)); done
+      mv "$root/$2" "$to" || return 1
+      echo "removed $2, moved to $to (delete that folder to erase it for good)" ;;
     mv)
       [ -n "${2:-}" ] && [ -n "${3:-}" ] && [ -d "$root/$2" ] || { echo "usage: cla mv <old> <new>"; return 1; }
+      _cla_old "$2" && _cla_name "$3" || return 1
       [ -e "$root/$3" ] && { echo "'$3' already exists"; return 1; }
-      local old new acct secret=
-      # macOS: the login lives in Keychain under a name made from the folder path, so move it too.
-      # Linux/WSL: the login is .credentials.json inside the folder, so the mv below carries it.
-      if has security; then
-        old=$(_cla_svc "$root/$2"); new=$(_cla_svc "$root/$3")
-        acct=$(security find-generic-password -s "$old" 2>/dev/null | sed -n 's/.*"acct"<blob>="\(.*\)"/\1/p')
-        secret=$(security find-generic-password -s "$old" -w 2>/dev/null)
-      fi
       mv "$root/$2" "$root/$3" || return 1
-      if [ -n "$secret" ]; then
-        security add-generic-password -U -s "$new" -a "$acct" -w "$secret" &&
-          security delete-generic-password -s "$old" >/dev/null 2>&1
-      fi
-      echo "renamed $2 -> $3" ;;
+      echo "renamed $2 -> $3"
+      # macOS keeps the login in Keychain under a name made from the folder path; we never copy secrets.
+      has security && echo "On macOS you must log in again: cla add $3 (Claude ties the Keychain login to the folder path)." ;;
     *)
       [ -d "$root/$1" ] || { echo "no account '$1'. run: cla add $1"; return 1; }
       dir=$root/$1; shift
@@ -129,7 +131,16 @@ _cla_trust_sync() {
   jq -e --argjson t "$trusted" '(.projects // {}) as $p | any($t[]; $p[.].hasTrustDialogAccepted != true)' "$dst" >/dev/null 2>&1 || return 0
   _ai_json_edit "$dst" --argjson t "$trusted" '.projects = reduce $t[] as $k (.projects // {}; .[$k].hasTrustDialogAccepted = true)'
 }
-_cla_svc() { echo "Claude Code-credentials-$(printf %s "$1" | shasum -a 256 | cut -c1-8)"; }
+# same rule as the TUI's valid_name
+_cla_name() {
+  case $1 in
+    ''|.*|*[!A-Za-z0-9._-]*) echo "bad name '$1': use letters, digits . _ - (not starting with '.')" >&2; return 1 ;;
+  esac
+}
+# rm and the old name of mv: only block path tricks, so accounts made with older names still work
+_cla_old() {
+  case $1 in ''|.*|*/*) echo "bad name '$1'" >&2; return 1 ;; esac
+}
 _cla_init() {
   mkdir -p "$1"
   # share settings, skills, plugins, memory with the main account; the login stays separate

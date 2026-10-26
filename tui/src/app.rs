@@ -13,8 +13,6 @@ use ratatui::layout::{Position, Rect};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-pub const SWITCH_WAIT: Duration = Duration::from_secs(5);
-
 #[derive(Clone, Copy, PartialEq)]
 pub enum Focus {
     /// the home list of accounts
@@ -24,11 +22,12 @@ pub enum Focus {
 }
 
 pub enum Notice {
-    /// A limit was hit: move to `to` at `at` unless the user changes it.
+    /// A limit was hit: move to `to` only when the user says yes (`y`).
     Switch {
         from: String,
         to: String,
-        at: Instant,
+        /// `to` runs codex: the conversation goes to OpenAI
+        codex: bool,
     },
     /// A limit was hit and no member is left.
     NoneLeft {
@@ -74,6 +73,15 @@ pub struct Deciding {
     rx: std::sync::mpsc::Receiver<Option<String>>,
     cands: Vec<(String, u32)>,
     default: String,
+}
+
+/// CLAUDE_CONFIG_DIR as ai started (`env`), unless it is a cla account's folder: inside a cla
+/// session main still means ~/.claude.
+fn base_config(env: Option<std::ffi::OsString>, paths: &Paths) -> Option<PathBuf> {
+    config::outside(
+        env.filter(|v| !v.is_empty()).map(PathBuf::from),
+        &paths.cla_root,
+    )
 }
 
 pub struct App {
@@ -126,9 +134,7 @@ impl App {
             wrr: false,
             default: String::new(),
             deciding: None,
-            base_config: std::env::var_os("CLAUDE_CONFIG_DIR")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from),
+            base_config: base_config(std::env::var_os("CLAUDE_CONFIG_DIR"), &paths),
             paths,
             rows: Vec::new(),
             selected: 0,
@@ -364,7 +370,9 @@ impl App {
             return;
         };
         match (&tab.notice, key.code) {
-            (Some(Notice::Switch { .. }), KeyCode::Enter) => self.switch_now(self.current),
+            (Some(Notice::Switch { .. }), KeyCode::Char('y' | 'Y')) => {
+                self.switch_now(self.current)
+            }
             (Some(Notice::Switch { .. } | Notice::NoneLeft { .. }), KeyCode::Char('o')) => {
                 if let Some(Notice::Switch { from, .. }) = &tab.notice {
                     tab.notice = Some(Notice::NoneLeft { from: from.clone() });
@@ -626,9 +634,10 @@ impl App {
                 format!("{} auth login", entry.command)
             }
             Kind::Codex => {
-                if let Some(d) = config::account_dir(&self.paths, &entry) {
-                    env.push(("CODEX_HOME".into(), Some(d.to_string_lossy().into_owned())));
-                }
+                // the main login gets codex_home too: an inherited CODEX_HOME may be an account's
+                let d = config::account_dir(&self.paths, &entry)
+                    .unwrap_or_else(|| self.paths.codex_home.clone());
+                env.push(("CODEX_HOME".into(), Some(d.to_string_lossy().into_owned())));
                 format!("{} login", entry.command)
             }
             Kind::Other => {
@@ -948,9 +957,10 @@ impl App {
                 }
             }
             Kind::Codex => {
-                if let Some(d) = config::account_dir(&self.paths, &entry) {
-                    env.push(("CODEX_HOME".into(), Some(d.to_string_lossy().into_owned())));
-                }
+                // the main login gets codex_home too: an inherited CODEX_HOME may be an account's
+                let d = config::account_dir(&self.paths, &entry)
+                    .unwrap_or_else(|| self.paths.codex_home.clone());
+                env.push(("CODEX_HOME".into(), Some(d.to_string_lossy().into_owned())));
             }
             Kind::Other => {
                 if config::agent(&entry.command) == "gemini"
@@ -1003,12 +1013,6 @@ impl App {
             self.flash = None;
         }
         for t in 0..self.tabs.len() {
-            if let Some(Notice::Switch { at, .. }) = &self.tabs[t].notice {
-                if Instant::now() >= *at {
-                    self.switch_now(t);
-                }
-                continue;
-            }
             if self.tabs[t].done {
                 continue;
             }
@@ -1040,25 +1044,28 @@ impl App {
         let next = failover::next_member(&self.paths, &self.entries(), &self.tabs[t].tried);
         self.tabs[t].notice = Some(match next {
             Some(to) => Notice::Switch {
+                codex: self.entry(&to).is_some_and(|e| e.kind == Kind::Codex),
                 from,
                 to,
-                at: Instant::now() + SWITCH_WAIT,
             },
             None => Notice::NoneLeft { from },
         });
     }
 
     fn switch_now(&mut self, t: usize) {
-        if !matches!(self.tabs[t].notice, Some(Notice::Switch { .. })) {
+        let Some(Notice::Switch { to: agreed, .. }) = &self.tabs[t].notice else {
             return;
-        }
+        };
+        let agreed = agreed.clone();
         self.tabs[t].notice = None;
         if !self.failover {
             self.tabs[t].notice = Some(Notice::Ended { code: 1 });
             return;
         }
-        // the order, on/off and limits may have changed while the notice was up
+        // the order, on/off and limits may have changed while the notice was up;
+        // the yes was for `agreed` only, so a different next member asks again
         let Some(to) = failover::next_member(&self.paths, &self.entries(), &self.tabs[t].tried)
+            .filter(|to| *to == agreed)
         else {
             return self.retry(t);
         };
@@ -1514,6 +1521,57 @@ mod tests {
         assert!(matches!(a.modal, Some(Modal::Confirm(_))));
         a.modal_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert!(a.modal.is_none());
+    }
+
+    #[test]
+    fn switch_notice_waits_for_y() {
+        let mut a = app();
+        a.open("t1");
+        a.tabs[0].notice = Some(Notice::Switch {
+            from: "w".into(),
+            to: "t2".into(),
+            codex: false,
+        });
+        a.tick();
+        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Char('n'));
+        assert!(
+            matches!(a.tabs[0].notice, Some(Notice::Switch { .. })),
+            "no switch by time, enter or another key"
+        );
+        key(&mut a, KeyCode::Char('y'));
+        // failover is off here, so the yes ends the tab instead of moving it
+        assert!(matches!(a.tabs[0].notice, Some(Notice::Ended { .. })));
+    }
+
+    #[test]
+    fn switch_to_codex_is_flagged() {
+        let mut a = app();
+        let mut p = fs::read_to_string(&a.paths.providers).unwrap();
+        p.push_str("cx\tcodex\tCodex\n");
+        fs::write(&a.paths.providers, p).unwrap();
+        a.refresh();
+        a.open("t1");
+        a.tabs[0].tried = vec!["claude/w".into()];
+        a.retry(0);
+        assert!(matches!(
+            &a.tabs[0].notice,
+            Some(Notice::Switch { to, codex: true, .. }) if to == "cx"
+        ));
+    }
+
+    #[test]
+    fn base_config_ignores_a_cla_account_folder() {
+        let a = app();
+        let acct = a.paths.cla_root.join("w").into_os_string();
+        assert_eq!(base_config(Some(acct), &a.paths), None);
+        assert_eq!(base_config(Some("".into()), &a.paths), None);
+        let own = a.paths.home.join("own");
+        fs::create_dir_all(&own).unwrap();
+        assert_eq!(
+            base_config(Some(own.clone().into_os_string()), &a.paths),
+            Some(own)
+        );
     }
 
     #[test]

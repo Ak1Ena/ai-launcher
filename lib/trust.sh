@@ -8,6 +8,7 @@
 AI_TRUST="claude codex gemini qwen agy"
 
 _ai_trust_share() {
+  [ -e "${AI_PROVIDERS%/*}/trust.on" ] || return 0  # off unless `ai trust on`: trusting lets a folder's hooks/MCP run
   has jq || return 0
   # shortcut: off on Windows until each agent's Windows path format (C:/ vs C:\\) is verified there
   is_windows && return 0
@@ -18,12 +19,18 @@ _ai_trust_share() {
   [ -n "$hit" ] || return 0
   for n in $AI_TRUST; do "_ai_trust_${n}_has" "$d" || "_ai_trust_${n}_add" "$d"; done
 }
-# rewrite a JSON file with a jq filter, keeping its permissions; skips missing/invalid files
+# rewrite a JSON file with a jq filter. Refuses invalid input or output, backs the original up
+# once as <file>.ai-launcher.bak, keeps permissions, writes through a symlink, swaps in with one mv.
 _ai_json_edit() {
-  local f=$1 tmp; shift
+  local f=$1 tmp l; shift
   [ -r "$f" ] || return 0
-  tmp=$(mktemp) || return 0
-  if jq "$@" "$f" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then cat "$tmp" > "$f"; fi
+  while [ -L "$f" ]; do l=$(readlink "$f"); case $l in /*) f=$l ;; *) f=$(dirname "$f")/$l ;; esac; done
+  [ -f "$f" ] && jq -e . "$f" >/dev/null 2>&1 || return 0
+  tmp=$(mktemp "$f.XXXXXX") || return 0
+  if cp -p "$f" "$tmp" && jq "$@" "$f" > "$tmp" 2>/dev/null && [ -s "$tmp" ] && jq -e . "$tmp" >/dev/null 2>&1; then
+    [ -e "$f.ai-launcher.bak" ] || cp -p "$f" "$f.ai-launcher.bak"
+    mv -f "$tmp" "$f" && return 0
+  fi
   rm -f "$tmp"
 }
 
@@ -52,10 +59,10 @@ $(_ai_trust_claude_files)
 EOF
 }
 
-# Codex: [projects."<dir>"] trust_level = "trusted" in config.toml
+# Codex: [projects."<dir>"] (or [projects.'<dir>']) trust_level = "trusted" in config.toml
 _ai_trust_codex_file() { echo "${CODEX_HOME:-$HOME/.codex}/config.toml"; }
 _ai_trust_codex_level() {
-  awk -v h="[projects.\"$1\"]" '$0 == h {s = 1; next} /^\[/ {s = 0}
+  awk -v h="[projects.\"$1\"]" -v g="[projects.'$1']" '$0 == h || $0 == g {s = 1; next} /^\[/ {s = 0}
     s && $1 == "trust_level" {gsub(/[" ]/, "", $3); print $3; exit}' "$(_ai_trust_codex_file)" 2>/dev/null
 }
 _ai_trust_codex_has() { [ "$(_ai_trust_codex_level "$1")" = trusted ]; }
@@ -63,7 +70,7 @@ _ai_trust_codex_add() {
   local f; f=$(_ai_trust_codex_file)
   [ -e "$f" ] || return 0
   [ -n "$(_ai_trust_codex_level "$1")" ] && return 0  # has a level (e.g. untrusted): leave it
-  grep -qF "[projects.\"$1\"]" "$f" && return 0        # section exists without a level: leave it
+  grep -qF -e "[projects.\"$1\"]" -e "[projects.'$1']" "$f" && return 0        # section exists without a level: leave it
   printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$1" >> "$f"
 }
 

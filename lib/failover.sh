@@ -60,18 +60,16 @@ _fo_label() {
   local l
   case $1 in claude/*) echo "Claude account ${1#claude/}" ;; *) l=$(_ai_get "$1" 3); echo "${l:-$1}${l:+ ($1)}" ;; esac
 }
-# countdown under a card. Prints go (enter, any key or time up) | order (o) | stop (q).
+# asks under a card, default No. Prints go (y) | order (o) | stop (anything else: enter, end of input).
 _fo_wait() {
-  local i k rc
-  for ((i = ${AI_FO_WAIT:-5}; i > 0; i--)); do
-    printf '\r\033[2m  switching in %ds · enter now · o change order · q stop \033[0m' $i >&2
-    k=; IFS= read -r -s -n 1 -t 1 k; rc=$?
-    case $k in q|Q) printf '\n' >&2; echo stop; return ;; o|O) printf '\n' >&2; echo order; return ;; esac
-    [ $rc = 0 ] && break
-  done
-  printf '\n' >&2; echo go
+  local k=
+  # drop keys typed before the prompt (a "y" meant for claude); only a terminal can hold type-ahead.
+  # shortcut: bash 3.2 read -t takes whole seconds, so this costs 1 s; upgrade when 3.2 is dropped.
+  if [ -t 0 ]; then while IFS= read -r -s -n 1 -t 1 k; do :; done; k=; fi
+  printf '\033[2m  move? y yes · o change order · N stop [y/N] \033[0m' >&2
+  IFS= read -r -s -n 1 k; printf '\n' >&2
+  case $k in y|Y) echo go ;; o|O) echo order ;; *) echo stop ;; esac
 }
-
 # ── members and their priority ─────────────────────────────
 # every account failover can use: member TAB kind (claude|codex), in providers order
 _fo_members() {
@@ -204,7 +202,9 @@ _fo_launch_claude() {
 }
 _fo_launch_codex() {
   local m=$1 d; shift
-  d=$(_ai_account_dir "$m") && { CODEX_HOME=$(native_path "$d"); export CODEX_HOME; }
+  if d=$(_ai_account_dir "$m"); then CODEX_HOME=$(native_path "$d"); export CODEX_HOME
+  # a CODEX_HOME inherited from an ai codex account is not the main login
+  elif [ -n "${CODEX_HOME:-}" ] && _fo_under "$CODEX_HOME" "$AI_ACCOUNTS"; then unset CODEX_HOME; fi
   _ai_exec "$(_ai_cmd "$m" codex)" "$@"
 }
 # markdown of a Claude transcript's main conversation, its last 60 KB (one argument must fit)
@@ -232,9 +232,11 @@ _fo_kind() { _fo_list | awk -F'\t' -v m="$1" '$1 == m { print $2; exit }'; }
 
 # _fo_run <member> [claude args]: start on <member>, move on at each limit.
 _fo_run() {
-  local m=$1 kind tried=" " sid= tr= rc dest first=1 history run
+  local m=$1 kind tried=" " sid= tr= rc dest first=1 history run k
   shift
   FO_BASE_CFG=${CLAUDE_CONFIG_DIR:-}
+  # inside a cla session the inherited folder is that account, not main (~/.claude)
+  [ -n "$FO_BASE_CFG" ] && _fo_under "$FO_BASE_CFG" "$CLA_ROOT" && FO_BASE_CFG=
   _fo_split "$@"
   mkdir -p "$AI_FO_STATE/limited"
   AI_FO_HANDOFF="$AI_FO_STATE/handoff.$$.json"; export AI_FO_HANDOFF
@@ -259,7 +261,7 @@ $history"
       # Sessions live per config folder. The <id>/ folder beside the transcript holds its subagent and tool files.
       dest=$(_fo_claude_dir "$m")/projects/$(basename "$(dirname "$tr")")
       mkdir -p "$dest" && { [ "$tr" -ef "$dest/$(basename "$tr")" ] || {
-        cp "$tr" "$dest/" && { [ ! -d "${tr%.jsonl}" ] || cp -R "${tr%.jsonl}" "$dest/"; }; }; } ||
+        cp -p "$tr" "$dest/" && { [ ! -d "${tr%.jsonl}" ] || cp -Rp "${tr%.jsonl}" "$dest/"; }; }; } ||
         { _fo_card "✻ Failover" "Could not copy the session to $(_fo_label "$m")" "$tr"; return 1; }
       run=(${FO_KEEP[@]+"${FO_KEEP[@]}"} --resume "$sid" "$AI_FO_PROMPT")
     fi
@@ -275,8 +277,9 @@ $history"
     printf '\033[H\033[2J' >&2   # a clean screen for the switch, not claude's exit text
     while :; do
       if m=$(_fo_next "$tried"); then
+        k=; [ "$(_fo_kind "$m")" = codex ] && k="This sends the conversation to OpenAI (Codex)."
         _fo_card "✻ Failover" "$(_fo_label "$prev") hit its usage limit." \
-          "→ Moving ${sid:+this session }to $(_fo_label "$m")."
+          "→ Move ${sid:+this session }to $(_fo_label "$m")?" ${k:+"$k"}
         case $(_fo_wait) in go) break ;; stop) return 1 ;; esac
       else
         _fo_card "✻ Failover" "$(_fo_label "$prev") hit its usage limit." "No other account is on and free right now."

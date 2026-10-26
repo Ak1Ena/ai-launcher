@@ -306,6 +306,24 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn move_transcript_keeps_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ai-fo-mode-{}", std::process::id()));
+        let f = dir.join("proj/-slug/s.jsonl");
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(&f, "{}\n").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+        move_transcript(&f, &dir.join("cfg")).unwrap();
+        let mode = fs::metadata(dir.join("cfg/projects/-slug/s.jsonl"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn handoff_skips_meta_and_errors() {
         let dir = std::env::temp_dir().join(format!("ai-fo-test-{}", std::process::id()));

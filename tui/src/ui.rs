@@ -811,29 +811,33 @@ fn notice(f: &mut Frame, app: &App, n: &Notice, area: Rect) {
     let d = |t: &'static str| Span::styled(t, s(MUTED));
     let bold = s(Color::White).add_modifier(Modifier::BOLD);
     let (title, lines): (&str, Vec<Line>) = match n {
-        Notice::Switch { from, to, at } => {
-            let left = at.saturating_duration_since(Instant::now()).as_secs() + 1;
-            (
-                "✻ Failover",
-                vec![
-                    Line::from(format!("{from} hit its usage limit.")),
-                    Line::from(vec![
-                        Span::raw("→ Moving this session to "),
-                        Span::styled(app.label(to), bold),
-                    ]),
-                    Line::raw(""),
-                    Line::from(Span::styled(format!("Switching in {left}s"), s(WARN))),
-                    Line::raw(""),
-                    Line::from(vec![
-                        keycap("enter"),
-                        d(" now   "),
-                        keycap("o"),
-                        d(" change order   "),
-                        keycap("q"),
-                        d(" stop"),
-                    ]),
-                ],
-            )
+        Notice::Switch { from, to, codex } => {
+            let mut lines = vec![
+                Line::from(format!("{from} hit its usage limit.")),
+                Line::from(vec![
+                    Span::raw("→ Move this session to "),
+                    Span::styled(app.label(to), bold),
+                    Span::raw("?"),
+                ]),
+            ];
+            if *codex {
+                lines.push(Line::from(Span::styled(
+                    "This sends the conversation to OpenAI (Codex).",
+                    s(WARN),
+                )));
+            }
+            lines.extend([
+                Line::raw(""),
+                Line::from(vec![
+                    keycap("y"),
+                    d(" move   "),
+                    keycap("o"),
+                    d(" change order   "),
+                    keycap("q"),
+                    d(" stop"),
+                ]),
+            ]);
+            ("✻ Failover", lines)
         }
         Notice::NoneLeft { from } => (
             "✻ Failover",

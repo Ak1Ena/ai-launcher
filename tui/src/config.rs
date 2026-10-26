@@ -23,6 +23,19 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// `dir` unless it is `root` or inside it (resolved paths), as when ai starts inside a cla or
+/// ai account session: that inherited folder is the account's, not the main login.
+pub fn outside(dir: Option<PathBuf>, root: &Path) -> Option<PathBuf> {
+    let (d, r) = match dir.as_deref().map(fs::canonicalize) {
+        Some(Ok(d)) => (d, fs::canonicalize(root)),
+        _ => return dir,
+    };
+    match r {
+        Ok(r) if d.starts_with(&r) => None,
+        _ => dir,
+    }
+}
+
 impl Paths {
     pub fn from_env() -> Paths {
         let home = env_path("HOME").unwrap_or_else(|| PathBuf::from("."));
@@ -34,9 +47,9 @@ impl Paths {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(18000);
+        let ai_accounts = env_path("AI_ACCOUNTS").unwrap_or_else(|| home.join(".ai-accounts"));
         Paths {
             cla_root: env_path("CLA_ROOT").unwrap_or_else(|| home.join(".claude-accounts")),
-            ai_accounts: env_path("AI_ACCOUNTS").unwrap_or_else(|| home.join(".ai-accounts")),
             fo_order: env_path("AI_FO_ORDER").unwrap_or_else(|| {
                 providers
                     .parent()
@@ -44,7 +57,9 @@ impl Paths {
                     .join("failover")
             }),
             fo_state: env_path("AI_FO_STATE").unwrap_or_else(|| state.join("ai-launcher/failover")),
-            codex_home: env_path("CODEX_HOME").unwrap_or_else(|| home.join(".codex")),
+            codex_home: outside(env_path("CODEX_HOME"), &ai_accounts)
+                .unwrap_or_else(|| home.join(".codex")),
+            ai_accounts,
             cooldown: Duration::from_secs(cooldown),
             providers,
             home,
@@ -681,6 +696,22 @@ mod tests {
             codex_home: root.join("home/.codex"),
             cooldown: Duration::from_secs(60),
         }
+    }
+
+    #[test]
+    fn outside_drops_a_dir_under_the_root() {
+        let p = tmp_paths("outside");
+        let acct = p.cla_root.join("w");
+        fs::create_dir_all(&acct).unwrap();
+        let other = p.home.join(".claude");
+        assert_eq!(outside(Some(acct), &p.cla_root), None);
+        assert_eq!(outside(Some(p.cla_root.clone()), &p.cla_root), None);
+        assert_eq!(outside(Some(other.clone()), &p.cla_root), Some(other));
+        // a sibling that only shares the name's start is not inside
+        let near = p.home.join("../acc2");
+        fs::create_dir_all(&near).unwrap();
+        assert_eq!(outside(Some(near.clone()), &p.cla_root), Some(near));
+        assert_eq!(outside(None, &p.cla_root), None);
     }
 
     #[test]
