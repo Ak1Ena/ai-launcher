@@ -69,7 +69,6 @@ Delete asks first, then deletes for good. A Claude account is logged out and its
 | Key (anywhere) | Does |
 | --- | --- |
 | `alt-1`-`alt-9` | go to tab n, also while typing in a CLI |
-| `alt-←` `alt-→` | previous / next tab |
 | `ctrl-\` | go home, or from home back to the current tab |
 | `alt-0` | go home |
 

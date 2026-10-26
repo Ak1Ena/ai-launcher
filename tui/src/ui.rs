@@ -1203,7 +1203,6 @@ fn status_line(f: &mut Frame, app: &App, area: Rect) {
     }
     add(0, true, home);
     add(2, true, hint("⌥1-9", "tabs"));
-    add(4, true, hint("⌥←→", "prev/next"));
     // the right side's last two spaces fall off the edge and leave a gap after the left side
     let (left, right): (Vec<_>, Vec<_>) = fit(items, area.width as usize)
         .into_iter()
