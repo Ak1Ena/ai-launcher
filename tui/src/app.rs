@@ -849,10 +849,7 @@ impl App {
                 let (paths, source) = (self.paths.clone(), plugins::expand_home(&f.get("Source")));
                 self.say(format!("Installing {}…", plugins::hide_userinfo(&source)));
                 self.in_background(move || match plugins::add(&paths, &source) {
-                    Ok(name) => format!(
-                        "Installed plugin {name} from {}.",
-                        plugins::hide_userinfo(&source)
-                    ),
+                    Ok(msg) => msg,
                     Err(e) => format!("Could not install {}: {e}", plugins::hide_userinfo(&source)),
                 });
             }
