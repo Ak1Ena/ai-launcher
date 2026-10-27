@@ -2,7 +2,7 @@
 # cliproxy setup: install CLIProxyAPI, make the keys, sign accounts in, start the proxy.
 # ai-launcher runs it after you read and approve it (ai plugin add cliproxy / ai plugin setup cliproxy).
 # Safe to run again: each step says use it / kept / done when it is already true.
-# Exit 0 = ready, 2 = you install CLIProxyAPI yourself, 1 = failed. Never prints a key.
+# Exit 0 = ready, 2 = you install CLIProxyAPI yourself, 1 = failed. Prints only the management key, at the end, for you to keep.
 # Network: only brew install or the release download you choose in step 1, and the local proxy.
 # Test hooks: CLIPROXY_RELEASE_BASE (release download folder), CLIPROXY_SETUP_ACCOUNTS=all|none (no checklist).
 D=${AI_PLUGIN_DIR:-$(pwd)}
@@ -293,6 +293,8 @@ else
     echo "  the proxy already has a management key"
     start_proxy
     if envkey mgmt; then mk=$K
+    elif [ -f "$Y.ai-launcher.key" ] && read -r K < "$Y.ai-launcher.key" && [ -n "$K" ] && okkey mgmt "$K"; then
+      mk=$K; echo "  using the management key kept in $Y.ai-launcher.key"
     else
       ANS=p; [ -w "$Y" ] && ask "it is stored hashed, so setup cannot read it: [p]aste it / [r]eset it to a new one?"
       if [ "$ANS" = r ]; then reset_mk; else getkey mgmt; mk=$K; fi
@@ -310,6 +312,14 @@ if ! okkey mgmt "$mk"; then
   echo "  the proxy refused the saved management key (HTTP ${code:-no answer})"
   getkey mgmt; mk=$K; cset mgmt_key "$mk" || die "could not write $D/$CONF"
 fi
+# a copy beside the proxy config, so `ai plugin rm` + `add` needs no paste or reset (the proxy keeps only a hash)
+keyfile=
+case $Y in ''|run/*) ;; *)
+  keyfile=$Y.ai-launcher.key
+  [ "$(cat "$Y.ai-launcher.key" 2>/dev/null)" = "$mk" ] ||
+    { (umask 077; printf '%s\n' "$mk" > "$Y.ai-launcher.key.$$") 2>/dev/null && mv "$Y.ai-launcher.key.$$" "$Y.ai-launcher.key"; } ||
+    { rm -f "$Y.ai-launcher.key.$$"; keyfile=; echo "  could not keep the management key in $Y.ai-launcher.key: a new add will ask for it"; } ;;
+esac
 add_key() {  # append our client key to access.api-keys; existing keys are sent back unchanged
   local out code p=/v8/management/config/access/api-keys body=run/body.$$
   has jq || die "adding the client key to the proxy needs jq: add it to access.api-keys yourself, then run setup again"
@@ -452,4 +462,6 @@ case $(uname -s)/$D in
     # Windows cannot rename the staging folder while the proxy runs from it
     [ -n "$started" ] && { stop_proxy; echo "  proxy stopped so the install can finish: start it with the start action"; } ;;
 esac
+echo "  management key: $mk"
+echo "    (saved in $D/$CONF${keyfile:+ and $keyfile}; the proxy keeps only its hash)"
 echo '  Done. "Claude Code · all accounts" is ready.'

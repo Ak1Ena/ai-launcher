@@ -655,7 +655,7 @@ out=$(RP=$FK/cpa:$FK/brew:$T/jq:$T/sys st </dev/null); rc=$?
 ok "setup: uses an existing cliproxyapi" '[ $rc = 0 ] && has_line "$out" "found $FK/cpa/cliproxyapi" && has_line "$out" "use it" && ! grep -q "^install" "$T/brew.log" && has_line "$out" "Done. \"Claude Code · all accounts\" is ready."'
 k1=$(sed -n 's/^key=//p' "$SP/config"); m1=$(sed -n 's/^mgmt_key=//p' "$SP/config"); cp "$T/proxy.yaml" "$T/proxy.run1"
 out=$(st </dev/null); rc=$?
-ok "setup: keys created once, kept on rerun" '[ $rc = 0 ] && [ ${#k1} = 64 ] && [ ${#m1} = 64 ] && [ "$k1" != "$m1" ] && [ "$(sed -n "s/^key=//p" "$SP/config")" = "$k1" ] && [ "$(sed -n "s/^mgmt_key=//p" "$SP/config")" = "$m1" ] && case $(ls -l "$SP/config") in -rw-------*) true;; *) false;; esac && cmp -s "$T/proxy.orig" "$T/proxy.yaml.ai-launcher.bak" && [ "$(ls "$T" | grep -c "^proxy.yaml.ai-launcher")" = 1 ] && grep -qx "  secret-key: \"$m1\"" "$T/proxy.yaml" && grep -qx "    - \"$k1\"" "$T/proxy.yaml" && cmp -s "$T/proxy.run1" "$T/proxy.yaml" && printf "%s\n" "$out" | grep "\[2/4\] Keys" | grep -q " kept$"'
+ok "setup: keys created once, kept on rerun" '[ $rc = 0 ] && [ ${#k1} = 64 ] && [ ${#m1} = 64 ] && [ "$k1" != "$m1" ] && [ "$(sed -n "s/^key=//p" "$SP/config")" = "$k1" ] && [ "$(sed -n "s/^mgmt_key=//p" "$SP/config")" = "$m1" ] && case $(ls -l "$SP/config") in -rw-------*) true;; *) false;; esac && cmp -s "$T/proxy.orig" "$T/proxy.yaml.ai-launcher.bak" && [ "$(ls "$T" | grep -c "^proxy.yaml.ai-launcher.bak")" = 1 ] && [ "$(cat "$T/proxy.yaml.ai-launcher.key")" = "$m1" ] && case $(ls -l "$T/proxy.yaml.ai-launcher.key") in -rw-------*) true;; *) false;; esac && grep -qx "  secret-key: \"$m1\"" "$T/proxy.yaml" && grep -qx "    - \"$k1\"" "$T/proxy.yaml" && cmp -s "$T/proxy.run1" "$T/proxy.yaml" && printf "%s\n" "$out" | grep "\[2/4\] Keys" | grep -q " kept$"'
 n0=$(diff "$T/proxy.orig" "$T/proxy.run1" | grep -c "^[<>]")
 newsp "proxy_config=$T/proxy.yaml"; { printf 'server:\n  auth-dir: "~/.cli-proxy-api"\n'; printf "$Y0"; } > "$T/proxy.yaml"; cp "$T/proxy.yaml" "$T/proxy.orig"
 out=$(RP=$FK/cpa:$FK/brew:$T/jq:$T/sys st </dev/null); rc=$?
@@ -664,7 +664,7 @@ ok "setup: auth-dir ~/ becomes \$HOME/, nothing else of the file changes" '[ $rc
 # a config you already had (secret set, sample key, host ""): never edited; strict proxy checks every key
 : > "$T/mode"
 userconf() {
-  newsp "proxy_config=$T/proxy.yaml"
+  newsp "proxy_config=$T/proxy.yaml"; rm -f "$T/proxy.yaml.ai-launcher.key"
   printf '%s\n' 'server:' '  host: ""' 'management:' '  secret-key: "$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012"' 'access:' '  api-keys:' '    - "your-api-key-1"' '    - "old-key"' > "$T/proxy.yaml"
   cp "$T/proxy.yaml" "$T/proxy.orig"; echo '["old-key"]' > "$T/apikeys.json"
 }
@@ -682,10 +682,14 @@ ok "setup: client key not added: fails, not ready" '[ $rc != 0 ] && has_line "$o
 # lost management key (plugin removed and added again): reset it in the proxy config, or reuse the client key there
 : > "$T/mode"
 userconf; out=$(printf 'n\nr\n' | st); rc=$?; nk=$(sed -n 's/^mgmt_key=//p' "$SP/config")
-ok "setup: reset rewrites only secret-key, backs up, saves the key" '[ $rc = 0 ] && [ ${#nk} = 64 ] && ! has_line "$out" "$nk" && grep -qx "  secret-key: \"$nk\"" "$T/proxy.yaml" && [ "$(diff "$T/proxy.orig" "$T/proxy.yaml" | grep -c "^[<>]")" = 2 ] && cmp -s "$T/proxy.orig" "$T/proxy.yaml.ai-launcher.bak" && has_line "$out" "Done."'
+ok "setup: reset rewrites only secret-key, backs up, saves the key" '[ $rc = 0 ] && [ ${#nk} = 64 ] && has_line "$out" "  management key: $nk" && [ "$(printf "%s\n" "$out" | grep -cF -- "$nk")" = 1 ] && grep -qx "  secret-key: \"$nk\"" "$T/proxy.yaml" && [ "$(diff "$T/proxy.orig" "$T/proxy.yaml" | grep -c "^[<>]")" = 2 ] && cmp -s "$T/proxy.orig" "$T/proxy.yaml.ai-launcher.bak" && has_line "$out" "Done."'
 userconf; echo old-backup > "$T/proxy.yaml.ai-launcher.bak"; chmod 640 "$T/proxy.yaml"
 out=$(printf 'n\nr\n' | st); rc=$?; nk=$(sed -n 's/^mgmt_key=//p' "$SP/config"); b=$(ls "$T" | grep '^proxy\.yaml\.ai-launcher\.bak\.[0-9]*$')
-ok "setup: reset with an older .bak: new timestamped backup, perms kept, atomic" '[ $rc = 0 ] && [ "$(printf "%s\n" "$b" | grep -c .)" = 1 ] && cmp -s "$T/proxy.orig" "$T/$b" && [ "$(cat "$T/proxy.yaml.ai-launcher.bak")" = old-backup ] && has_line "$out" "(the old file is in $T/$b)" && case $(ls -l "$T/proxy.yaml") in -rw-r-----*) true;; *) false;; esac && [ -z "$(ls "$T" | grep "^proxy\.yaml\.[0-9]")" ] && grep -qx "  secret-key: \"$nk\"" "$T/proxy.yaml" && ! has_line "$out" "$nk"'
+ok "setup: reset with an older .bak: new timestamped backup, perms kept, atomic" '[ $rc = 0 ] && [ "$(printf "%s\n" "$b" | grep -c .)" = 1 ] && cmp -s "$T/proxy.orig" "$T/$b" && [ "$(cat "$T/proxy.yaml.ai-launcher.bak")" = old-backup ] && has_line "$out" "(the old file is in $T/$b)" && case $(ls -l "$T/proxy.yaml") in -rw-r-----*) true;; *) false;; esac && [ -z "$(ls "$T" | grep "^proxy\.yaml\.[0-9]")" ] && grep -qx "  secret-key: \"$nk\"" "$T/proxy.yaml" && has_line "$out" "  management key: $nk" && [ "$(printf "%s\n" "$out" | grep -cF -- "$nk")" = 1 ]'
+userconf; printf 'n\nr\n' | st >/dev/null; nk=$(sed -n 's/^mgmt_key=//p' "$SP/config")
+stop2; rm -rf "$SP"; cp -R "$REPO/plugins-extra/cliproxy" "$SP"; printf 'url=%s\nproxy_config=%s\n' "$URL" "$T/proxy.yaml" > "$SP/config"; chmod 600 "$SP/config"
+out=$(printf 'n\n' | st); rc=$?
+ok "setup: plugin removed and added again: kept management key, no prompt" '[ $rc = 0 ] && grep -qx "mgmt_key=$nk" "$SP/config" && has_line "$out" "using the management key kept in $T/proxy.yaml.ai-launcher.key" && ! has_line "$out" "paste" && ! has_line "$out" "[r]eset" && has_line "$out" "  management key: $nk" && [ "$(printf "%s\n" "$out" | grep -cF -- "$nk")" = 1 ]'
 userconf; chmod 444 "$T/proxy.yaml"; out=$(printf 'n\n%s\n' "$MK" | st); rc=$?; chmod 644 "$T/proxy.yaml"
 ok "setup: read-only proxy config: paste only" '[ $rc = 0 ] && ! has_line "$out" "[r]eset" && grep -qx "mgmt_key=$MK" "$SP/config"'
 userconf; out=$(CLIPROXY_MGMT_KEY=$MK st </dev/null); rc=$?
@@ -784,7 +788,7 @@ out=$(RP=$FK/win:$FK/cpa:$T/jq:$T/sys st </dev/null); rc=$?; sleep 0.3
 ok "setup: Windows staging run stops its proxy at the end" '[ $rc = 0 ] && has_line "$out" "start it with the start action" && [ ! -e "$SP/run/pid" ] && ! curl -s -m 1 -o /dev/null "http://127.0.0.1:$P2/"'
 stop2; SP=$T/sp
 stop2
-leak=; while IFS= read -r k; do [ -n "$k" ] && grep -qF -- "$k" "$T/setup.out" && leak=1; done < "$T/keys.list"
+leak=; while IFS= read -r k; do [ -n "$k" ] && grep -v "^  management key: " "$T/setup.out" | grep -qF -- "$k" && leak=1; done < "$T/keys.list"
 ok "setup: never prints a key"         '[ -z "$leak" ] && [ "$(grep -c . "$T/keys.list")" -gt 4 ] && ! grep -q pasted-mgmt-SECRET "$T/setup.out"'
 : > "$T/mode"
 
