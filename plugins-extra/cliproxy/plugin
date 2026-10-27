@@ -378,7 +378,8 @@ link1() {
   fi
   out=$(kcurl "$mgmt_key" -m 10 -F "file=@$t;type=application/json;filename=$1-$2.json" "$url/v0/management/auth-files"); code=${out##*$'\n'}
   rm -f "$t"
-  [ "$code" = 200 ] || { echo "skipped $2: the proxy refused it ($(hc "$code"))"; return 1; }
+  # the proxy's own error text (never a token: the body is its message), one line, short
+  [ "$code" = 200 ] || { echo "skipped $2: the proxy refused it ($(hc "$code")): $(printf '%s' "${out%$'\n'*}" | jq -r '.error // .message // empty' 2>/dev/null | tr -d '\000-\037\177' | cut -c1-160)"; return 1; }
   echo "linked $2"
 }
 # link [id]: every launcher account not in the proxy, or the one with that id

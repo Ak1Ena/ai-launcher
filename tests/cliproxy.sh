@@ -152,7 +152,7 @@ class H(BaseHTTPRequestHandler):
             if 'forbid' in m: return self.send(403, {"error": "remote management key not set"})
             if 'anykey' not in m and not any(self.auth(k) for k in mks()): return self.send(401, {"error": "bad mgmt key"})
             if p == '/v0/management/auth-files' and self.command == 'POST':
-                if 'upfail' in m: return self.send(500, {"error": "nope"})
+                if 'upfail' in m: return self.send(500, {"error": "failed to write file: x"})
                 return self.send(200, {"status": "ok"}) if upload(self.headers.get('Content-Type', ''), self.raw) else self.send(400, {"error": "no file"})
             if p == '/v8/management/config/access/api-keys':
                 if self.command == 'GET': return self.send(200, jfile('apikeys.json') or [])
@@ -527,6 +527,7 @@ echo '{"files":[{"auth_index":"c9","name":"Claude-K1@Example.com.json","provider
 mkdir -p "$L/cla/k6"; echo '{"oauthAccount":{"emailAddress":"K2@EXAMPLE.com"}}' > "$L/cla/k6/.claude.json"; cp "$L/cla/k2/.credentials.json" "$L/cla/k6/"
 rm -rf "$D/cache" "$T/uploads"; : > "$T/upload.mode"; echo upfail > "$T/mode"
 res=$(lrun do link); rc=$?; : > "$T/mode"
+ok "link: failed upload shows the proxy's error, no token" 'has_line "$res" "skipped cx@example.com: the proxy refused it (HTTP 500): failed to write file: x" && ! printf "%s\n" "$res" | grep -q TOK-'
 ok "link: failed upload: temp file was 600, nothing left" '[ $rc = 1 ] && has_line "$res" "skipped cx@example.com: the proxy refused it (HTTP 500)" && [ -s "$T/upload.mode" ] && [ -z "$(grep -v "^-rw-------" "$T/upload.mode")" ] && [ -z "$(ls "$D/cache" | grep "^link")" ] && [ -z "$(grep -rl TOK- "$D")" ]'
 res=$(lrun do link); rc=$?
 ok "link: a same-name proxy file is never overwritten" 'has_line "$res" "skipped k1@example.com: a proxy file named claude-k1@example.com.json already exists" && [ ! -e "$T/uploads/claude-k1@example.com.json" ] && grep -q "Claude-K1@Example.com.json" "$T/creds.json" && [ "$(ls "$T/uploads" | grep -ic "^claude-k1")" = 0 ]'
@@ -623,6 +624,10 @@ ok "setup: uses an existing cliproxyapi" '[ $rc = 0 ] && has_line "$out" "found 
 k1=$(sed -n 's/^key=//p' "$SP/config"); m1=$(sed -n 's/^mgmt_key=//p' "$SP/config"); cp "$T/proxy.yaml" "$T/proxy.run1"
 out=$(st </dev/null); rc=$?
 ok "setup: keys created once, kept on rerun" '[ $rc = 0 ] && [ ${#k1} = 64 ] && [ ${#m1} = 64 ] && [ "$k1" != "$m1" ] && [ "$(sed -n "s/^key=//p" "$SP/config")" = "$k1" ] && [ "$(sed -n "s/^mgmt_key=//p" "$SP/config")" = "$m1" ] && case $(ls -l "$SP/config") in -rw-------*) true;; *) false;; esac && cmp -s "$T/proxy.orig" "$T/proxy.yaml.ai-launcher.bak" && [ "$(ls "$T" | grep -c "^proxy.yaml.ai-launcher")" = 1 ] && grep -qx "  secret-key: \"$m1\"" "$T/proxy.yaml" && grep -qx "    - \"$k1\"" "$T/proxy.yaml" && cmp -s "$T/proxy.run1" "$T/proxy.yaml" && printf "%s\n" "$out" | grep "\[2/4\] Keys" | grep -q " kept$"'
+n0=$(diff "$T/proxy.orig" "$T/proxy.run1" | grep -c "^[<>]")
+newsp "proxy_config=$T/proxy.yaml"; { printf 'server:\n  auth-dir: "~/.cli-proxy-api"\n'; printf "$Y0"; } > "$T/proxy.yaml"; cp "$T/proxy.yaml" "$T/proxy.orig"
+out=$(RP=$FK/cpa:$FK/brew:$T/jq:$T/sys st </dev/null); rc=$?
+ok "setup: auth-dir ~/ becomes \$HOME/, nothing else of the file changes" '[ $rc = 0 ] && grep -qx "  auth-dir: \"$HOME/.cli-proxy-api\"" "$T/proxy.yaml" && [ "$(diff "$T/proxy.orig" "$T/proxy.yaml" | grep -c "^[<>]")" = $((n0 + 2)) ] && head -1 "$T/proxy.yaml" | grep -qx "server:"'
 
 # a config you already had (secret set, sample key, host ""): never edited; strict proxy checks every key
 : > "$T/mode"
