@@ -121,7 +121,7 @@ pub fn resolve(paths: &Paths, id: &str) -> Option<(Plugin, String)> {
 }
 
 /// Text without ANSI escapes or other control characters (status text may carry colour for bash).
-fn plain(s: &str) -> String {
+pub fn plain(s: &str) -> String {
     let mut out = String::new();
     let mut it = s.chars().peekable();
     while let Some(c) = it.next() {

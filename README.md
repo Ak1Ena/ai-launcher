@@ -291,7 +291,7 @@ ai plugin do <name> <action>           # run one of the plugin's actions
 
 `ai plugin new <name>` copies `templates/plugin/` into the plugins folder and does not run its setup. `ai plugin ls` ends with an `available` list: bundled plugins not installed yet, with `(has setup)` when they need one.
 
-TUI keys on a plugin row: `a` actions, `o` on/off, `u` update, `d` delete, `e` show its folder. `p` (or the `+ Plugin` button) opens the Plugins screen with its add form, from anywhere on home. On a plugin row, `a`, `d` and `e` are plugin actions; adding an account stays on the button and on other rows.
+TUI keys on a plugin row: `a` actions (the plugin's tabbed menu when it has one, see "Menu"), `o` on/off, `u` update, `d` delete, `e` show its folder. `p` (or the `+ Plugin` button) opens the Plugins screen with its add form, from anywhere on home. On a plugin row, `a`, `d` and `e` are plugin actions; adding an account stays on the button and on other rows.
 
 `P` (or the `Plugins` button) opens the Plugins screen: installed plugins (name, `about` or title, status `● ok` / `× failed` / `·` off / `loading…`, on/off, `actions`, `↻ update` for git plugins, `[-]`), then bundled plugins not installed yet (`has setup`, `[+]`), then `[+ Add from git / folder]`. In it: Enter actions, space or `o` on/off, `u` update, `-` remove (asks first), `+` installs the bundled plugin under the cursor or opens the add form, `/` searches names and `about` text. Esc closes the innermost thing: the add form, the search text, then the screen. Every `[+]`, `[-]`, `actions`, `↻ update` and on/off is clickable. `s` runs the setup of the plugin under the cursor again.
 
@@ -313,12 +313,27 @@ ai                          # the demo section shows up in the picker
 | --- | --- | --- |
 | `rows` | First line `section<TAB><title>`. Then one line per entry: `<id><TAB><label><TAB><status text>`. A line `  <TAB><text>` (two spaces, a tab) is a detail line shown under the entry above it. | 2 s (in the TUI, a plugin's first call in a session gets 10 s). A failure or timeout shows `<name>: plugin failed`. |
 | `actions` (optional) | One line per action: `<action><TAB><label>`. | 2 s (TUI first call: 10 s) |
+| `menu` (optional, TUI only) | Tabs for the TUI's `a` window, see "Menu" below. Without it, `a` shows the `actions` form. | 2 s (TUI first call: 10 s) |
 | `do <action>` | Runs the action. stdin is closed; stdout and stderr are shown. `rows` refreshes afterwards. | 30 s, then it is killed |
 | `launch <id> [args...]` | Runs the session in the foreground with the terminal (bash: `exec`, TUI: its own tab). | none |
 
 An entry `<id>` is letters, digits, `.`, `_` or `-`. Status and detail text is plain text; the bash picker shows ANSI colour, the TUI strips it. Other files refer to an entry as `plugin:<name>/<id>` (for example the default entry); an id that no longer exists is ignored. In the bash `ai`, launches share folder trust like any other (only with `ai trust on`); the TUI has no shared trust.
 
 Two marker files sit in the plugin folder. `.off` (empty) turns it off: it is never run, and its section shows `<name> · off`. `.source` holds the git URL it was installed from, used by `update`. A plugin is code you chose to run, with your permissions, so install only plugins you trust. `ai plugin add|update` with a git source is the only time `ai` touches the network for plugins; everything else is up to the plugin.
+
+**Menu.** With `menu`, `a` on a plugin row (or Enter in the Plugins screen) opens one window with a tab per `tab` line. Tab-separated lines; anything else is skipped, and a tab left empty is dropped:
+
+```
+tab<TAB>list|radio|checklist<TAB><title>[<TAB>order|weight]
+item<TAB><id><TAB><label>[<TAB>on]
+row<TAB><key><TAB><label><TAB>1|0<TAB><n|-><TAB><note><TAB><on-id><TAB><off-id><TAB><dec-id><TAB><inc-id>
+```
+
+- `list`: its `item`s; Enter runs `do <id>`. `radio`: the same, and `on` marks the current choice (`●`, others `○`).
+- `checklist`: its `row`s, `order` (default) or `weight`. `1` = ticked (in use). `<n>` is the position (`order`) or the weight 0..99 (`weight`); `-` means not placed (for example not linked yet): it shows no number and never moves. `dec` / `inc` are move up / down (`order`) or weight -1 / +1 (`weight`). An id of `-` means that change is not offered.
+- Keys: ←/→ (or Tab) switch tabs, ↑/↓ move, space ticks, `shift-↑/↓` (or `K`/`J`) reorders an `order` list, `+`/`-` changes a weight. Nothing runs until Enter; Esc closes with no change.
+- Enter on a checklist runs `do` once per step, in this order: ticks of rows not placed (on-id, e.g. a link), then other ticks (on-id / off-id), then moves (a row's dec-id once per place it rises, which reaches any new order), then weights (inc-id or dec-id once per step). A failure doesn't stop the rest. Then the plugin reloads, and one line says `applied N changes` or `K of N changes failed: <id> failed: <why>; …`.
+- Every id and key is an action id (`[A-Za-z0-9._-]+`). The window runs the ids of the menu it opened with, never a list refreshed meanwhile. Bash `ai` has no menu window and ignores `menu`; `ai plugin do <name> <id>` runs the same ids.
 
 **`setup` contract** (optional file, same folder as `plugin`):
 
@@ -389,6 +404,8 @@ Weights and priorities go through `PATCH /v8/management/credentials/fields` (v0:
 
 **Link.** With a management key, every `cla` account and Codex provider whose email (any case) the proxy does not have yet is listed as `<email>  not linked`, so one added with the launcher's "+ Add" shows up at once. The action **`<email>: link to proxy`** (`link.<kind>-<name>`) or **Link all launcher accounts** (`ai plugin do cliproxy link`) uploads that account's own login as a proxy auth file (`POST /v0/management/auth-files`, `claude-<email>.json` / `codex-<email>.json`), with no browser. A Claude login comes from the macOS Keychain (item `Claude Code-credentials-<first 8 hex of sha256 of the account folder path>`, read with `security`) or from `<account>/.credentials.json`; a Codex login from its `auth.json`. Tokens are never printed, never on a command line, and only briefly in a mode-600 temp file in the plugin's cache. Actions have no terminal, so a Keychain prompt may block them; the entry **+ Link launcher accounts** does the same in a terminal. Each account reports `linked <email>` or `skipped <email>: <reason>`.
 The trade-off: a linked account shares one login between `cla` (or Codex) and the proxy. Refresh tokens rotate (each refresh replaces the old one), so a token refresh on one side will likely sign the other side out. If that happens, log the `cla` account in again (`cla <name>`), or give the proxy its own login with setup's "sign in again". The proxy keeps the copied tokens in plaintext in its own auth directory, like every login it holds. Link never uploads over a proxy file of the same name, and links each email once.
+
+**TUI menu.** In the TUI, `a` on the cliproxy row opens its tabs (`plugin menu`): **Actions** (start, stop, apply, keep each chat on one account, link all), **Mode** (failover / weighted round-robin, current one `●`), and **Accounts**, a checklist of the proxy's Claude and Codex accounts, then the launcher accounts not linked yet. Tick = use (a not-linked one: link it), untick = don't use; in failover `shift-↑/↓` sets the order, in weighted round-robin `+`/`-` the weight. Enter runs the same `link.` / `on.` / `off.` / `up.` / `wup.` / `wdown.` actions as `ai plugin do`. Linking pins the current order into `order=` first, so new accounts land after it.
 
 **Remove.** `ai plugin rm cliproxy` deletes the plugin folder, and with it the saved client and management keys in `config`. The proxy and its config stay; setup can reset the management key after a new `add`.
 
