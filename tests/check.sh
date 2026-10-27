@@ -459,6 +459,16 @@ mksetup sleepy 'touch "'"$T"'/setup.started"; sleep 30'; mkdir -p "$T/tmpx"
   kill -INT -- -$p; wait $p ) 2>/dev/null
 ok "setup: interrupt removes staging and the temp copy" '[ -e "$T/setup.started" ] && [ ! -e "$PL/sleepy" ] && [ ! -e "$PL/.sleepy.install" ] && grep -qx "setup failed (exit 130): plugin not installed" "$T/int.out" && [ -z "$(ls -A "$T/tmpx")" ]'
 
+# plugin new, about, available list
+ok "plugin new: creates a working plugin" 'AI plugin new demo >/dev/null 2>&1 && [ -x "$PL/demo/plugin" ] && [ -x "$PL/demo/setup" ] && "$PL/demo/plugin" rows | head -1 | grep -q "^section${TAB}" && _ai_plugin_rows demo | cut -f1,2 | grep -q "^plugin:demo${TAB}hello"'
+cp -R "$PL/demo" "$T/demo.bak"
+ok "plugin new: refuses existing and bad names" '! AI plugin new demo >/dev/null 2>&1 && ! AI plugin new "a b" >/dev/null 2>&1 && diff -r "$PL/demo" "$T/demo.bak" >/dev/null'
+lsout=$(AI plugin ls 2>&1 | plain)
+ok "plugin ls: lists available bundled with about" 'echo "$lsout" | grep -A3 "^available" | grep -q "cliproxy.*Claude Code through CLIProxyAPI: all accounts as one"'
+ok "plugin ls: installed bundled leaves available" 'AI_YES=1 AI plugin add cliproxy >/dev/null 2>&1 && AI plugin ls 2>&1 | plain | grep -q "no other bundled plugins"'
+AI_PLUGIN_DIR=$PL/demo "$PL/demo/setup" >/dev/null 2>&1; cp "$PL/demo/config" "$T/demo.cfg"
+ok "template setup is safe to run twice" 'AI_PLUGIN_DIR=$PL/demo "$PL/demo/setup" >/dev/null 2>&1 && cmp -s "$PL/demo/config" "$T/demo.cfg"'
+
 # the bundled cliproxy plugin has its own suite (fake proxy, fake HOME)
 ok "cliproxy plugin suite" 'bash "$REPO/tests/cliproxy.sh" >/dev/null 2>&1'
 

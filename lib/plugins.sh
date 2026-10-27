@@ -82,8 +82,8 @@ _ai_plugin_launch() {
 _ai_plugin() {
   local sub=${1:-ls}; [ $# -gt 0 ] && shift
   case $sub in
-    ls|add|update|setup|rm|on|off|do) "_ai_plugin_$sub" "$@" ;;
-    *) echo "usage: ai plugin ls | add <folder|git url|owner/repo|cliproxy> [name] | update [name] | setup|rm|on|off <name> | do <name> <action>"; return 1 ;;
+    ls|add|new|update|setup|rm|on|off|do) "_ai_plugin_$sub" "$@" ;;
+    *) echo "usage: ai plugin ls | add <folder|git url|owner/repo|cliproxy> [name] | new <name> | update [name] | setup|rm|on|off <name> | do <name> <action>"; return 1 ;;
   esac
 }
 # name must be valid; with "x" it must also be installed (a link counts)
@@ -92,7 +92,7 @@ _ai_plugin_arg() {
   [ -z "${2:-}" ] || [ -e "$(_ai_plugins_dir)/$1" ] || [ -L "$(_ai_plugins_dir)/$1" ] || { echo "no plugin '$1' (ai plugin ls)" >&2; return 1; }
 }
 _ai_plugin_ls() {
-  local n d st src title
+  local n d st src title av
   for n in $(_ai_plugin_names); do
     d=$(_ai_plugins_dir)/$n; src=local; title=
     [ -s "$d/.source" ] && src=$(head -1 "$d/.source" | sed 's#^\([A-Za-z0-9+.-]*://\)[^/@]*@#\1#')
@@ -100,6 +100,38 @@ _ai_plugin_ls() {
     else st=on; title=$(_ai_plugin_call "$n" 2 rows | head -1 | tr -d '\000-\010\013-\037\177'); title=${title#section"$TAB"}; fi
     printf '\033[1;36m%s\033[0m %s %s \033[2m%s\033[0m\n' "$(pad "$n" 12)" "$(pad "$st" 3)" "$(pad "$title" 28)" "$src"
   done
+  av=$(_ai_plugin_available)
+  echo; echo "available"
+  if [ -z "$av" ]; then echo "  no other bundled plugins"; return 0; fi
+  while IFS="$TAB" read -r n title st; do
+    printf '  \033[1;36m%s\033[0m %s%s\n' "$(pad "$n" 12)" "$title" "$([ "$st" = setup ] && echo ' (has setup)')"
+  done <<<"$av"
+}
+# first line of <dir>/about, control chars stripped, 60 chars max
+_ai_plugin_about() {
+  local a; [ -f "$1/about" ] || return 0
+  a=$(head -1 "$1/about" | tr -d '\000-\010\013-\037\177'); printf '%s\n' "${a:0:60}"
+}
+# bundled plugins not installed: name TAB about TAB setup|-
+_ai_plugin_available() {
+  local d n s
+  for d in "${AI_HOME:-}"/plugins-extra/*/; do
+    d=${d%/}; n=${d##*/}
+    [ -f "$d/plugin" ] && _ai_plugin_ok_name "$n" || continue
+    [ -e "$(_ai_plugins_dir)/$n" ] || [ -L "$(_ai_plugins_dir)/$n" ] && continue
+    s=-; [ -f "$d/setup" ] && s=setup
+    printf '%s\t%s\t%s\n' "$n" "$(_ai_plugin_about "$d")" "$s"
+  done
+}
+# ai plugin new <name>: copy the template; setup is not run
+_ai_plugin_new() {
+  local n=${1:-} dir
+  _ai_plugin_arg "$n" || return 1
+  dir=$(_ai_plugins_dir)/$n
+  { [ -e "$dir" ] || [ -L "$dir" ]; } && { echo "plugin '$n' exists"; return 1; }
+  mkdir -p "${dir%/*}" && cp -R "${AI_HOME:-}/templates/plugin" "$dir" || return 1
+  chmod +x "$dir/plugin" "$dir/setup"
+  echo "created plugin $n in $dir: edit plugin, then run ai"
 }
 _ai_plugin_nouser() { sed 's#\(://\)[^/@ ]*@#\1#g'; }  # no user:token@ in output
 _ai_plugin_add() {

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Plugin protocol (see README "Writing a plugin"). Rules:
+#  - `rows` must be fast (2 s limit), never prompt, print plain text, and never print secrets.
+#  - Keep your state in files relative to $AI_PLUGIN_DIR, not elsewhere.
+#  - There is no tty for rows / actions / do. `launch` runs in the foreground with the terminal.
+case ${1:-} in
+  rows)
+    # first line: section title. Then entries: id TAB label TAB status. "  TAB text" is a detail line.
+    printf 'section\tDemo\n'
+    printf 'hello\tHello\tready\n'
+    printf '  \tfolder: %s\n' "${AI_PLUGIN_DIR:-?}"
+    ;;
+  actions)
+    printf 'ping\tPing\n'
+    ;;
+  do)
+    case ${2:-} in
+      ping) echo "pong" ;;
+      *) echo "unknown action: ${2:-}"; exit 1 ;;
+    esac
+    ;;
+  launch)
+    # $2 is the entry id, the rest are extra args
+    exec bash -c 'echo hello from $AI_PLUGIN_DIR; exec "${SHELL:-bash}"'
+    ;;
+  *) exit 1 ;;
+esac
