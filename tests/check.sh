@@ -479,6 +479,6 @@ AI_PLUGIN_DIR=$PL/demo "$PL/demo/setup" >/dev/null 2>&1; cp "$PL/demo/config" "$
 ok "template setup is safe to run twice" 'AI_PLUGIN_DIR=$PL/demo "$PL/demo/setup" >/dev/null 2>&1 && cmp -s "$PL/demo/config" "$T/demo.cfg"'
 
 # the bundled cliproxy plugin has its own suite (fake proxy, fake HOME)
-ok "cliproxy plugin suite" 'bash "$REPO/tests/cliproxy.sh" >/dev/null 2>&1'
+ok "cliproxy plugin suite" 'cpo=$(bash "$REPO/tests/cliproxy.sh" 2>&1) || { echo "$cpo" | grep -A3 "^FAIL" >&2; false; }'
 
 echo; if [ $fails -gt 0 ]; then echo "$fails failed"; exit 1; else echo "all passed"; fi
