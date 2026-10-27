@@ -369,10 +369,13 @@ ok "plugins: CR and control chars stripped" 'echo "$crow" | plain | grep -q "Al\
 rm -rf "$PL/sec" "$PL/crl"
 mkdir -p "$T/src/myp" "$T/src/noplug" "$T/keepplug"; printf '#!/bin/sh\necho mine\n' > "$T/src/myp/plugin"; chmod +x "$T/src/myp/plugin"
 AI() { "$REPO/bin/ai" "$@"; }
-# cliproxy's setup against fakes: a cliproxyapi, a brew without it, and a curl that says the proxy is up (no network, no real brew)
-mkdir -p "$T/cpfake"; for f in cliproxyapi curl; do printf '#!/bin/sh\nexit 0\n' > "$T/cpfake/$f"; done
+# cliproxy's setup against fakes (no network, no real brew): a brew without cliproxyapi, a cliproxyapi whose start
+# marks the proxy up, and a curl whose probe is up after that start and whose API calls answer 200
+mkdir -p "$T/cpfake"
+printf '#!/bin/sh\ntouch "%s/cpup"\n' "$T" > "$T/cpfake/cliproxyapi"
+printf '#!/bin/sh\ncase " $* " in *" -w "*) printf "\\n200" ;; *) [ -e "%s/cpup" ] ;; esac\n' "$T" > "$T/cpfake/curl"
 printf '#!/bin/sh\nexit 1\n' > "$T/cpfake/brew"; chmod +x "$T"/cpfake/*
-AIcp() { PATH=$T/cpfake:$PATH AI_YES=1 CLIPROXY_SETUP_ACCOUNTS=none AI "$@" </dev/null; }
+AIcp() { rm -f "$T/cpup"; PATH=$T/cpfake:$PATH AI_YES=1 CLIPROXY_SETUP_ACCOUNTS=none AI "$@" </dev/null; }
 ok "plugin add: local folder" 'AI plugin add "$T/src/myp/" >/dev/null 2>&1 && [ -x "$PL/myp/plugin" ] && [ ! -e "$PL/myp/.source" ]'
 mkdir -p "$T/src/real"; cp "$T/src/myp/plugin" "$T/src/real/"; ln -s real "$T/src/lnkp"
 ok "plugin add: symlinked folder copies contents" 'AI plugin add "$T/src/lnkp" >/dev/null 2>&1 && [ -d "$PL/lnkp" ] && [ ! -L "$PL/lnkp" ] && [ -x "$PL/lnkp/plugin" ]; rm -rf "$PL/lnkp"'
