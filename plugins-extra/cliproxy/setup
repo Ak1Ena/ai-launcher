@@ -8,7 +8,7 @@
 D=${AI_PLUGIN_DIR:-$(pwd)}
 cd "$D" || exit 1
 D=$(pwd)   # a / path whatever the env holds (the Windows install check below needs it)
-CONF=config TAB=$(printf '\t') DL= BODY= started=
+CONF=config TAB=$(printf '\t') DL= BODY= YT= BAK= started=
 has() { command -v "$1" >/dev/null 2>&1; }
 brew_managed() { has brew && brew list cliproxyapi >/dev/null 2>&1; }
 stop_proxy() {  # the proxy this run started
@@ -16,7 +16,7 @@ stop_proxy() {  # the proxy this run started
   started=
 }
 # a failed or cancelled setup leaves no proxy behind (the installer then removes the staging folder)
-trap 'rc=$?; rm -rf "$DL" "$BODY"; [ $rc != 0 ] && [ -n "$started" ] && stop_proxy; exit $rc' EXIT
+trap 'rc=$?; rm -rf "$DL" "$BODY" "$YT"; [ $rc != 0 ] && [ -n "$started" ] && stop_proxy; exit $rc' EXIT
 trap 'exit 130' INT TERM HUP
 die() { echo "  $*"; exit 1; }
 has curl || die "setup needs curl"
@@ -101,7 +101,7 @@ getkey() {
 }
 # a proxy config this run made or installed: localhost only, no sample client keys (never a config that was there before)
 sanitize() {
-  [ -n "$own" ] || [ -e "$1.ai-launcher.bak" ] || cp -p "$1" "$1.ai-launcher.bak" || die "could not back up $1"
+  [ -n "$own" ] || [ -n "$BAK" ] || { BAK=$1.ai-launcher.bak; [ -e "$BAK" ] && BAK=$BAK.$(date +%s); cp -p "$1" "$BAK"; } || die "could not back up $1"
   ( umask 077; sed -e 's/^\(  host: \)""/\1"127.0.0.1"/' -e '/^[[:blank:]]*- "your-api-key-[0-9]*"[[:blank:]]*$/d' "$1" > "$1.$$" ) &&
     cat "$1.$$" > "$1"; local rc=$?
   rm -f "$1.$$"; [ $rc = 0 ] || die "could not edit $1"
@@ -149,10 +149,20 @@ download() {
   bin=bin/cliproxyapi$exe
   step 1 Install "$asset" "installed"
 }
-yedit() {  # yedit <awk program>: edit the proxy config in place (keeps its permissions), backed up once
-  [ -n "$own" ] || [ -e "$Y.ai-launcher.bak" ] || cp -p "$Y" "$Y.ai-launcher.bak" || die "could not back up $Y"
-  ( umask 077; MK=$mk K=$key awk "BEGIN { mk = ENVIRON[\"MK\"]; k = ENVIRON[\"K\"] } $1" "$Y" > "$Y.$$" ) && [ -s "$Y.$$" ] && cat "$Y.$$" > "$Y"; local rc=$?
-  rm -f "$Y.$$"; [ $rc = 0 ] || die "could not edit $Y"
+yedit() {  # yedit <awk program>: edit the proxy config (keeps its permissions); the first edit of a run backs it up
+  local y=$Y m l
+  # shortcut: one level of symlink is followed (brew's etc file is a plain file); deeper chains are edited at the last link read
+  if [ -L "$y" ]; then l=$(readlink "$y"); case $l in /*) y=$l ;; *) y=$(dirname "$y")/$l ;; esac; fi
+  if [ -z "$own" ] && [ -z "$BAK" ]; then
+    BAK=$Y.ai-launcher.bak; [ -e "$BAK" ] && BAK=$BAK.$(date +%s)   # never overwrite an older backup
+    cp -p "$y" "$BAK" || die "could not back up $Y"
+  fi
+  m=$(ls -ld "$y"); m=${m%% *}
+  m="u=$(echo "${m:1:3}" | tr -cd rwx),g=$(echo "${m:4:3}" | tr -cd rwx),o=$(echo "${m:7:3}" | tr -cd rwx)"
+  YT=$y.$$   # holds the keys: 600, same folder, removed by the traps
+  ( umask 077; MK=$mk K=$key awk "BEGIN { mk = ENVIRON[\"MK\"]; k = ENVIRON[\"K\"] } $1" "$y" > "$YT" ) && [ -s "$YT" ] &&
+    chmod "$m" "$YT" && mv "$YT" "$y" || { rm -f "$YT"; YT=; die "could not edit $Y"; }
+  YT=
 }
 secret() {  # value of the first secret-key: line
   awk '/^[ \t]*secret-key:/ { v = $0; sub(/^[ \t]*secret-key:[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v)
@@ -172,7 +182,7 @@ reset_mk() {
   yedit '!d && /^[ \t]*secret-key:/ { i = $0; sub(/secret-key:.*/, "", i); print i "secret-key: \"" mk "\""; d = 1; next } { print }'
   local i=0; while [ $i -lt 20 ] && ! okkey mgmt "$mk"; do sleep 0.5; i=$((i + 1)); done
   okkey mgmt "$mk" || die "the proxy did not take the new management key within 10 s (HTTP ${code:-no answer}): restart the proxy, then run setup again"
-  echo "  new management key written to $Y (the old file is in $Y.ai-launcher.bak)"
+  echo "  new management key written to $Y${BAK:+ (the old file is in $BAK)}"
 }
 keys_empty() {  # no client key in the proxy config yet
   awk '!s && /^[ \t]*api-keys:/ { v = $0; sub(/^[ \t]*api-keys:[ \t]*/, "", v); sub(/[ \t]*#.*$/, "", v)

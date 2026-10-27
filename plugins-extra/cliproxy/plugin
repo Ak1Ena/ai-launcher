@@ -51,7 +51,9 @@ JQDEF='def clean: tostring | gsub("[[:cntrl:]]"; "");
   def wt: .weight // 1 | (tonumber? // 1) | floor | if . < 0 then 0 elif . > 99 then 99 else . end;
   def accts: [.files[]? | select((.provider // .type // "") | ascii_downcase | test("^(claude|codex)$"))
     | {i: aid, n: (.name // .id // "" | clean), e: who, w: wt, d: (.disabled == true)} | select(.i != "" and .n != "")]
-    | sort_by(.n)[] | [.i, .n, .e, .w, .d] | @tsv;'
+    | sort_by(.n)[] | [.i, .n, .e, .w, .d] | @tsv;
+  # every proxy file, any provider: lower-case name TAB lower-case email field ("" when none), for link
+  def names: .files[]? | [(.name // .id // "" | clean | ascii_downcase), (.email | if type == "string" then clean | ascii_downcase else "" end)] | @tsv;'
 
 # ── usage cache: line 1 = fetch time, then detail lines ──
 refresh() {
@@ -79,11 +81,12 @@ refresh() {
       404) line="usage: management API off (set remote-management secret-key in the proxy config)" ;;
       *) line="usage: management API unavailable (${code:-no answer})" ;;
     esac
-    rm -f "$CACHE/accts"
+    rm -f "$CACHE/accts" "$CACHE/names"
     { date +%s; printf '  \t%s\n' "$line"; } > "$f"; mv "$f" "$CACHE/usage"; return
   fi
   # accounts cache: <idx> TAB <name> TAB <email> TAB <weight> TAB <disabled> per claude / codex account, by name
   jq -r "$JQDEF"'accts' "$creds" > "$CACHE/accts.$$" 2>/dev/null && mv "$CACHE/accts.$$" "$CACHE/accts"
+  jq -r "$JQDEF"'names' "$creds" > "$CACHE/names.$$" 2>/dev/null && mv "$CACHE/names.$$" "$CACHE/names"
   # each enabled claude / codex login: its provider's own usage endpoint through the proxy (as the Management Center does)
   jq -r '.files[] | select((.disabled != true) and ((.provider // .type // "") | ascii_downcase | test("^(claude|codex)$")))
     | [.auth_index, (.provider // .type | ascii_downcase), (.id_token.chatgpt_account_id? // "")] | @tsv' "$creds" 2>/dev/null |
@@ -255,6 +258,7 @@ fetchaccts() {  # the live list into the accounts cache
   [ "$code" = 200 ] || { echo "could not read the accounts ($(hc "$code"))"; return 1; }
   mkdir -p "$CACHE" && chmod 700 "$CACHE"
   printf '%s\n' "${out%$'\n'*}" | jq -r "$JQDEF"'accts' > "$CACHE/accts.$$" 2>/dev/null && mv "$CACHE/accts.$$" "$CACHE/accts"
+  printf '%s\n' "${out%$'\n'*}" | jq -r "$JQDEF"'names' > "$CACHE/names.$$" 2>/dev/null && mv "$CACHE/names.$$" "$CACHE/names"
 }
 # accounts cache in failover order: order= names first, the rest by name, gone names dropped
 # shortcut: a comma inside an auth file name breaks order=; file names have none today
@@ -338,10 +342,10 @@ laccts() {
   done < "$pf"
 }
 JWT='def jwt: split(".")[1] // "" | gsub("-"; "+") | gsub("_"; "/") | . + ([range(0; (4 - length % 4) % 4)] | map("=") | join("")) | @base64d | fromjson;'
-# launcher accounts whose email is not in the accounts cache (case-insensitive)
+# launcher accounts whose email no proxy file has in its email field (any case); one per email
 unlinked() {
-  [ -f "$CACHE/accts" ] || return 0
-  laccts | awk -F "$TAB" 'FILENAME == ARGV[1] { p[tolower($3)] = 1; next } !(tolower($3) in p)' "$CACHE/accts" -
+  [ -f "$CACHE/names" ] || return 0
+  laccts | awk -F "$TAB" 'FILENAME == ARGV[1] { if ($2 != "") p[$2] = 1; next } { e = tolower($3) } !(e in p) && !s[e]++' "$CACHE/names" -
 }
 # Keychain service of a Claude Code config dir: "Claude Code-credentials-" + sha256(CLAUDE_CONFIG_DIR)[0:8],
 # as claude 2.1.311 builds it (kW(): no suffix only when CLAUDE_CONFIG_DIR is unset); account = $USER
@@ -368,6 +372,10 @@ link1() {
   fi
   s=
   [ -s "$t" ] || { rm -f "$t"; echo "skipped $2: no saved login found"; return 1; }
+  # the proxy replaces a file of the same name: never upload over one
+  if cut -f1 "$CACHE/names" | grep -qxF -- "$(printf '%s' "$1-$2.json" | tr 'A-Z' 'a-z')"; then
+    rm -f "$t"; echo "skipped $2: a proxy file named $1-$2.json already exists"; return 1
+  fi
   out=$(kcurl "$mgmt_key" -m 10 -F "file=@$t;type=application/json;filename=$1-$2.json" "$url/v0/management/auth-files"); code=${out##*$'\n'}
   rm -f "$t"
   [ "$code" = 200 ] || { echo "skipped $2: the proxy refused it ($(hc "$code"))"; return 1; }

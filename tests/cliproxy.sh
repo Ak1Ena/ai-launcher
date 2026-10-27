@@ -152,6 +152,7 @@ class H(BaseHTTPRequestHandler):
             if 'forbid' in m: return self.send(403, {"error": "remote management key not set"})
             if 'anykey' not in m and not any(self.auth(k) for k in mks()): return self.send(401, {"error": "bad mgmt key"})
             if p == '/v0/management/auth-files' and self.command == 'POST':
+                if 'upfail' in m: return self.send(500, {"error": "nope"})
                 return self.send(200, {"status": "ok"}) if upload(self.headers.get('Content-Type', ''), self.raw) else self.send(400, {"error": "no file"})
             if p == '/v8/management/config/access/api-keys':
                 if self.command == 'GET': return self.send(200, jfile('apikeys.json') or [])
@@ -481,7 +482,7 @@ CXID="h.$(b64 '{"email":"cx@example.com"}').TOK-CX-IDSIG" CXAT="h.$(b64 '{"exp":
 echo "{\"tokens\":{\"id_token\":\"$CXID\",\"access_token\":\"$CXAT\",\"refresh_token\":\"TOK-CX-REFRESH\",\"account_id\":\"acct-1\"}}" > "$L/acc/codex/cw/auth.json"
 printf 'cw\tcodex --x\tCodex cw\nother\tgemini\tGemini\n' > "$L/providers"
 printf '#!/bin/sh\necho "$*" >> "%s/security.argv"\ns=; p=; for a; do [ "$p" = -s ] && s=$a; p=$a; done\n[ -f "%s/kc/$s" ] || exit 44\ncat "%s/kc/$s"\n' "$T" "$T" "$T" > "$T/kc/security"
-printf '#!/bin/sh\necho "$*" >> "%s/curl.argv"\nexec "%s" "$@"\n' "$T" "$(command -v curl)" > "$T/argv/curl"; chmod +x "$T/kc/security" "$T/argv/curl"
+printf '#!/bin/sh\necho "$*" >> "%s/curl.argv"\nfor a; do case $a in file=@*) f=${a#file=@}; ls -l "${f%%%%;*}" | cut -c1-10 >> "%s/upload.mode" ;; esac; done\nexec "%s" "$@"\n' "$T" "$T" "$(command -v curl)" > "$T/argv/curl"; chmod +x "$T/kc/security" "$T/argv/curl"
 lrun() { CLA_ROOT=$L/cla AI_PROVIDERS=$L/providers AI_ACCOUNTS=$L/acc RP=$T/argv:$T/kc:$BASEPATH run "$@"; }
 echo "{\"files\":[$(acc c1 claude k3@example.com)]}" > "$T/creds.json"; rm -rf "$T/uploads"
 conf "url=$URL" "key=$CK" "mgmt_key=$MK" mode=failover; rm -rf "$D/cache"; lrun rows >/dev/null; wait_cache; out=$(lrun rows)
@@ -520,6 +521,16 @@ rm -rf "$L/cla/k4"; res=$(lrun do link); rc=$?
 ok "link: nothing left says so, no launch row" '[ $rc = 0 ] && has_line "$res" "nothing to link" && ! lrun rows | grep -q "^link${TAB}"'
 conf "url=$URL" "key=$CK"; res=$(lrun do link); rc=$?
 ok "link: needs the management key"    '[ $rc = 1 ] && [ "$res" = "needs the management key" ] && ! lrun actions | grep -q "^link"'
+# a proxy file with no email but the target name (any case) is never uploaded over; one email twice: one upload
+conf "url=$URL" "key=$CK" "mgmt_key=$MK" mode=failover
+echo '{"files":[{"auth_index":"c9","name":"Claude-K1@Example.com.json","provider":"claude","disabled":false}]}' > "$T/creds.json"
+mkdir -p "$L/cla/k6"; echo '{"oauthAccount":{"emailAddress":"K2@EXAMPLE.com"}}' > "$L/cla/k6/.claude.json"; cp "$L/cla/k2/.credentials.json" "$L/cla/k6/"
+rm -rf "$D/cache" "$T/uploads"; : > "$T/upload.mode"; echo upfail > "$T/mode"
+res=$(lrun do link); rc=$?; : > "$T/mode"
+ok "link: failed upload: temp file was 600, nothing left" '[ $rc = 1 ] && has_line "$res" "skipped cx@example.com: the proxy refused it (HTTP 500)" && [ -s "$T/upload.mode" ] && [ -z "$(grep -v "^-rw-------" "$T/upload.mode")" ] && [ -z "$(ls "$D/cache" | grep "^link")" ] && [ -z "$(grep -rl TOK- "$D")" ]'
+res=$(lrun do link); rc=$?
+ok "link: a same-name proxy file is never overwritten" 'has_line "$res" "skipped k1@example.com: a proxy file named claude-k1@example.com.json already exists" && [ ! -e "$T/uploads/claude-k1@example.com.json" ] && grep -q "Claude-K1@Example.com.json" "$T/creds.json" && [ "$(ls "$T/uploads" | grep -ic "^claude-k1")" = 0 ]'
+ok "link: one upload per email (any case)" '[ "$(ls "$T/uploads" | grep -ic "k2@example.com")" = 1 ] && [ "$(printf "%s\n" "$res" | grep -ic "k2@example.com")" = 1 ] && has_line "$res" "linked cx@example.com"'
 rm -f "$T/creds.json"; rm -rf "$D/cache" "$T/uploads"
 
 # ── proxy text cannot inject control chars ──
@@ -634,7 +645,10 @@ ok "setup: client key not added: fails, not ready" '[ $rc != 0 ] && has_line "$o
 # lost management key (plugin removed and added again): reset it in the proxy config, or reuse the client key there
 : > "$T/mode"
 userconf; out=$(printf 'n\nr\n' | st); rc=$?; nk=$(sed -n 's/^mgmt_key=//p' "$SP/config")
-ok "setup: reset rewrites only secret-key, backs up, saves the key" '[ $rc = 0 ] && [ ${#nk} = 64 ] && grep -qx "  secret-key: \"$nk\"" "$T/proxy.yaml" && [ "$(diff "$T/proxy.orig" "$T/proxy.yaml" | grep -c "^[<>]")" = 2 ] && cmp -s "$T/proxy.orig" "$T/proxy.yaml.ai-launcher.bak" && has_line "$out" "Done."'
+ok "setup: reset rewrites only secret-key, backs up, saves the key" '[ $rc = 0 ] && [ ${#nk} = 64 ] && ! has_line "$out" "$nk" && grep -qx "  secret-key: \"$nk\"" "$T/proxy.yaml" && [ "$(diff "$T/proxy.orig" "$T/proxy.yaml" | grep -c "^[<>]")" = 2 ] && cmp -s "$T/proxy.orig" "$T/proxy.yaml.ai-launcher.bak" && has_line "$out" "Done."'
+userconf; echo old-backup > "$T/proxy.yaml.ai-launcher.bak"; chmod 640 "$T/proxy.yaml"
+out=$(printf 'n\nr\n' | st); rc=$?; nk=$(sed -n 's/^mgmt_key=//p' "$SP/config"); b=$(ls "$T" | grep '^proxy\.yaml\.ai-launcher\.bak\.[0-9]*$')
+ok "setup: reset with an older .bak: new timestamped backup, perms kept, atomic" '[ $rc = 0 ] && [ "$(printf "%s\n" "$b" | grep -c .)" = 1 ] && cmp -s "$T/proxy.orig" "$T/$b" && [ "$(cat "$T/proxy.yaml.ai-launcher.bak")" = old-backup ] && has_line "$out" "(the old file is in $T/$b)" && case $(ls -l "$T/proxy.yaml") in -rw-r-----*) true;; *) false;; esac && [ -z "$(ls "$T" | grep "^proxy\.yaml\.[0-9]")" ] && grep -qx "  secret-key: \"$nk\"" "$T/proxy.yaml" && ! has_line "$out" "$nk"'
 userconf; chmod 444 "$T/proxy.yaml"; out=$(printf 'n\n%s\n' "$MK" | st); rc=$?; chmod 644 "$T/proxy.yaml"
 ok "setup: read-only proxy config: paste only" '[ $rc = 0 ] && ! has_line "$out" "[r]eset" && grep -qx "mgmt_key=$MK" "$SP/config"'
 userconf; out=$(CLIPROXY_MGMT_KEY=$MK st </dev/null); rc=$?
