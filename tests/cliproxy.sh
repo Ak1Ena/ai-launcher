@@ -6,13 +6,13 @@ T=$(cd "$(mktemp -d)" && pwd -P)
 SRV=
 trap '[ -n "$SRV" ] && { kill $SRV; wait $SRV; } 2>/dev/null; for f in "$T/brew.pid" "$T/sp/run/pid"; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done; rm -rf "$T"' EXIT
 export HOME=$T/home; mkdir -p "$HOME" "$T/bin" "$T/sys" "$T/jq" "$T/work"
-unset CLIPROXY_API_KEY CLIPROXY_MGMT_KEY
+unset CLIPROXY_API_KEY CLIPROXY_MGMT_KEY CLA_ROOT AI_PROVIDERS AI_ACCOUNTS CODEX_HOME   # never the real accounts
 export CLIPROXY_PROBE_SECS=5   # a loaded machine must not turn a slow answer into "proxy down"
 PY=$(command -v python3 || true)
 JQ=$(command -v jq || true)
 # sys = /usr/bin + /bin without jq, brew, claude, so each test picks what is on PATH
 for f in /usr/bin/* /bin/*; do
-  b=${f##*/}; case $b in jq|brew|claude|python*|fzf|cliproxyapi) continue ;; esac
+  b=${f##*/}; case $b in jq|brew|claude|python*|fzf|cliproxyapi|security) continue ;; esac   # security: never the real Keychain
   [ -e "$T/sys/$b" ] || ln -s "$f" "$T/sys/$b"
 done
 [ -e "$T/sys/curl" ] || { c=$(command -v curl) && ln -s "$c" "$T/sys/curl"; }
@@ -91,6 +91,30 @@ CREDS = {"observed_at": "2026-10-26T10:00:00Z", "files": [
   {"auth_index": "c3", "provider": "claude", "status": "disabled", "disabled": True, "success": 1, "failed": 2},
   {"auth_index": "x1", "provider": "codex", "status": "active", "disabled": False, "success": 7, "failed": 0},
   {"auth_index": "g1", "provider": "gemini", "status": "active", "disabled": False, "success": 5, "failed": 0}]}
+def mks():  # MK, or a plaintext secret-key in proxy.yaml (the real proxy hot-reloads and hashes it)
+    ks = [MK]
+    try:
+        for l in open(T + '/proxy.yaml'):
+            l = l.strip()
+            if l.startswith('secret-key:'):
+                v = l.split(':', 1)[1].strip().strip('"')
+                if v and not v.startswith('$2'): ks.append(v)
+    except Exception: pass
+    return ks
+def upload(ctype, raw):  # multipart auth file: kept in uploads/, added to creds.json and auth/ when they exist
+    import email
+    msg = email.message_from_bytes(b'Content-Type: ' + ctype.encode() + b'\r\n\r\n' + raw)
+    for part in msg.walk():
+        n = part.get_filename()
+        if not n: continue
+        data = part.get_payload(decode=True); os.makedirs(T + '/uploads', exist_ok=True)
+        open(T + '/uploads/' + n, 'wb').write(data); a = json.loads(data)
+        e = {"auth_index": "u" + str(len(os.listdir(T + '/uploads'))), "name": n, "email": a.get("email"), "provider": a.get("type"), "disabled": False, "success": 0, "failed": 0}
+        c = jfile('creds.json')
+        if c is not None: c['files'].append(e); json.dump(c, open(T + '/creds.json', 'w'))
+        if os.path.isdir(T + '/auth'): json.dump(e, open(T + '/auth/' + n, 'w'))
+        return True
+    return False
 def jfile(n):
     try: return json.load(open(T + '/' + n))
     except Exception: return None
@@ -126,7 +150,9 @@ class H(BaseHTTPRequestHandler):
         if '/management/' in p:
             if 'slow' in m and 'credentials' in p: time.sleep(3)
             if 'forbid' in m: return self.send(403, {"error": "remote management key not set"})
-            if 'anykey' not in m and not self.auth(MK): return self.send(401, {"error": "bad mgmt key"})
+            if 'anykey' not in m and not any(self.auth(k) for k in mks()): return self.send(401, {"error": "bad mgmt key"})
+            if p == '/v0/management/auth-files' and self.command == 'POST':
+                return self.send(200, {"status": "ok"}) if upload(self.headers.get('Content-Type', ''), self.raw) else self.send(400, {"error": "no file"})
             if p == '/v8/management/config/access/api-keys':
                 if self.command == 'GET': return self.send(200, jfile('apikeys.json') or [])
                 if 'keysfail' in m: return self.send(500, {"error": "nope"})
@@ -157,7 +183,7 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self): self.handle_any('')
     def do_PUT(self): self.handle_any(self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode())
     def do_PATCH(self): self.handle_any(self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode())
-    def do_POST(self): self.handle_any(self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode())
+    def do_POST(self): self.raw = self.rfile.read(int(self.headers.get('Content-Length') or 0)); self.handle_any(self.raw.decode('utf-8', 'replace'))
 class S(HTTPServer):  # HTTPServer.server_bind runs getfqdn (reverse DNS) before listen: took 35 s on CI macOS
     def server_bind(self): socketserver.TCPServer.server_bind(self); self.server_name, self.server_port = self.server_address[:2]
 if len(sys.argv) > 4: S(('127.0.0.1', int(sys.argv[4])), H).serve_forever()   # a fake started proxy (setup tests)
@@ -444,6 +470,58 @@ ok "accounts: keys never printed"      '! printf "%s" "$wall" | grep -qe "$CK" -
 rm -f "$T/creds.json" "$T/routing.json" "$T/over.json" "$T"/fields.log "$T/status.log" "$T/patch.log"; rm -rf "$D/cache"
 conf "url=$URL" "key=$CK" "mgmt_key=$MK"
 
+# ── link launcher accounts: fake Keychain (security), fake cla / codex logins, curl argv logged ──
+L=$T/link; mkdir -p "$L/cla/k1" "$L/cla/k2" "$L/cla/k3" "$L/cla/k4" "$L/acc/codex/cw" "$T/kc" "$T/argv"
+for a in k1:k1@example.com k2:K2@Example.com k3:K3@Example.com k4:k4@example.com; do echo "{\"oauthAccount\":{\"emailAddress\":\"${a#*:}\"}}" > "$L/cla/${a%%:*}/.claude.json"; done
+svc="Claude Code-credentials-$("$PY" -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:8])' "$L/cla/k1")"
+echo '{"claudeAiOauth":{"accessToken":"TOK-K1-ACCESS","refreshToken":"TOK-K1-REFRESH","expiresAt":1893456000000,"scopes":["user:inference"]}}' > "$T/kc/$svc"
+echo '{"claudeAiOauth":{"accessToken":"TOK-K2-ACCESS","refreshToken":"TOK-K2-REFRESH","expiresAt":1893456000000}}' > "$L/cla/k2/.credentials.json"
+b64() { printf '%s' "$1" | base64 | tr '+/' '-_' | tr -d '=\n'; }
+CXID="h.$(b64 '{"email":"cx@example.com"}').TOK-CX-IDSIG" CXAT="h.$(b64 '{"exp":1893456000}').TOK-CX-ATSIG"
+echo "{\"tokens\":{\"id_token\":\"$CXID\",\"access_token\":\"$CXAT\",\"refresh_token\":\"TOK-CX-REFRESH\",\"account_id\":\"acct-1\"}}" > "$L/acc/codex/cw/auth.json"
+printf 'cw\tcodex --x\tCodex cw\nother\tgemini\tGemini\n' > "$L/providers"
+printf '#!/bin/sh\necho "$*" >> "%s/security.argv"\ns=; p=; for a; do [ "$p" = -s ] && s=$a; p=$a; done\n[ -f "%s/kc/$s" ] || exit 44\ncat "%s/kc/$s"\n' "$T" "$T" "$T" > "$T/kc/security"
+printf '#!/bin/sh\necho "$*" >> "%s/curl.argv"\nexec "%s" "$@"\n' "$T" "$(command -v curl)" > "$T/argv/curl"; chmod +x "$T/kc/security" "$T/argv/curl"
+lrun() { CLA_ROOT=$L/cla AI_PROVIDERS=$L/providers AI_ACCOUNTS=$L/acc RP=$T/argv:$T/kc:$BASEPATH run "$@"; }
+echo "{\"files\":[$(acc c1 claude k3@example.com)]}" > "$T/creds.json"; rm -rf "$T/uploads"
+conf "url=$URL" "key=$CK" "mgmt_key=$MK" mode=failover; rm -rf "$D/cache"; lrun rows >/dev/null; wait_cache; out=$(lrun rows)
+ok "link: not-linked accounts listed, no number, case-insensitive match" '[ "$(printf "%s\n" "$out" | grep "^  ${TAB}.*not linked$")" = "  ${TAB}k1@example.com  not linked
+  ${TAB}K2@Example.com  not linked
+  ${TAB}k4@example.com  not linked
+  ${TAB}cx@example.com  not linked" ] && has_line "$out" "  ${TAB}1  k3@example.com  on"'
+ok "link: launch row with the count"   '[ "$(printf "%s\n" "$out" | tail -1)" = "link${TAB}+ Link launcher accounts${TAB}4 not linked" ]'
+acts=$(lrun actions)
+ok "link: one action per account, then link all" '[ "$(printf "%s\n" "$acts" | grep "^link")" = "link.claude-k1${TAB}k1@example.com: link to proxy
+link.claude-k2${TAB}K2@Example.com: link to proxy
+link.claude-k4${TAB}k4@example.com: link to proxy
+link.codex-cw${TAB}cx@example.com: link to proxy
+link${TAB}Link all launcher accounts" ]'
+setc mode wrr; out=$(lrun rows); setc mode failover
+ok "link: wrr shows no weight"         'has_line "$out" "  ${TAB}k1@example.com  not linked" && ! has_line "$out" "k1@example.com  ×"'
+: > "$T/curl.argv"; : > "$T/security.argv"; : > "$T/srv.log"
+res=$(lrun do link 2>&1); rc=$?
+ok "link: per-account result, rc 1 when one is skipped" '[ $rc = 1 ] && [ "$res" = "linked k1@example.com
+linked K2@Example.com
+skipped k4@example.com: no saved login found
+linked cx@example.com" ]'
+ok "link: Keychain service from the config dir hash, account \$USER" 'grep -qxF -- "find-generic-password -a $(USER=${USER:-} sh -c "echo \${USER:-claude-code-user}") -w -s $svc" "$T/security.argv"'
+ok "link: claude auth file (Keychain)" 'jq -e ".type == \"claude\" and .access_token == \"TOK-K1-ACCESS\" and .refresh_token == \"TOK-K1-REFRESH\" and .id_token == \"\" and .email == \"k1@example.com\" and .expired == \"2030-01-01T00:00:00Z\" and (.last_refresh | test(\"^20[0-9][0-9]-[0-9-]+T[0-9:]+Z$\"))" "$T/uploads/claude-k1@example.com.json" >/dev/null'
+ok "link: claude auth file (.credentials.json)" 'jq -e ".access_token == \"TOK-K2-ACCESS\" and .refresh_token == \"TOK-K2-REFRESH\" and .email == \"K2@Example.com\"" "$T/uploads/claude-K2@Example.com.json" >/dev/null'
+ok "link: codex auth file"             'jq -e ".type == \"codex\" and .id_token == \"$CXID\" and .access_token == \"$CXAT\" and .refresh_token == \"TOK-CX-REFRESH\" and .account_id == \"acct-1\" and .email == \"cx@example.com\" and .expired == \"2030-01-01T00:00:00Z\" and (.last_refresh | length > 0)" "$T/uploads/codex-cx@example.com.json" >/dev/null'
+ok "link: account already in proxy not uploaded" '[ "$(ls "$T/uploads" | grep -ic k3)" = 0 ] && [ "$(ls "$T/uploads" | grep -c .)" = 3 ] && grep -q "POST /v0/management/auth-files" "$T/srv.log"'
+ok "link: no token in output, argv, log or leftover files" '! printf "%s" "$res" | grep -q TOK- && ! grep -q TOK- "$T/curl.argv" "$T/security.argv" "$T/srv.log" && [ -z "$(grep -rl TOK- "$D" "$T/work")" ] && grep -q "file=@" "$T/curl.argv"'
+out=$(lrun rows)
+ok "link: rows follow at once"         '[ "$(printf "%s\n" "$out" | grep "^  ${TAB}.*not linked$")" = "  ${TAB}k4@example.com  not linked" ] && has_line "$out" "k1@example.com  on"'
+res=$(lrun do link.claude-k4); rc=$?; res2=$(lrun do link.claude-k1); rc2=$?
+ok "link.<id>: one account, unknown refused" '[ $rc = 1 ] && [ "$res" = "skipped k4@example.com: no saved login found" ] && [ $rc2 = 1 ] && has_line "$res2" "already linked"'
+res=$(lrun launch link </dev/null); rc=$?
+ok "launch link runs the same link"    '[ $rc = 1 ] && [ "$res" = "skipped k4@example.com: no saved login found" ]'
+rm -rf "$L/cla/k4"; res=$(lrun do link); rc=$?
+ok "link: nothing left says so, no launch row" '[ $rc = 0 ] && has_line "$res" "nothing to link" && ! lrun rows | grep -q "^link${TAB}"'
+conf "url=$URL" "key=$CK"; res=$(lrun do link); rc=$?
+ok "link: needs the management key"    '[ $rc = 1 ] && [ "$res" = "needs the management key" ] && ! lrun actions | grep -q "^link"'
+rm -f "$T/creds.json"; rm -rf "$D/cache" "$T/uploads"
+
 # ── proxy text cannot inject control chars ──
 conf "url=$URL" "key=$CK" "mgmt_key=$MK"
 printf '%s' '{"data":[{"id":"evil\u001b[31m\nall\tFORGED"}]}' > "$T/models.json"
@@ -542,16 +620,27 @@ userconf() {
   printf '%s\n' 'server:' '  host: ""' 'management:' '  secret-key: "$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012"' 'access:' '  api-keys:' '    - "your-api-key-1"' '    - "old-key"' > "$T/proxy.yaml"
   cp "$T/proxy.yaml" "$T/proxy.orig"; echo '["old-key"]' > "$T/apikeys.json"
 }
-userconf; out=$(printf 'pasted-mgmt-SECRET\n%s\n' "$MK" | st); rc=$?
+userconf; out=$(printf 'n\np\npasted-mgmt-SECRET\n%s\n' "$MK" | st); rc=$?
 ok "setup: existing secret-key is never replaced" '[ $rc = 0 ] && cmp -s "$T/proxy.orig" "$T/proxy.yaml" && [ ! -e "$T/proxy.yaml.ai-launcher.bak" ] && grep -qx "mgmt_key=$MK" "$SP/config"'
 ok "setup: a pasted management key is checked, asked again" '[ "$(printf "%s\n" "$out" | grep -c "paste the management key:")" = 2 ] && has_line "$out" "the proxy refused that key (HTTP 401)"'
 ok "setup: client key appended through the API" '[ "$(cat "$T/apikeys.json")" = "[\"old-key\",\"$(sed -n "s/^key=//p" "$SP/config")\"]" ] && has_line "$out" "Done."'
 userconf; out=$(CLIPROXY_MGMT_KEY=$MK st </dev/null); rc=$?
 ok "setup: management key from the env, checked, no prompt" '[ $rc = 0 ] && ! has_line "$out" "paste the" && grep -qx "mgmt_key=$MK" "$SP/config"'
-userconf; out=$(printf 'bad1\nbad2\nbad3\n' | st); rc=$?
+userconf; out=$(printf 'n\np\nbad1\nbad2\nbad3\n' | st); rc=$?
 ok "setup: 3 wrong management keys stop, nothing saved" '[ $rc != 0 ] && ! grep -q "^mgmt_key=" "$SP/config" && ! has_line "$out" "Done." && [ "$(printf "%s\n" "$out" | grep -c "refused that key (HTTP 401)")" = 3 ]'
-userconf; echo 'anykey keysfail' > "$T/mode"; out=$(printf '%s\n' "$MK" | st); rc=$?
+userconf; echo 'anykey keysfail' > "$T/mode"; out=$(printf 'n\np\n%s\n' "$MK" | st); rc=$?
 ok "setup: client key not added: fails, not ready" '[ $rc != 0 ] && has_line "$out" "could not add the client key" && ! has_line "$out" "Done."'
+
+# lost management key (plugin removed and added again): reset it in the proxy config, or reuse the client key there
+: > "$T/mode"
+userconf; out=$(printf 'n\nr\n' | st); rc=$?; nk=$(sed -n 's/^mgmt_key=//p' "$SP/config")
+ok "setup: reset rewrites only secret-key, backs up, saves the key" '[ $rc = 0 ] && [ ${#nk} = 64 ] && grep -qx "  secret-key: \"$nk\"" "$T/proxy.yaml" && [ "$(diff "$T/proxy.orig" "$T/proxy.yaml" | grep -c "^[<>]")" = 2 ] && cmp -s "$T/proxy.orig" "$T/proxy.yaml.ai-launcher.bak" && has_line "$out" "Done."'
+userconf; chmod 444 "$T/proxy.yaml"; out=$(printf 'n\n%s\n' "$MK" | st); rc=$?; chmod 644 "$T/proxy.yaml"
+ok "setup: read-only proxy config: paste only" '[ $rc = 0 ] && ! has_line "$out" "[r]eset" && grep -qx "mgmt_key=$MK" "$SP/config"'
+userconf; out=$(CLIPROXY_MGMT_KEY=$MK st </dev/null); rc=$?
+ok "setup: reuses a working client key from the proxy config" '[ $rc = 0 ] && grep -qx "key=old-key" "$SP/config" && [ "$(cat "$T/apikeys.json")" = "[\"old-key\"]" ] && has_line "$out" "use the client key already in" && cmp -s "$T/proxy.orig" "$T/proxy.yaml"'
+userconf; echo '[]' > "$T/apikeys.json"; out=$(CLIPROXY_MGMT_KEY=$MK st </dev/null); rc=$?
+ok "setup: a client key the proxy refuses is not offered" '[ $rc = 0 ] && ! has_line "$out" "use the client key already in" && ! grep -qx "key=old-key" "$SP/config"'
 
 # a proxy already running with a config setup does not know: never invent keys or a config for it
 : > "$T/mode"; newsp
@@ -574,7 +663,7 @@ ok "setup: a just-installed config loses sample keys and binds localhost" '! gre
 stop2; rm -rf "$SP" "$T/bp" "$T/auth"; newsp "url=http://127.0.0.1:$P2"; mkdir -p "$T/bp/etc"
 printf '%s\n' 'server:' '  host: ""' "  port: $P2" 'management:' '  secret-key: "$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012"' 'access:' '  api-keys:' '    - "your-api-key-1"' '    - "old-key"' > "$T/bp/etc/cliproxyapi.conf"
 cp "$T/bp/etc/cliproxyapi.conf" "$T/bp.orig"; echo '["old-key"]' > "$T/apikeys.json"
-out=$(printf 'i\n%s\n' "$MK" | RP=$FK/brew:$T/jq:$T/sys st); rc=$?
+out=$(printf 'i\n\np\n%s\n' "$MK" | RP=$FK/brew:$T/jq:$T/sys st); rc=$?
 ok "setup: a brew config that existed before install stays byte-identical" '[ $rc = 0 ] && grep -qx "install cliproxyapi" "$T/brew.log" && cmp -s "$T/bp.orig" "$T/bp/etc/cliproxyapi.conf" && [ ! -e "$T/bp/etc/cliproxyapi.conf.ai-launcher.bak" ]'
 
 newsp "url=http://127.0.0.1:$P2"; out=$(echo m | RP=$FK/brew:$T/jq:$T/sys st); rc=$?
@@ -620,6 +709,14 @@ rm -f "$T"/auth/claude-*.json; echo '{"provider":"claude","email":"A@example.com
 echo other@example.com > "$T/login-claude"
 out=$(ACC=all st </dev/null)
 ok "setup: another email warns and is kept" 'has_line "$out" "signed in as other@example.com, expected B@Example.com: kept"'
+echo '{"claudeAiOauth":{"accessToken":"TOK-B-ACCESS","refreshToken":"TOK-B-REFRESH","expiresAt":1893456000000}}' > "$T/cla/b/.credentials.json"
+rm -f "$T"/auth/claude-[!0]*.json; c1=$(grep -c -- -claude-login "$T/cpa.log"); rm -rf "$T/uploads"
+out=$(ACC=all st </dev/null); rc=$?
+ok "setup: link is the default, no browser for an account with a login" '[ $rc = 0 ] && has_line "$out" "linked B@Example.com" && [ "$(grep -c -- -claude-login "$T/cpa.log")" = "$c1" ] && [ -f "$T/uploads/claude-B@Example.com.json" ] && ! grep -rq TOK- "$SP" && ! has_line "$out" TOK-'
+rm -f "$T/auth/claude-B@Example.com.json"; c1=$(grep -c -- -claude-login "$T/cpa.log"); echo b@example.com > "$T/login-claude"
+out=$(printf '\ns\n' | ACC= st); rc=$?
+ok "setup: sign in again is still offered" '[ $rc = 0 ] && has_line "$out" "[l]ink existing login (no browser) / [s]ign in again (browser)?" && [ "$(grep -c -- -claude-login "$T/cpa.log")" = $((c1 + 1)) ]'
+rm -f "$T/cla/b/.credentials.json" "$T"/auth/*; echo '{"provider":"claude","email":"A@example.com"}' > "$T/auth/claude-0.json"
 mkdir -p "$T/fzfbin"; printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "%s/fzf.args"\nexit 130\n' "$T" > "$T/fzfbin/fzf"; chmod +x "$T/fzfbin/fzf"
 out=$(RP=$FK/cpa:$T/jq:$T/sys:$T/fzfbin ACC= st </dev/null)
 ok "setup: fzf header lists accounts already in the proxy" 'grep -qx "already in proxy: a@example.com" "$T/fzf.args"'

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cliproxy plugin for ai-launcher: one "all accounts" Claude Code channel through a local CLIProxyAPI.
-# Protocol: plugin rows | actions | do <start|stop|affinity|apply|mode-failover|mode-wrr|on.<idx>|off.<idx>|up.<idx>|down.<idx>|wup.<idx>|wdown.<idx>> | launch all [args...]   (see the README "Plugins")
+# Protocol: plugin rows | actions | do <start|stop|affinity|apply|mode-failover|mode-wrr|on.<idx>|off.<idx>|up.<idx>|down.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link   (see the README "Plugins")
 # API facts: docs/superpowers/notes/cliproxyapi.md. Never prints a key.
 D=${AI_PLUGIN_DIR:-$(cd "$(dirname "$0")" && pwd)}
 CONF=$D/config CACHE=$D/cache TAB=$(printf '\t')
@@ -316,6 +316,86 @@ move() {
   echo "$e: now $to"
 }
 
+# ── link: copy a launcher account's own login (cla / Codex) into the proxy, no browser ──
+okmail() { case $1 in *@*) case $1 in *[!A-Za-z0-9._%+@-]*) return 1 ;; esac ;; *) return 1 ;; esac; }
+# launcher accounts with a known email: kind TAB id TAB email TAB home
+laccts() {
+  has jq || return 0
+  local f e h a c pf=${AI_PROVIDERS:-$HOME/.config/ai-launcher/providers}
+  set -- "${CLA_ROOT:-$HOME/.claude-accounts}"/*/.claude.json
+  [ -f "$1" ] && jq -r '[input_filename, (.oauthAccount.emailAddress // "")] | @tsv' "$@" 2>/dev/null |
+    while IFS="$TAB" read -r f e; do
+      h=${f%/.claude.json}; a=$(printf '%s' "${h##*/}" | tr -cd 'A-Za-z0-9._-')
+      okmail "$e" && printf 'claude\tclaude-%s\t%s\t%s\n' "$a" "$e" "$h"
+    done
+  [ -f "$pf" ] || return 0
+  while IFS="$TAB" read -r a c _; do   # providers that run codex (the same rule as setup)
+    [ "$(printf '%s\n' "$c" | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {n = split($i, p, "/"); print p[n]; exit}}')" = codex ] || continue
+    case $a in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+    h=${AI_ACCOUNTS:-$HOME/.ai-accounts}/codex/$a; [ "$a" = codex ] && h=${CODEX_HOME:-$HOME/.codex}
+    e=$(jq -r "$JWT"'.tokens.id_token // empty | jwt | .email // empty' "$h/auth.json" 2>/dev/null)
+    okmail "$e" && printf 'codex\tcodex-%s\t%s\t%s\n' "$a" "$e" "$h"
+  done < "$pf"
+}
+JWT='def jwt: split(".")[1] // "" | gsub("-"; "+") | gsub("_"; "/") | . + ([range(0; (4 - length % 4) % 4)] | map("=") | join("")) | @base64d | fromjson;'
+# launcher accounts whose email is not in the accounts cache (case-insensitive)
+unlinked() {
+  [ -f "$CACHE/accts" ] || return 0
+  laccts | awk -F "$TAB" 'FILENAME == ARGV[1] { p[tolower($3)] = 1; next } !(tolower($3) in p)' "$CACHE/accts" -
+}
+# Keychain service of a Claude Code config dir: "Claude Code-credentials-" + sha256(CLAUDE_CONFIG_DIR)[0:8],
+# as claude 2.1.311 builds it (kW(): no suffix only when CLAUDE_CONFIG_DIR is unset); account = $USER
+ksvc() {
+  local h; if has shasum; then h=$(printf '%s' "$1" | shasum -a 256); else h=$(printf '%s' "$1" | sha256sum); fi
+  printf 'Claude Code-credentials-%s' "${h:0:8}"
+}
+kuser() { local u=${USER:-$(id -un 2>/dev/null)}; case $u in ''|*[!A-Za-z0-9._-]*) u=claude-code-user ;; esac; printf '%s' "$u"; }
+# link1 <kind> <email> <home>: upload that login as a proxy auth file. Tokens only pass through pipes and one 600 temp file.
+link1() {
+  local t=$CACHE/link.$$ s=
+  rm -f "$t"
+  if [ "$1" = claude ]; then
+    has security && s=$(security find-generic-password -a "$(kuser)" -w -s "$(ksvc "$3")" 2>/dev/null)
+    case $s in '{'*|'') ;; *[!0-9a-fA-F]*) s= ;; *) s=$(printf '%s' "$s" | xxd -r -p 2>/dev/null) ;; esac   # -w prints hex for some items
+    [ -n "$s" ] || s=$(cat "$3/.credentials.json" 2>/dev/null)   # Linux, or claude's plaintext fallback
+    ( umask 077; printf '%s' "$s" | jq -c --arg e "$2" '.claudeAiOauth // empty | select(.accessToken and .refreshToken)
+      | {type: "claude", access_token: .accessToken, refresh_token: .refreshToken, id_token: "", email: $e,
+         expired: ((.expiresAt // 0) / 1000 | floor | todate), last_refresh: (now | floor | todate)}' > "$t" 2>/dev/null )
+  else
+    ( umask 077; jq -c --arg e "$2" "$JWT"'.tokens // empty | select(.access_token and .refresh_token)
+      | {type: "codex", id_token: (.id_token // ""), access_token, refresh_token, account_id: (.account_id // ""), email: $e,
+         expired: ((try (.access_token | jwt | .exp | todate) catch null) // ""), last_refresh: (now | floor | todate)}' "$3/auth.json" > "$t" 2>/dev/null )
+  fi
+  s=
+  [ -s "$t" ] || { rm -f "$t"; echo "skipped $2: no saved login found"; return 1; }
+  out=$(kcurl "$mgmt_key" -m 10 -F "file=@$t;type=application/json;filename=$1-$2.json" "$url/v0/management/auth-files"); code=${out##*$'\n'}
+  rm -f "$t"
+  [ "$code" = 200 ] || { echo "skipped $2: the proxy refused it ($(hc "$code"))"; return 1; }
+  echo "linked $2"
+}
+# link [id]: every launcher account not in the proxy, or the one with that id
+link() {
+  [ -n "$mgmt_key" ] || { echo 'needs the management key'; return 1; }
+  has curl && has jq || { echo 'needs curl and jq'; return 1; }
+  fetchaccts || return 1
+  trap 'rm -f "$CACHE/link.$$"' EXIT; trap 'exit 1' INT TERM HUP
+  # shortcut: a Keychain prompt with no tty blocks until answered (do: 30 s limit); the launch row has a tty
+  local k id e h n=0 bad=0
+  while IFS="$TAB" read -r k id e h; do
+    [ -n "$id" ] || continue
+    [ -z "$1" ] || [ "$1" = "$id" ] || continue
+    n=$((n + 1)); link1 "$k" "$e" "$h" || bad=1
+  done <<EOF
+$(unlinked)
+EOF
+  if [ $n = 0 ]; then
+    if [ -n "$1" ]; then echo "unknown or already linked: $1"; return 1; fi
+    echo 'nothing to link: every launcher account is in the proxy'; return 0
+  fi
+  rm -f "$CACHE/usage"; fetchaccts >/dev/null
+  return $bad
+}
+
 brew_has() { has brew && [ -d "$(brew --prefix 2>/dev/null)/opt/cliproxyapi" ]; }
 
 case ${1:-} in
@@ -338,8 +418,12 @@ case ${1:-} in
       ordered | awk -F "$TAB" -v m="$mode" '{ u = ($5 == "true") ? "off" : "on"
         if (m == "failover") printf "  \t%d  %s  %s\n", NR, $3, u
         else if (u == "off" || $4 + 0 <= 0) printf "  \t%s  off\n", $3; else printf "  \t%s  ×%d\n", $3, $4 }'
+      nl=$(unlinked | cut -f3)
+      [ -z "$nl" ] || printf '%s\n' "$nl" | sed "s/^/  $TAB/; s/\$/  not linked/"
     fi
-    usage ;;
+    usage
+    # a launch row: linking may need a Keychain prompt, and launch has a tty
+    [ -z "${nl:-}" ] || printf 'link\t+ Link launcher accounts\t%s not linked\n' "$(printf '%s\n' "$nl" | grep -c .)" ;;
   actions)
     if brew_has || [ -n "$start_cmd" ]; then printf 'start\tstart proxy\n'; fi
     if brew_has || [ -n "$stop_cmd" ]; then printf 'stop\tstop proxy\n'; fi
@@ -356,6 +440,7 @@ case ${1:-} in
         } else if (f[5] != "true") { w = f[4] + 0
           if (w < 99) printf "wup.%s\t%s: weight %s → %s\n", f[1], f[3], (w > 0 ? w : "off"), w + 1
           if (w > 0) printf "wdown.%s\t%s: weight %s → %s\n", f[1], f[3], w, (w > 1 ? w - 1 : "off") } } }'
+      unlinked | awk -F "$TAB" '{ printf "link.%s\t%s: link to proxy\n", $2, $3; n++ } END { if (n) print "link\tLink all launcher accounts" }'
     fi
     exit 0 ;;
   do)
@@ -378,6 +463,8 @@ case ${1:-} in
       up.*|down.*) move "${2%%.*}" "${2#*.}"; exit ;;
       wup.*) setweight up "${2#wup.}"; exit ;;
       wdown.*) setweight down "${2#wdown.}"; exit ;;
+      link) link ""; exit ;;
+      link.*) link "${2#link.}"; exit ;;
     esac
     case ${2:-} in start|stop) ;; *) echo "unknown action: ${2:-}"; exit 1 ;; esac
     if brew_has; then exec brew services "$2" cliproxyapi; fi
@@ -385,6 +472,11 @@ case ${1:-} in
     [ -n "$cmd" ] || { echo "no $2 command: install cliproxyapi with brew or set ${2}_cmd= in $CONF"; exit 1; }
     cd "$D" && exec bash -c "$cmd" ;;   # in the plugin folder: setup's commands use paths relative to it
   launch)
+    if [ "${2:-}" = link ]; then
+      link ""; rc=$?
+      [ -t 0 ] && { printf 'press Enter to close '; read -r _; }
+      exit $rc
+    fi
     [ "${2:-}" = all ] || { echo "unknown entry: ${2:-}" >&2; exit 1; }
     shift 2
     [ -n "$key" ] || { nokey >&2; exit 1; }
@@ -393,5 +485,5 @@ case ${1:-} in
     ! envname "$mgmt_key_env" || unset "$mgmt_key_env"
     export ANTHROPIC_BASE_URL=$url ANTHROPIC_AUTH_TOKEN=$key CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
     exec claude "$@" ;;
-  *) echo "usage: plugin rows | actions | do <start|stop|affinity|apply|mode-failover|mode-wrr|on.<idx>|off.<idx>|up.<idx>|down.<idx>|wup.<idx>|wdown.<idx>> | launch all [args...]" >&2; exit 1 ;;
+  *) echo "usage: plugin rows | actions | do <start|stop|affinity|apply|mode-failover|mode-wrr|on.<idx>|off.<idx>|up.<idx>|down.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link" >&2; exit 1 ;;
 esac

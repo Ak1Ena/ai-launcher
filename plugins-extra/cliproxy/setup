@@ -72,15 +72,22 @@ okkey() {
   if [ "$1" = client ]; then out=$(kcurl "$2" -m 5 "$url/v1/models"); else out=$(kcurl "$2" -m 10 "$url/v0/management/auth-files"); fi
   code=${out##*$'\n'}; [ "$code" = 200 ]
 }
-# getkey client|mgmt: K = a key the proxy accepts: from the env first, then pasted (3 tries), else stop
-getkey() {
-  local what=$1 e t=0 nm="client key" envs="$key_env CLIPROXY_API_KEY"
-  [ "$what" = mgmt ] && nm="management key" envs="$mgmt_key_env CLIPROXY_MGMT_KEY"
+# envkey client|mgmt: K = a key from the env the proxy accepts
+envkey() {
+  local e envs="$key_env CLIPROXY_API_KEY"
+  [ "$1" = mgmt ] && envs="$mgmt_key_env CLIPROXY_MGMT_KEY"
   for e in $envs; do
     envname "$e" || continue; eval "K=\${$e:-}"
-    [ -n "$K" ] && okkey "$what" "$K" && return 0
-    [ -n "$K" ] && echo "  the proxy refused the $nm in \$$e (HTTP ${code:-no answer})"
+    [ -n "$K" ] && okkey "$1" "$K" && return 0
+    [ -n "$K" ] && echo "  the proxy refused the key in \$$e (HTTP ${code:-no answer})"
   done
+  return 1
+}
+# getkey client|mgmt: K = a key the proxy accepts: from the env first, then pasted (3 tries), else stop
+getkey() {
+  local what=$1 t=0 nm="client key"
+  [ "$what" = mgmt ] && nm="management key"
+  envkey "$what" && return 0
   while [ $t -lt 3 ]; do
     printf '  paste the %s: ' "$nm"; read -r -s K || K=; echo
     case $K in
@@ -150,6 +157,22 @@ yedit() {  # yedit <awk program>: edit the proxy config in place (keeps its perm
 secret() {  # value of the first secret-key: line
   awk '/^[ \t]*secret-key:/ { v = $0; sub(/^[ \t]*secret-key:[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v)
     if (v ~ /^".*"$/ || v ~ /^'\''.*'\''$/) v = substr(v, 2, length(v) - 2); print v; exit }' "$Y"
+}
+apikeys() {  # the plaintext client keys listed under api-keys:, one per line
+  awk '!s && /^[ \t]*api-keys:[ \t]*(#.*)?$/ { s = 1; next }
+    s && /^[ \t]*(#|$)/ { next }
+    s && /^[ \t]*- / { v = $0; sub(/^[ \t]*- [ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v)
+      if (v ~ /^".*"$/ || v ~ /^'\''.*'\''$/) v = substr(v, 2, length(v) - 2); if (v != "") print v; next }
+    s { exit }' "$Y"
+}
+# a new random secret-key in the proxy config; the proxy hot-reloads it (and hashes it) by itself
+reset_mk() {
+  mk=$(gen)
+  cset mgmt_key "$mk" || die "could not write $D/$CONF"   # plugin config first, so the key is never lost
+  yedit '!d && /^[ \t]*secret-key:/ { i = $0; sub(/secret-key:.*/, "", i); print i "secret-key: \"" mk "\""; d = 1; next } { print }'
+  local i=0; while [ $i -lt 20 ] && ! okkey mgmt "$mk"; do sleep 0.5; i=$((i + 1)); done
+  okkey mgmt "$mk" || die "the proxy did not take the new management key within 10 s (HTTP ${code:-no answer}): restart the proxy, then run setup again"
+  echo "  new management key written to $Y (the old file is in $Y.ai-launcher.bak)"
 }
 keys_empty() {  # no client key in the proxy config yet
   awk '!s && /^[ \t]*api-keys:/ { v = $0; sub(/^[ \t]*api-keys:[ \t]*/, "", v); sub(/[ \t]*#.*$/, "", v)
@@ -222,6 +245,15 @@ else
     start_cmd="mkdir -p run; nohup $(q "$bin") -config $(q "$Y") >run/log 2>&1 & echo \$! >run/pid"
     cset start_cmd "$start_cmd" && cset stop_cmd 'kill "$(cat run/pid)" && rm -f run/pid' || die "could not write $D/$CONF"
   fi
+  if [ -z "$key" ] && ! keys_empty; then
+    # the proxy config has client keys in plaintext: offer one the proxy accepts instead of a new one
+    start_proxy
+    k=$(apikeys | grep -v '^your-api-key-' | while IFS= read -r k; do okkey client "$k" && { printf '%s\n' "$k"; break; }; done)
+    if [ -n "$k" ]; then
+      ask "use the client key already in $Y? [Y/n]"
+      [ "$ANS" = n ] || key=$k res=saved
+    fi
+  fi
   [ -n "$key" ] || { key=$(gen); res=created; }
   sk=$(secret)
   if [ -z "$sk" ]; then [ -n "$mk" ] || { mk=$(gen); res=created; }
@@ -247,7 +279,12 @@ else
   if [ -n "$need_mk" ]; then
     # the proxy already has a management key: check the one you give against the running proxy
     echo "  the proxy already has a management key"
-    start_proxy; getkey mgmt; mk=$K
+    start_proxy
+    if envkey mgmt; then mk=$K
+    else
+      ANS=p; [ -w "$Y" ] && ask "it is stored hashed, so setup cannot read it: [p]aste it / [r]eset it to a new one?"
+      if [ "$ANS" = r ]; then reset_mk; else getkey mgmt; mk=$K; fi
+    fi
     cset mgmt_key "$mk" || die "could not write $D/$CONF"
     [ $res = created ] || res=saved
   fi
@@ -365,6 +402,13 @@ else
     count; done_n=0 i=0
     while [ $i -lt $n ]; do
       if [ "${sel[i]}" = 1 ]; then
+        lk=l
+        [ "${CLIPROXY_SETUP_ACCOUNTS:-}" = all ] || [ "${mail[i]}" = '?' ] || { ask "${mail[i]} (${kind[i]} ${name[i]}): [l]ink existing login (no browser) / [s]ign in again (browser)?"; lk=${ANS:-l}; }
+        if [ "$lk" != s ] && [ "${mail[i]}" != '?' ]; then
+          # the plugin copies the login the launcher account already has (README: one login shared by both)
+          r=$(AI_PLUGIN_DIR=$D bash ./plugin do "link.${kind[i]}-$(printf '%s' "${name[i]}" | tr -cd 'A-Za-z0-9._-')" 2>&1) && { echo "  $r"; done_n=$((done_n + 1)); i=$((i + 1)); continue; }
+          echo "  $r: signing in instead"
+        fi
         echo "  sign in as ${mail[i]} (${kind[i]} ${name[i]})"
         if [ -z "$bin" ]; then echo "  no cliproxyapi here to sign in with: skipped"; i=$((i + 1)); continue; fi
         f=-claude-login; [ "${kind[i]}" = codex ] && f=-codex-device-login
@@ -382,7 +426,7 @@ else
       fi
       i=$((i + 1))
     done
-    step 3 Accounts "$done_n signed in, $pc in proxy before" "done"
+    step 3 Accounts "$done_n added, $pc in proxy before" "done"
   fi
 fi
 
