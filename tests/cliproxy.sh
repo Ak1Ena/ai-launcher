@@ -240,6 +240,11 @@ echo nomodels > "$T/mode"; run launch all >/dev/null 2>&1; rc=$?
 ok "launch: /v1/models fails: the saved agents" '[ $rc = 0 ] && [ "$(sed -n 3p "$T/claude.args")" = --agents ] && [ "$(sed -n 4p "$T/claude.args")" = "$AG" ]'
 rm -f "$D/cache/agents.json"; run launch all >/dev/null 2>&1; rc=$?; : > "$T/mode"
 ok "launch: /v1/models fails, none saved: no --agents" '[ $rc = 0 ] && ! grep -q -- --agents "$T/claude.args"'
+run launch all >/dev/null 2>&1
+ok "launch: Claude models in the proxy: Claude Code keeps its own default" '! grep -q ANTHROPIC_MODEL "$D/cache/claude-settings.json"'
+echo '{"data":[{"id":"gpt-5"},{"id":"gpt-6.1-sol"},{"id":"codex-auto-review"},{"id":"gpt-image-1"}]}' > "$T/models.json"; run launch all >/dev/null 2>&1; rm -f "$T/models.json"
+ok "launch: no Claude model: default and opus/sonnet/haiku/fable point at the newest one" 'jq -e ".env | .ANTHROPIC_MODEL == \"gpt-6.1-sol\" and .ANTHROPIC_DEFAULT_OPUS_MODEL == \"gpt-6.1-sol\" and .ANTHROPIC_DEFAULT_SONNET_MODEL == \"gpt-6.1-sol\" and .ANTHROPIC_DEFAULT_HAIKU_MODEL == \"gpt-6.1-sol\" and .ANTHROPIC_DEFAULT_FABLE_MODEL == \"gpt-6.1-sol\"" "$D/cache/claude-settings.json" >/dev/null'
+run launch all >/dev/null 2>&1
 RP=$NOJQ run launch all >/dev/null 2>&1; rc=$?
 ok "launch: no jq: no --agents" '[ $rc = 0 ] && ! grep -q -- --agents "$T/claude.args"'
 echo '{"data":[{"id":"GPT-5"},{"id":"gpt-5"},{"id":"-x__y-"},{"id":"..."},{"id":"gemini-image-x"}]}' > "$T/models.json"

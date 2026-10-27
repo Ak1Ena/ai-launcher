@@ -506,10 +506,23 @@ case ${1:-} in
     # --settings beats user settings. A file, not an argument, so the key is never on a command line.
     cs=$D/cache/claude-settings.json
     case $url$key in *[\"\\]*) cs= ;; esac
+    # no Claude model in the proxy (only other providers' accounts on): Claude Code's default and its
+    # opus/sonnet/haiku/fable names would all fail, so they all point at the newest model the proxy has
+    me=
+    if has jq && [ -f "$CACHE/agents.json" ]; then
+      ids=$(jq -r '.[].model | strings' "$CACHE/agents.json" 2>/dev/null)
+      if [ -n "$ids" ] && ! printf '%s\n' "$ids" | grep -q '^claude-'; then
+        dm=$(printf '%s\n' "$ids" | grep -v review | sort -V -r 2>/dev/null | head -n 1)
+        [ -n "$dm" ] || dm=$(printf '%s\n' "$ids" | head -n 1)
+        for v in ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL; do
+          me="$me,\"$v\":\"$dm\""
+        done
+      fi
+    fi
     # status line: the user's own one, plus the account in use (plugin statusline)
     sl=; case $D in *[[:cntrl:]]*) ;; *) sl=$(printf '%q statusline' "$D/plugin"); sl=${sl//\\/\\\\}; sl=${sl//\"/\\\"}
       sl=",\"statusLine\":{\"type\":\"command\",\"command\":\"$sl\"}" ;; esac
-    if [ -n "$cs" ] && mkdir -p "$D/cache" && (umask 077; printf '{"env":{"ANTHROPIC_BASE_URL":"%s","ANTHROPIC_AUTH_TOKEN":"%s"}%s}\n' "$url" "$key" "$sl" > "$cs.$$") && mv "$cs.$$" "$cs"; then
+    if [ -n "$cs" ] && mkdir -p "$D/cache" && (umask 077; printf '{"env":{"ANTHROPIC_BASE_URL":"%s","ANTHROPIC_AUTH_TOKEN":"%s"%s}%s}\n' "$url" "$key" "$me" "$sl" > "$cs.$$") && mv "$cs.$$" "$cs"; then
       exec claude --settings "$cs" "$@"
     fi
     [ -z "$cs" ] || rm -f "$cs.$$"
