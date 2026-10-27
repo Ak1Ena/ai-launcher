@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cliproxy plugin for ai-launcher: one "all accounts" Claude Code channel through a local CLIProxyAPI.
-# Protocol: plugin rows | actions | do <start|stop|affinity|apply|mode-failover|mode-wrr|on.<idx>|off.<idx>|up.<idx>|down.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link   (see the README "Plugins")
+# Protocol: plugin rows | actions | menu | do <start|stop|affinity|apply|mode-failover|mode-wrr|on.<idx>|off.<idx>|up.<idx>|down.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link   (see the README "Plugins")
 # API facts: docs/superpowers/notes/cliproxyapi.md. Never prints a key.
 D=${AI_PLUGIN_DIR:-$(cd "$(dirname "$0")" && pwd)}
 CONF=$D/config CACHE=$D/cache TAB=$(printf '\t')
@@ -50,8 +50,8 @@ JQDEF='def clean: tostring | gsub("[[:cntrl:]]"; "");
   def who: .email // .account // .name // .id // "?" | clean;
   def wt: .weight // 1 | (tonumber? // 1) | floor | if . < 0 then 0 elif . > 99 then 99 else . end;
   def accts: [.files[]? | select((.provider // .type // "") | ascii_downcase | test("^(claude|codex)$"))
-    | {i: aid, n: (.name // .id // "" | clean), e: who, w: wt, d: (.disabled == true)} | select(.i != "" and .n != "")]
-    | sort_by(.n)[] | [.i, .n, .e, .w, .d] | @tsv;
+    | {i: aid, n: (.name // .id // "" | clean), e: who, w: wt, d: (.disabled == true), p: (.provider // .type | ascii_downcase)}
+    | select(.i != "" and .n != "")] | sort_by(.n)[] | [.i, .n, .e, .w, .d, .p] | @tsv;
   # every proxy file, any provider: lower-case name TAB lower-case email field ("" when none), for link
   def names: .files[]? | [(.name // .id // "" | clean | ascii_downcase), (.email | if type == "string" then clean | ascii_downcase else "" end)] | @tsv;'
 
@@ -84,7 +84,7 @@ refresh() {
     rm -f "$CACHE/accts" "$CACHE/names"
     { date +%s; printf '  \t%s\n' "$line"; } > "$f"; mv "$f" "$CACHE/usage"; return
   fi
-  # accounts cache: <idx> TAB <name> TAB <email> TAB <weight> TAB <disabled> per claude / codex account, by name
+  # accounts cache: <idx> TAB <name> TAB <email> TAB <weight> TAB <disabled> TAB <provider> per claude / codex account, by name
   jq -r "$JQDEF"'accts' "$creds" > "$CACHE/accts.$$" 2>/dev/null && mv "$CACHE/accts.$$" "$CACHE/accts"
   jq -r "$JQDEF"'names' "$creds" > "$CACHE/names.$$" 2>/dev/null && mv "$CACHE/names.$$" "$CACHE/names"
   # each enabled claude / codex login: its provider's own usage endpoint through the proxy (as the Management Center does)
@@ -290,7 +290,7 @@ acct() {
   fetchaccts || return 1
   local l; l=$(ordered | awk -F "$TAB" -v id="$1" '$1 == id { print NR "\t" $0; exit }')
   [ -n "$l" ] || { echo "unknown account: $1"; return 1; }
-  IFS="$TAB" read -r pos i nm e w d <<EOF
+  IFS="$TAB" read -r pos i nm e w d _ <<EOF
 $l
 EOF
 }
@@ -387,6 +387,8 @@ link() {
   [ -n "$mgmt_key" ] || { echo 'needs the management key'; return 1; }
   has curl && has jq || { echo 'needs curl and jq'; return 1; }
   fetchaccts || return 1
+  # pin the current order: a new account goes after it, never between (the TUI's menu moves count on that)
+  [ ! -s "$CACHE/accts" ] || setkey order "$(ordered | cut -f2 | paste -sd , -)" || { echo "could not write $CONF"; return 1; }
   trap 'rm -f "$CACHE/link.$$"' EXIT; trap 'exit 1' INT TERM HUP
   # shortcut: a Keychain prompt with no tty blocks until answered (do: 30 s limit); the launch row has a tty
   local k id e h n=0 bad=0
@@ -433,6 +435,27 @@ case ${1:-} in
     usage
     # a launch row: linking may need a Keychain prompt, and launch has a tty
     [ -z "${nl:-}" ] || printf 'link\t+ Link launcher accounts\t%s not linked\n' "$(printf '%s\n' "$nl" | grep -c .)" ;;
+  menu)   # the TUI's tabbed window, from the same state and ids as actions (README "Plugins": menu)
+    printf 'tab\tlist\tActions\n'
+    if brew_has || [ -n "$start_cmd" ]; then printf 'item\tstart\tstart proxy\n'; fi
+    if brew_has || [ -n "$stop_cmd" ]; then printf 'item\tstop\tstop proxy\n'; fi
+    routing
+    [ $mode_ok = no ] && printf 'item\tapply\tApply %s to the proxy\n' "$(modename "$mode")"
+    [ -n "$mgmt_key" ] && [ "$aff_state" != on ] && printf 'item\taffinity\tKeep each chat on one account\n'
+    nl=; [ -n "$mgmt_key" ] && [ -f "$CACHE/accts" ] && nl=$(unlinked)
+    [ -z "$nl" ] || printf 'item\tlink\tLink all launcher accounts\n'
+    printf 'tab\tradio\tMode\n'
+    printf 'item\tmode-failover\tfailover (in your order)%s\n' "$([ $mode = failover ] && printf '\ton')"
+    printf 'item\tmode-wrr\tweighted round-robin%s\n' "$([ $mode = wrr ] && printf '\ton')"
+    if [ -n "$mgmt_key" ] && [ -f "$CACHE/accts" ]; then
+      printf 'tab\tchecklist\tAccounts\t%s\n' "$([ $mode = wrr ] && echo weight || echo order)"
+      # row key label checked n note on-id off-id dec-id inc-id
+      ordered | awk -F "$TAB" -v m="$mode" '{ c = ($5 == "true") ? 0 : 1
+        if (m == "failover") printf "row\t%s\t%s\t%d\t%d\t%s\ton.%s\toff.%s\tup.%s\tdown.%s\n", $1, $3, c, NR, $6, $1, $1, $1, $1
+        else printf "row\t%s\t%s\t%d\t%d\t%s\ton.%s\toff.%s\twdown.%s\twup.%s\n", $1, $3, c, $4, $6, $1, $1, $1, $1 }'
+      [ -z "$nl" ] || printf '%s\n' "$nl" | awk -F "$TAB" '{ printf "row\t%s\t%s\t0\t-\t%s · not linked\tlink.%s\t-\t-\t-\n", $2, $3, $1, $2 }'
+    fi
+    exit 0 ;;
   actions)
     if brew_has || [ -n "$start_cmd" ]; then printf 'start\tstart proxy\n'; fi
     if brew_has || [ -n "$stop_cmd" ]; then printf 'stop\tstop proxy\n'; fi
@@ -494,5 +517,5 @@ case ${1:-} in
     ! envname "$mgmt_key_env" || unset "$mgmt_key_env"
     export ANTHROPIC_BASE_URL=$url ANTHROPIC_AUTH_TOKEN=$key CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
     exec claude "$@" ;;
-  *) echo "usage: plugin rows | actions | do <start|stop|affinity|apply|mode-failover|mode-wrr|on.<idx>|off.<idx>|up.<idx>|down.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link" >&2; exit 1 ;;
+  *) echo "usage: plugin rows | actions | menu | do <start|stop|affinity|apply|mode-failover|mode-wrr|on.<idx>|off.<idx>|up.<idx>|down.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link" >&2; exit 1 ;;
 esac

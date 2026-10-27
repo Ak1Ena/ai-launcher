@@ -352,6 +352,18 @@ up.c3${TAB}wd@example.com: move up (3 → 2)
 down.c3${TAB}wd@example.com: move down (3 → 4)
 off.x1${TAB}wc@example.com: don'"'"'t use
 up.x1${TAB}wc@example.com: move up (4 → 3)" ]'
+menu=$(run menu)
+ok "menu failover: tabs, items, current mode, order rows" '[ "$menu" = "tab${TAB}list${TAB}Actions
+item${TAB}apply${TAB}Apply failover to the proxy
+tab${TAB}radio${TAB}Mode
+item${TAB}mode-failover${TAB}failover (in your order)${TAB}on
+item${TAB}mode-wrr${TAB}weighted round-robin
+tab${TAB}checklist${TAB}Accounts${TAB}order
+row${TAB}c1${TAB}wa@example.com${TAB}1${TAB}1${TAB}claude${TAB}on.c1${TAB}off.c1${TAB}up.c1${TAB}down.c1
+row${TAB}c2${TAB}wb@example.com${TAB}1${TAB}2${TAB}claude${TAB}on.c2${TAB}off.c2${TAB}up.c2${TAB}down.c2
+row${TAB}c3${TAB}wd@example.com${TAB}0${TAB}3${TAB}claude${TAB}on.c3${TAB}off.c3${TAB}up.c3${TAB}down.c3
+row${TAB}x1${TAB}wc@example.com${TAB}1${TAB}4${TAB}codex${TAB}on.x1${TAB}off.x1${TAB}up.x1${TAB}down.x1" ]'
+ok "menu ids are action ids"           '[ -z "$(printf "%s\n" "$menu" | cut -f2,7- | tr "\t" "\n" | grep -v "^-$" | grep -v "^[A-Za-z0-9._-]*$")" ] && [ -z "$(for i in apply off.c1 on.c3 down.c1 up.x1; do has_line "$acts" "$i${TAB}" || echo "$i"; done)" ]'
 res=$(run do mode-failover); rc=$?
 ok "mode-failover: one PATCH, exact body" '[ $rc = 0 ] && [ "$(cat "$T/patch.log")" = "{\"routing\":{\"strategy\":\"fill-first\",\"cooldown\":{\"disable-cooling\":false}}}" ]'
 ok "mode-failover: priorities 40..10 in order" '[ "$(cat "$T/fields.log")" = "$(pr $NA 40 $NB 30 $ND 20 $NC 10)" ]'
@@ -407,6 +419,14 @@ wdown.c2${TAB}wb@example.com: weight 3 → 2
 on.c3${TAB}wd@example.com: use
 off.x1${TAB}wc@example.com: don'"'"'t use
 wup.x1${TAB}wc@example.com: weight off → 1" ]'
+ok "menu wrr: radio follows, weight rows (×N, disabled kept)" '[ "$(run menu | sed -n "/^tab${TAB}radio/,\$p")" = "tab${TAB}radio${TAB}Mode
+item${TAB}mode-failover${TAB}failover (in your order)
+item${TAB}mode-wrr${TAB}weighted round-robin${TAB}on
+tab${TAB}checklist${TAB}Accounts${TAB}weight
+row${TAB}c1${TAB}wa@example.com${TAB}1${TAB}1${TAB}claude${TAB}on.c1${TAB}off.c1${TAB}wdown.c1${TAB}wup.c1
+row${TAB}c2${TAB}wb@example.com${TAB}1${TAB}3${TAB}claude${TAB}on.c2${TAB}off.c2${TAB}wdown.c2${TAB}wup.c2
+row${TAB}c3${TAB}wd@example.com${TAB}0${TAB}1${TAB}claude${TAB}on.c3${TAB}off.c3${TAB}wdown.c3${TAB}wup.c3
+row${TAB}x1${TAB}wc@example.com${TAB}1${TAB}0${TAB}codex${TAB}on.x1${TAB}off.x1${TAB}wdown.x1${TAB}wup.x1" ]'
 ok "action ids fit the charset"        '[ -z "$(run actions | cut -f1 | grep -v "^[A-Za-z0-9._-]*$")" ]'
 rm -f "$T/fields.log"; res=$(run do wup.c2); rc=$?
 ok "raise: fields PATCH, name, integer" '[ $rc = 0 ] && [ "$(cat "$T/fields.log")" = "/v8/management/credentials/fields {\"name\":\"$NB\",\"weight\":4}" ] && has_line "$res" "wb@example.com: weight 4"'
@@ -462,6 +482,10 @@ conf "url=$URL" "key=$CK"
 res=$(run do mode-wrr); rc=$?
 ok "no mgmt key: config only"          '[ $rc = 0 ] && grep -qx mode=wrr "$D/config" && has_line "$res" "proxy not changed (no management key)" && [ ! -e "$T/patch.log" ] && [ ! -e "$T/put.log" ] && [ ! -e "$T/fields.log" ]'
 ok "no mgmt key: no apply, no account actions" '! run actions | grep -q "^apply" && [ -z "$(alines)" ]'
+ok "no mgmt key: menu has no apply, affinity or Accounts tab" '[ "$(run menu)" = "tab${TAB}list${TAB}Actions
+tab${TAB}radio${TAB}Mode
+item${TAB}mode-failover${TAB}failover (in your order)
+item${TAB}mode-wrr${TAB}weighted round-robin${TAB}on" ]'
 ok "no mgmt key: do apply refuses"     '! run do apply >/dev/null'
 nk=; for a in on.c1 off.c1 up.c1 down.c1 wup.c1 wdown.c1; do res=$(run do $a); rc=$?; [ $rc != 0 ] && [ "$res" = "needs the management key" ] || nk="$nk $a"; done
 ok "no mgmt key: every account action refuses" '[ -z "$nk" ] && [ ! -e "$T/fields.log" ] && [ ! -e "$T/status.log" ]'
@@ -497,6 +521,13 @@ link.claude-k2${TAB}K2@Example.com: link to proxy
 link.claude-k4${TAB}k4@example.com: link to proxy
 link.codex-cw${TAB}cx@example.com: link to proxy
 link${TAB}Link all launcher accounts" ]'
+menu=$(lrun menu)
+ok "link: menu has link all, not-linked rows last, tick = link" 'has_line "$menu" "item${TAB}link${TAB}Link all launcher accounts" && [ "$(printf "%s\n" "$menu" | sed -n "/^tab${TAB}checklist/,\$p")" = "tab${TAB}checklist${TAB}Accounts${TAB}order
+row${TAB}c1${TAB}k3@example.com${TAB}1${TAB}1${TAB}claude${TAB}on.c1${TAB}off.c1${TAB}up.c1${TAB}down.c1
+row${TAB}claude-k1${TAB}k1@example.com${TAB}0${TAB}-${TAB}claude · not linked${TAB}link.claude-k1${TAB}-${TAB}-${TAB}-
+row${TAB}claude-k2${TAB}K2@Example.com${TAB}0${TAB}-${TAB}claude · not linked${TAB}link.claude-k2${TAB}-${TAB}-${TAB}-
+row${TAB}claude-k4${TAB}k4@example.com${TAB}0${TAB}-${TAB}claude · not linked${TAB}link.claude-k4${TAB}-${TAB}-${TAB}-
+row${TAB}codex-cw${TAB}cx@example.com${TAB}0${TAB}-${TAB}codex · not linked${TAB}link.codex-cw${TAB}-${TAB}-${TAB}-" ]'
 setc mode wrr; out=$(lrun rows); setc mode failover
 ok "link: wrr shows no weight"         'has_line "$out" "  ${TAB}k1@example.com  not linked" && ! has_line "$out" "k1@example.com  ×"'
 : > "$T/curl.argv"; : > "$T/security.argv"; : > "$T/srv.log"
@@ -512,6 +543,7 @@ ok "link: codex auth file"             'jq -e ".type == \"codex\" and .id_token 
 ok "link: account already in proxy not uploaded" '[ "$(ls "$T/uploads" | grep -ic k3)" = 0 ] && [ "$(ls "$T/uploads" | grep -c .)" = 3 ] && grep -q "POST /v0/management/auth-files" "$T/srv.log"'
 ok "link: no token in output, argv, log or leftover files" '! printf "%s" "$res" | grep -q TOK- && ! grep -q TOK- "$T/curl.argv" "$T/security.argv" "$T/srv.log" && [ -z "$(grep -rl TOK- "$D" "$T/work")" ] && grep -q "file=@" "$T/curl.argv"'
 out=$(lrun rows)
+ok "link: pins the order, new accounts after it" 'grep -qx "order=claude-k3@example.com.json" "$D/config"'
 ok "link: rows follow at once"         '[ "$(printf "%s\n" "$out" | grep "^  ${TAB}.*not linked$")" = "  ${TAB}k4@example.com  not linked" ] && has_line "$out" "k1@example.com  on"'
 res=$(lrun do link.claude-k4); rc=$?; res2=$(lrun do link.claude-k1); rc2=$?
 ok "link.<id>: one account, unknown refused" '[ $rc = 1 ] && [ "$res" = "skipped k4@example.com: no saved login found" ] && [ $rc2 = 1 ] && has_line "$res2" "already linked"'
