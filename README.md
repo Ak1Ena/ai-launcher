@@ -308,13 +308,14 @@ Two marker files sit in the plugin folder. `.off` (empty) turns it off: it is ne
 
 The bundled `cliproxy` plugin starts Claude Code through [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), a local proxy that holds several logins (Claude, Codex, Gemini...) and spreads requests across them. You get one row, "Claude Code · all accounts", that works like one more account for all of them together. The failover section stays as it is.
 
-Needs CLIProxyAPI installed, logged in and running (`brew services start cliproxyapi`); the plugin does not install it or log in for you. It also needs `curl`, and `jq` for the usage lines.
+`ai plugin add cliproxy` runs its setup after you review it (again later with `ai plugin setup cliproxy`, the way to add accounts):
 
-```bash
-export CLIPROXY_API_KEY=...    # a client key from the proxy's config
-export CLIPROXY_MGMT_KEY=...   # its management key (only for the usage lines)
-ai plugin add cliproxy
-```
+1. **Install.** Uses `cliproxyapi` on `PATH`, brew's, the plugin's own `bin/` copy, or a proxy already answering at `url`. Otherwise it offers `brew install cliproxyapi`, or without brew downloads the latest release for your OS into `plugins/cliproxy/bin/` after checking it against the release's `checksums.txt` (and fills `start_cmd` / `stop_cmd`). Choosing "myself" prints the command and stops.
+2. **Keys.** Makes a client key and a management key once and keeps them in `config` (mode 600). It edits the proxy's `config.yaml` (brew: `$(brew --prefix)/etc/cliproxyapi.conf`, else `plugins/cliproxy/run/config.yaml`) only to fill an empty `secret-key` and to add a client key when there is none; it backs the file up once to `config.yaml.ai-launcher.bak`. A proxy that already has a management key asks you to paste it; existing client keys stay, and the new one is appended through the management API.
+3. **Accounts.** A checklist of your `cla` accounts and Codex providers; each ticked one signs in again for the proxy (`-claude-login`, `-codex-device-login`). Accounts the proxy already has are kept.
+4. **Start.** Starts the proxy if it is down, then sets failover mode and session affinity.
+
+It needs `curl`, and `jq` for accounts and the usage lines. To set it up by hand instead, export `CLIPROXY_API_KEY` (a client key from the proxy's config) and `CLIPROXY_MGMT_KEY` (its management key).
 
 The first `rows` call creates `plugins/cliproxy/config` (mode 600). It is read as `key=value` lines, never run as a script:
 
@@ -323,7 +324,8 @@ The first `rows` call creates `plugins/cliproxy/config` (mode 600). It is read a
 | `url` | `http://127.0.0.1:8317` | Where the proxy listens |
 | `key_env` / `key` | `CLIPROXY_API_KEY` | Env var holding the client key, or the key itself (`key` wins) |
 | `mgmt_key_env` / `mgmt_key` | `CLIPROXY_MGMT_KEY` | Same, for the management key |
-| `start_cmd` / `stop_cmd` | none | Commands for the start / stop actions when brew has no `cliproxyapi` (run with `bash -c`) |
+| `start_cmd` / `stop_cmd` | none | Commands for the start / stop actions when brew has no `cliproxyapi` (run with `bash -c` in the plugin folder) |
+| `proxy_config` | set by setup | The proxy's `config.yaml` that setup edits (a relative path is inside the plugin folder) |
 | `mode` | `failover` | `failover` or `balance`: how the "all accounts" row uses accounts (see below) |
 
 Each line is `key=value`. A ` #` (space then `#`) or tab then `#` starts a comment, and a line starting with `#` is skipped. Quotes are not removed: `key="abc"` gives the key `"abc"` with the quotes.

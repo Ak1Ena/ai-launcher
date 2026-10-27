@@ -4,7 +4,7 @@
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 T=$(cd "$(mktemp -d)" && pwd -P)
 SRV=
-trap '[ -n "$SRV" ] && { kill $SRV; wait $SRV; } 2>/dev/null; rm -rf "$T"' EXIT
+trap '[ -n "$SRV" ] && { kill $SRV; wait $SRV; } 2>/dev/null; for f in "$T/brew.pid" "$T/sp/run/pid"; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done; rm -rf "$T"' EXIT
 export HOME=$T/home; mkdir -p "$HOME" "$T/bin" "$T/sys" "$T/jq" "$T/work"
 unset CLIPROXY_API_KEY CLIPROXY_MGMT_KEY
 export CLIPROXY_PROBE_SECS=5   # a loaded machine must not turn a slow answer into "proxy down"
@@ -12,7 +12,7 @@ PY=$(command -v python3 || true)
 JQ=$(command -v jq || true)
 # sys = /usr/bin + /bin without jq, brew, claude, so each test picks what is on PATH
 for f in /usr/bin/* /bin/*; do
-  b=${f##*/}; case $b in jq|brew|claude|python*) continue ;; esac
+  b=${f##*/}; case $b in jq|brew|claude|python*|fzf|cliproxyapi) continue ;; esac
   [ -e "$T/sys/$b" ] || ln -s "$f" "$T/sys/$b"
 done
 [ -e "$T/sys/curl" ] || { c=$(command -v curl) && ln -s "$c" "$T/sys/curl"; }
@@ -119,7 +119,12 @@ class H(BaseHTTPRequestHandler):
         if '/management/' in p:
             if 'slow' in m and 'credentials' in p: time.sleep(3)
             if 'forbid' in m: return self.send(403, {"error": "remote management key not set"})
-            if not self.auth(MK): return self.send(401, {"error": "bad mgmt key"})
+            if 'anykey' not in m and not self.auth(MK): return self.send(401, {"error": "bad mgmt key"})
+            if p == '/v8/management/config/access/api-keys':
+                if self.command == 'GET': return self.send(200, jfile('apikeys.json') or [])
+                open(T + '/apikeys.json', 'w').write(body); return self.send(200, {"status": "ok"})
+            if p == '/v0/management/auth-files' and os.path.isdir(T + '/auth'):
+                return self.send(200, {"files": [json.load(open(T + '/auth/' + f)) for f in sorted(os.listdir(T + '/auth'))]})
             if 'v0' in m and p.startswith('/v8/'): return self.send(404, {"error": "not found"})
             if p == '/v0/management/routing/strategy':
                 if self.command == 'GET': return self.send(200, {"strategy": (jfile('v0strategy.json') or "round-robin")})
@@ -141,6 +146,7 @@ class H(BaseHTTPRequestHandler):
     def do_PUT(self): self.handle_any(self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode())
     def do_PATCH(self): self.handle_any(self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode())
     def do_POST(self): self.handle_any(self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode())
+if len(sys.argv) > 4: HTTPServer(('127.0.0.1', int(sys.argv[4])), H).serve_forever()   # a fake started proxy (setup tests)
 s = HTTPServer(('127.0.0.1', 0), H)
 open(T + '/port.tmp', 'w').write(str(s.server_address[1])); os.rename(T + '/port.tmp', T + '/port')
 s.serve_forever()
@@ -358,5 +364,117 @@ rm -f "$T/creds.json" "$T/quota.json"; rm -rf "$D/cache"
 all=$(run rows; run actions; run launch nope 2>&1; run do apply; run do mode-failover; cat "$D"/cache/* "$T"/*.log 2>/dev/null)
 ok "keys never printed or cached"      '! printf "%s" "$all" | grep -qe "$CK" -e "$MK" -e "$MYKEY"'
 ok "cache is private"                  'case $(ls -ld "$D/cache") in drwx------*) true;; *) false;; esac'
+
+# ── setup: fake cliproxyapi / brew, release served from file://, fake proxy on $URL or a started one on $P2 ──
+FK=$T/fk SP=$T/sp; mkdir -p "$FK/cpa" "$FK/brew" "$T/rel" "$T/relsrc" "$T/cla"
+P2=$("$PY" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+# logins append a fake auth file (email from $T/login-<provider>); anything else serves the fake proxy on the config's port
+cat > "$FK/cpa/cliproxyapi" <<EOF
+#!/bin/sh
+echo "\$*" >> "$T/cpa.log"
+case " \$* " in
+  *" -claude-login "*) p=claude ;; *" -codex-device-login "*) p=codex ;;
+  *) c=; prev=; for a in "\$@"; do [ "\$prev" = -config ] && c=\$a; prev=\$a; done
+     exec "$PY" "$T/srv.py" "$T" "$CK" "$MK" "\$(sed -n 's/^ *port: *\([0-9]*\).*/\1/p' "\$c" | head -1)" ;;
+esac
+mkdir -p "$T/auth"; printf '{"provider":"%s","email":"%s"}\n' "\$p" "\$(cat "$T/login-\$p")" > "$T/auth/\$p-\$\$.json"
+EOF
+cat > "$FK/brew/brew" <<EOF
+#!/bin/sh
+echo "\$*" >> "$T/brew.log"
+case "\$1" in
+  --prefix) if [ -n "\$2" ]; then echo "$T/bp/opt/\$2"; else echo "$T/bp"; fi ;;
+  list) [ -x "$T/bp/opt/cliproxyapi/bin/cliproxyapi" ] ;;
+  install) mkdir -p "$T/bp/opt/cliproxyapi/bin" "$T/bp/etc" && cp "$FK/cpa/cliproxyapi" "$T/bp/opt/cliproxyapi/bin/" &&
+    printf 'server:\n  port: $P2\nmanagement:\n  secret-key: ""\naccess:\n  api-keys:\n' > "$T/bp/etc/cliproxyapi.conf" ;;
+  services) [ "\$2" = start ] && { "$T/bp/opt/cliproxyapi/bin/cliproxyapi" -config "$T/bp/etc/cliproxyapi.conf" >/dev/null 2>&1 & echo \$! > "$T/brew.pid"; } ;;
+esac
+EOF
+chmod +x "$FK/cpa/cliproxyapi" "$FK/brew/brew"
+stop2() { for f in "$T/brew.pid" "$SP/run/pid"; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; rm -f "$f"; done; sleep 0.3; }
+newsp() {  # fresh plugin folder: url=$URL plus the given config lines (a later line wins)
+  stop2; rm -rf "$SP" "$T/auth" "$T/cpa.log" "$T/brew.log" "$T/bp" "$T/apikeys.json" "$T/proxy.yaml"*
+  cp -R "$REPO/plugins-extra/cliproxy" "$SP"
+  { echo "url=$URL"; for l; do echo "$l"; done; } > "$SP/config"; chmod 600 "$SP/config"
+}
+# st: run setup like ai does (cwd and AI_PLUGIN_DIR = plugin folder), stdin = answers; keeps output and keys for the key check
+st() {
+  local o r
+  o=$(cd "$SP" && AI_PLUGIN_DIR=$SP PATH=${RP:-$FK/cpa:$T/jq:$T/sys} CLA_ROOT=$T/cla AI_PROVIDERS=$T/providers AI_ACCOUNTS=$T/acc \
+    CLIPROXY_SETUP_ACCOUNTS=${ACC-none} "$BASH" "$SP/setup" 2>&1); r=$?
+  printf '%s\n' "$o" >> "$T/setup.out"; sed -n 's/^\(mgmt_\)\{0,1\}key=//p' "$SP/config" >> "$T/keys.list"
+  printf '%s\n' "$o"; return $r
+}
+echo anykey > "$T/mode"; : > "$T/setup.out"; : > "$T/keys.list"
+Y0='management:\n  secret-key: ""\naccess:\n  api-keys: []\n'
+
+newsp "proxy_config=$T/proxy.yaml"; printf "$Y0" > "$T/proxy.yaml"; cp "$T/proxy.yaml" "$T/proxy.orig"
+out=$(RP=$FK/cpa:$FK/brew:$T/jq:$T/sys st </dev/null); rc=$?
+ok "setup: uses an existing cliproxyapi" '[ $rc = 0 ] && has_line "$out" "found $FK/cpa/cliproxyapi" && has_line "$out" "use it" && ! grep -q "^install" "$T/brew.log" && has_line "$out" "Done. \"Claude Code · all accounts\" is ready."'
+k1=$(sed -n 's/^key=//p' "$SP/config"); m1=$(sed -n 's/^mgmt_key=//p' "$SP/config"); cp "$T/proxy.yaml" "$T/proxy.run1"
+out=$(st </dev/null); rc=$?
+ok "setup: keys created once, kept on rerun" '[ $rc = 0 ] && [ ${#k1} = 64 ] && [ ${#m1} = 64 ] && [ "$k1" != "$m1" ] && [ "$(sed -n "s/^key=//p" "$SP/config")" = "$k1" ] && [ "$(sed -n "s/^mgmt_key=//p" "$SP/config")" = "$m1" ] && case $(ls -l "$SP/config") in -rw-------*) true;; *) false;; esac && cmp -s "$T/proxy.orig" "$T/proxy.yaml.ai-launcher.bak" && [ "$(ls "$T" | grep -c "^proxy.yaml.ai-launcher")" = 1 ] && grep -qx "  secret-key: \"$m1\"" "$T/proxy.yaml" && grep -qx "    - \"$k1\"" "$T/proxy.yaml" && cmp -s "$T/proxy.run1" "$T/proxy.yaml" && printf "%s\n" "$out" | grep "\[2/4\] Keys" | grep -q " kept$"'
+
+newsp "proxy_config=$T/proxy.yaml"
+printf '%s\n' 'management:' '  secret-key: "$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012"' 'access:' '  api-keys:' '    - "old-key"' > "$T/proxy.yaml"
+cp "$T/proxy.yaml" "$T/proxy.orig"; echo '["old-key"]' > "$T/apikeys.json"
+out=$(echo pasted-mgmt-SECRET | st); rc=$?
+ok "setup: existing secret-key is never replaced" '[ $rc = 0 ] && has_line "$out" "paste the management key:" && cmp -s "$T/proxy.orig" "$T/proxy.yaml" && [ ! -e "$T/proxy.yaml.ai-launcher.bak" ] && grep -qx mgmt_key=pasted-mgmt-SECRET "$SP/config"'
+ok "setup: client key appended through the API" '[ "$(cat "$T/apikeys.json")" = "[\"old-key\",\"$(sed -n "s/^key=//p" "$SP/config")\"]" ]'
+
+newsp "url=http://127.0.0.1:$P2"
+out=$(echo i | RP=$FK/brew:$T/jq:$T/sys st); rc=$?
+ok "setup: brew install when missing and chosen" '[ $rc = 0 ] && grep -qx "install cliproxyapi" "$T/brew.log" && grep -qx "services start cliproxyapi" "$T/brew.log" && grep -qx "proxy_config=$T/bp/etc/cliproxyapi.conf" "$SP/config" && grep -q "secret-key: \"[0-9a-f]\{64\}\"" "$T/bp/etc/cliproxyapi.conf" && ! grep -q "^start_cmd=" "$SP/config" && has_line "$out" "proxy up"'
+
+newsp "url=http://127.0.0.1:$P2"; out=$(echo m | RP=$FK/brew:$T/jq:$T/sys st); rc=$?
+newsp "url=http://127.0.0.1:$P2"; out2=$(echo m | RP=$T/jq:$T/sys st); rc2=$?
+ok "setup: myself exits 2 and prints the command" '[ $rc = 2 ] && has_line "$out" "install it with: brew install cliproxyapi" && [ ! -e "$T/bp" ] && [ $rc2 = 2 ] && has_line "$out2" "https://github.com/router-for-me/CLIProxyAPI/releases/latest/download/" && [ ! -e "$SP/bin" ]'
+
+case $(uname -s) in Darwin) OS=darwin ;; *) OS=linux ;; esac
+case $(uname -m) in arm64|aarch64) AR=aarch64 ;; *) AR=amd64 ;; esac
+A=CLIProxyAPI_9.9.9_${OS}_${AR}.tar.gz
+cp "$FK/cpa/cliproxyapi" "$T/relsrc/cli-proxy-api"
+printf '%s\n' 'server:' '  host: ""' '  port: 8317' 'management:' '  secret-key: ""' 'access:' '  api-keys:' '    - "your-api-key-1"' '    - "your-api-key-2"' > "$T/relsrc/config.example.yaml"
+(cd "$T/relsrc" && tar -czf "$T/rel/$A" cli-proxy-api config.example.yaml)
+sum=$(shasum -a 256 "$T/rel/$A" 2>/dev/null || sha256sum "$T/rel/$A"); sum=${sum%% *}
+BAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+printf '%s  CLIProxyAPI_9.9.9_%s_%s_no-plugin.tar.gz\n%s  %s\n' "$BAD" "$OS" "$AR" "$sum" "$A" > "$T/rel/checksums.txt"
+dl() { echo d | CLIPROXY_RELEASE_BASE=file://$T/rel RP=$T/jq:$T/sys st; }
+newsp "url=http://127.0.0.1:$P2"; out=$(dl); rc=$?
+ok "setup: no brew downloads and verifies the release" '[ $rc = 0 ] && [ -x "$SP/bin/cliproxyapi" ] && grep -q "^start_cmd=" "$SP/config" && grep -q "^stop_cmd=" "$SP/config" && grep -qx proxy_config=run/config.yaml "$SP/config" && grep -qx "  host: \"127.0.0.1\"" "$SP/run/config.yaml" && grep -qx "  port: $P2" "$SP/run/config.yaml" && ! grep -q your-api-key "$SP/run/config.yaml" && [ -z "$(ls -d "$SP"/run/dl.* 2>/dev/null)" ] && has_line "$out" "proxy up"'
+(cd "$T/work" && PATH=$BASEPATH AI_PLUGIN_DIR=$SP "$SP/plugin" do stop) >/dev/null 2>&1; sleep 0.3
+ok "setup: stop_cmd stops the started proxy" '[ ! -e "$SP/run/pid" ] && ! curl -s -m 1 -o /dev/null "http://127.0.0.1:$P2/"'
+printf '%s  %s\n' "$BAD" "$A" > "$T/rel/checksums.txt"
+newsp "url=http://127.0.0.1:$P2"; out=$(dl); rc=$?
+printf '%s  CLIProxyAPI_9.9.9_%s_%s_no-plugin.tar.gz\n' "$sum" "$OS" "$AR" > "$T/rel/checksums.txt"
+newsp "url=http://127.0.0.1:$P2"; out2=$(dl); rc2=$?
+ok "setup: bad checksum refuses"       '[ $rc != 0 ] && has_line "$out" "checksum mismatch" && [ $rc2 != 0 ] && has_line "$out2" "no ${OS}_${AR} entry" && [ ! -e "$SP/bin/cliproxyapi" ] && [ -z "$(ls -d "$SP"/run/dl.* 2>/dev/null)" ]'
+
+# accounts: cla a (already in the proxy), cla b, codex provider "work" (email from its id_token)
+newsp "proxy_config=$T/proxy.yaml"; printf "$Y0" > "$T/proxy.yaml"
+mkdir -p "$T/cla/a" "$T/cla/b" "$T/acc/codex/work" "$T/auth"
+echo '{"oauthAccount":{"emailAddress":"a@example.com"}}' > "$T/cla/a/.claude.json"
+echo '{"oauthAccount":{"emailAddress":"B@Example.com"}}' > "$T/cla/b/.claude.json"
+echo '{"provider":"claude","email":"A@example.com"}' > "$T/auth/claude-0.json"
+printf 'claude\tclaude\tClaude Code\nwork\tFOO=1 /usr/local/bin/codex --x\tCodex work\n' > "$T/providers"
+echo "{\"tokens\":{\"id_token\":\"h.$(printf '{"email":"c@example.com"}' | base64 | tr '+/' '-_' | tr -d '=\n').s\"}}" > "$T/acc/codex/work/auth.json"
+echo b@example.com > "$T/login-claude"; echo c@example.com > "$T/login-codex"
+out=$(ACC=all st </dev/null); rc=$?
+ok "setup: accounts all logs in each launcher account not in proxy" '[ $rc = 0 ] && [ "$(grep -c -- -claude-login "$T/cpa.log")" = 1 ] && grep -qx -- "-config $T/proxy.yaml -claude-login" "$T/cpa.log" && has_line "$out" "sign in as B@Example.com" && ! has_line "$out" "sign in as a@example.com"'
+ok "setup: codex uses device login"    'grep -qx -- "-config $T/proxy.yaml -codex-device-login" "$T/cpa.log" && has_line "$out" "signed in as c@example.com"'
+n1=$(wc -l < "$T/cpa.log")
+out=$(ACC=all st </dev/null); rc=$?
+ok "setup: rerun is idempotent"        '[ $rc = 0 ] && [ "$(wc -l < "$T/cpa.log")" = "$n1" ] && printf "%s\n" "$out" | grep "\[3/4\] Accounts" | grep -q " kept$" && printf "%s\n" "$out" | grep "\[2/4\] Keys" | grep -q " kept$"'
+rm -f "$T"/auth/claude-*.json; echo '{"provider":"claude","email":"A@example.com"}' > "$T/auth/claude-0.json"
+echo other@example.com > "$T/login-claude"
+out=$(ACC=all st </dev/null)
+ok "setup: another email warns and is kept" 'has_line "$out" "signed in as other@example.com, expected B@Example.com: kept"'
+rm -rf "$T/auth"; echo a@example.com > "$T/login-claude"; c1=$(grep -c -- -claude-login "$T/cpa.log"); x1=$(grep -c -- -codex "$T/cpa.log")
+out=$(printf 'n\n\n1\n\n' | ACC= st); rc=$?
+ok "setup: numbered list needs one account, then signs in the ticked one" '[ $rc = 0 ] && has_line "$out" "pick at least one account" && [ "$(grep -c -- -claude-login "$T/cpa.log")" = $((c1 + 1)) ] && [ "$(grep -c -- -codex "$T/cpa.log")" = "$x1" ] && has_line "$out" "signed in as a@example.com"'
+stop2
+leak=; while IFS= read -r k; do [ -n "$k" ] && grep -qF -- "$k" "$T/setup.out" && leak=1; done < "$T/keys.list"
+ok "setup: never prints a key"         '[ -z "$leak" ] && [ "$(grep -c . "$T/keys.list")" -gt 4 ] && ! grep -q pasted-mgmt-SECRET "$T/setup.out"'
+: > "$T/mode"
 
 [ $fails = 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }
