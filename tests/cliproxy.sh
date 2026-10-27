@@ -34,6 +34,7 @@ run() { (cd "$T/work" && PATH=${RP:-$BASEPATH} "$P" "$@"); }   # plugin's cwd = 
 conf() { printf '%s\n' "$@" > "$D/config"; chmod 600 "$D/config"; }
 wait_cache() { local i=0; while [ $i -lt 50 ]; do [ -f "$D/cache/usage" ] && [ "$(head -1 "$D/cache/usage")" != "${1:-}" ] && [ ! -d "$D/cache/lock" ] && return 0; sleep 0.2; i=$((i + 1)); done; return 1; }
 TAB=$(printf '\t')
+fresh() { rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows); }
 
 # fake claude: dumps env and args
 printf '#!/bin/sh\nenv > "%s/claude.env"; printf "%%s\\n" "$@" > "%s/claude.args"\n' "$T" "$T" > "$T/bin/claude"; chmod +x "$T/bin/claude"
@@ -93,10 +94,9 @@ CREDS = {"observed_at": "2026-10-26T10:00:00Z", "files": [
 def jfile(n):
     try: return json.load(open(T + '/' + n))
     except Exception: return None
-def creds():  # weights.json: name -> weight, set by the fields PATCH; absent = no weight key (proxy default 1)
-    c = jfile('creds.json') or json.loads(json.dumps(CREDS)); w = jfile('weights.json') or {}
-    for f in c.get('files', []):
-        if f.get('name') in w: f['weight'] = w[f['name']]
+def creds():  # over.json: name -> fields set by the fields / status PATCH, merged into the list
+    c = jfile('creds.json') or json.loads(json.dumps(CREDS)); o = jfile('over.json') or {}
+    for f in c.get('files', []): f.update(o.get(f.get('name'), {}))
     return c
 def quota(ai):
     now = int(time.time())
@@ -146,9 +146,9 @@ class H(BaseHTTPRequestHandler):
                 r.update(json.loads(body).get('routing', {})); json.dump(r, open(T + '/routing.json', 'w'))
                 return self.send(200, {"status": "ok"})
             if p in ('/v8/management/credentials', '/v0/management/auth-files'): return self.send(200, creds())
-            if p in ('/v8/management/credentials/fields', '/v0/management/auth-files/fields') and self.command == 'PATCH':
-                open(T + '/fields.log', 'a').write(p + ' ' + body + '\n'); b = json.loads(body)
-                w = jfile('weights.json') or {}; w[b['name']] = b['weight']; json.dump(w, open(T + '/weights.json', 'w'))
+            if p.split('/')[-1] in ('fields', 'status') and p.rsplit('/', 1)[0] in ('/v8/management/credentials', '/v0/management/auth-files') and self.command == 'PATCH':
+                open(T + '/' + p.split('/')[-1] + '.log', 'a').write(p + ' ' + body + '\n'); b = json.loads(body)
+                o = jfile('over.json') or {}; o.setdefault(b.pop('name'), {}).update(b); json.dump(o, open(T + '/over.json', 'w'))
                 return self.send(200, {"status": "ok"})
             if p in ('/v8/management/requests/api-call', '/v0/management/api-call'):
                 req = json.loads(body or '{}'); code, obj = quota(req.get('auth_index'))
@@ -256,6 +256,7 @@ ok "refused management API: hint"      'has_line "$out" "  ${TAB}usage: manageme
 : > "$T/mode"
 
 # ── session affinity ──
+conf "url=$URL" "key=$CK" "mgmt_key=$MK" mode=failover   # no mode= would read a round-robin proxy as wrr
 AFF='session affinity off'
 rm -f "$T/routing.json" "$T/patch.log"; rm -rf "$D/cache"
 run rows >/dev/null; wait_cache
@@ -292,50 +293,142 @@ ok "no mgmt key: do affinity refuses"  'has_line "$res" "management key"'
 conf url=http://127.0.0.1:1 "mgmt_key=$MK"
 ok "dead proxy: no answer, not HTTP 000" 'run do affinity | grep -q "not available (no answer;"'
 
-# ── mode: failover (default) / load balance ──
+# ── modes and accounts: failover (default) / weighted round-robin ──
+acc() { printf '{"auth_index":"%s","name":"%s-%s.json","email":"%s","provider":"%s","status":"active","disabled":false,"success":1,"failed":0%s}' "$1" "$2" "$3" "$3" "$2" "${4:+,$4}"; }
+setc() { grep -v "^$1=" "$D/config" > "$D/c.tmp"; [ -n "$2" ] && echo "$1=$2" >> "$D/c.tmp"; mv "$D/c.tmp" "$D/config"; chmod 600 "$D/config"; }
+alines() { run actions | grep -E '^(on|off|up|down|wup|wdown)\.'; }
+dlines() { printf '%s\n' "$out" | grep -E "^  ${TAB}([0-9]  )?w[a-z]@"; }
+NA=claude-wa@example.com.json NB=claude-wb@example.com.json ND=claude-wd@example.com.json NC=codex-wc@example.com.json
+pr() { printf '/v8/management/credentials/fields {"name":"%s","priority":%s}\n' "$@"; }   # pr name p [name p ...]
+# a repeated key: the last wins
+echo "{\"files\":[$(acc c1 claude wa@example.com),$(acc c2 claude wb@example.com),$(acc c3 claude wd@example.com '"disabled":true'),$(acc x1 codex wc@example.com),$(acc g1 gemini wg@example.com)]}" > "$T/creds.json"
 conf "url=$URL" "key=$CK" "mgmt_key=$MK" "# a comment"
-: > "$T/mode"; rm -f "$T/patch.log" "$T/put.log"
-echo '{"strategy":"round-robin","session-affinity":true,"session-affinity-subagents":true}' > "$T/routing.json"
-rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows)
-MIS="⚠ proxy uses round-robin, plugin mode is failover — apply: TUI a, or ai plugin do cliproxy apply"
-ok "default mode: failover title"      '[ "$(printf "%s\n" "$out" | head -1)" = "section${TAB}CLIPROXY · all accounts · failover" ]'
+: > "$T/mode"; rm -f "$T/patch.log" "$T/put.log" "$T/fields.log" "$T/status.log" "$T/over.json"
+echo '{"strategy":"fill-first","cooldown":{"disable-cooling":true},"session-affinity":true,"session-affinity-subagents":true}' > "$T/routing.json"
+fresh
+MIS="⚠ proxy uses fill-first (cooling off), plugin mode is failover — apply: TUI a, or ai plugin do cliproxy apply"
+ok "default mode: failover title"      '[ "$(printf "%s\n" "$out" | head -1)" = "section${TAB}CLIPROXY · all accounts · failover" ] && ! grep -q "^mode=" "$D/config"'
 ok "mismatch: warning line"            'has_line "$out" "  ${TAB}$MIS"'
-ok "no ttl: plain sticky per chat"     'has_line "$out" "routing: round-robin · sticky per chat" && ! has_line "$out" "sticky per chat ("'
+ok "failover rows: n, email, on/off, by name" '[ "$(dlines)" = "  ${TAB}1  wa@example.com  on
+  ${TAB}2  wb@example.com  on
+  ${TAB}3  wd@example.com  off
+  ${TAB}4  wc@example.com  on" ]'
 acts=$(run actions)
-ok "actions: modes, apply on mismatch" 'has_line "$acts" "mode-failover${TAB}Mode: failover (one account until limited)" && has_line "$acts" "mode-balance${TAB}Mode: load balance" && has_line "$acts" "apply${TAB}Apply failover to the proxy"'
+ok "actions: modes, apply, no old ones" 'has_line "$acts" "mode-failover${TAB}Mode: failover (one account until limited, in your order)" && has_line "$acts" "mode-wrr${TAB}Mode: weighted round-robin" && has_line "$acts" "apply${TAB}Apply failover to the proxy" && ! has_line "$acts" "mode-balance" && ! has_line "$acts" "weights-"'
+ok "failover actions: use, move"       '[ "$(alines)" = "off.c1${TAB}wa@example.com: don'"'"'t use
+down.c1${TAB}wa@example.com: move down (1 → 2)
+off.c2${TAB}wb@example.com: don'"'"'t use
+up.c2${TAB}wb@example.com: move up (2 → 1)
+down.c2${TAB}wb@example.com: move down (2 → 3)
+on.c3${TAB}wd@example.com: use
+up.c3${TAB}wd@example.com: move up (3 → 2)
+down.c3${TAB}wd@example.com: move down (3 → 4)
+off.x1${TAB}wc@example.com: don'"'"'t use
+up.x1${TAB}wc@example.com: move up (4 → 3)" ]'
 res=$(run do mode-failover); rc=$?
 ok "mode-failover: one PATCH, exact body" '[ $rc = 0 ] && [ "$(cat "$T/patch.log")" = "{\"routing\":{\"strategy\":\"fill-first\",\"cooldown\":{\"disable-cooling\":false}}}" ]'
+ok "mode-failover: priorities 40..10 in order" '[ "$(cat "$T/fields.log")" = "$(pr $NA 40 $NB 30 $ND 20 $NC 10)" ]'
 ok "mode-failover: says so"            'has_line "$res" "proxy now uses failover"'
 ok "mode written, other lines kept, 600" '[ "$(cat "$D/config")" = "url=$URL
 key=$CK
 mgmt_key=$MK
 # a comment
 mode=failover" ] && case $(ls -l "$D/config") in -rw-------*) true;; *) false;; esac'
-rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows)
+fresh
 ok "matching proxy: no mismatch, no apply" '! has_line "$out" "proxy uses" && ! run actions | grep -q "^apply"'
-rm -f "$T/patch.log"; res=$(run do mode-balance)
-ok "mode-balance: exact body"          '[ "$(cat "$T/patch.log")" = "{\"routing\":{\"strategy\":\"round-robin\",\"session-affinity\":true,\"session-affinity-subagents\":true,\"session-affinity-ttl\":\"1h\"}}" ]'
-ok "mode-balance: one mode line"       '[ "$(grep -c "^mode=" "$D/config")" = 1 ] && grep -qx mode=balance "$D/config"'
-rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows)
-ok "balance title, no mismatch"        '[ "$(printf "%s\n" "$out" | head -1)" = "section${TAB}CLIPROXY · all accounts · load balance" ] && ! has_line "$out" "proxy uses"'
-echo '{"strategy":"wrr","session-affinity":false,"session-affinity-ttl":"2h"}' > "$T/routing.json"; rm -f "$T/patch.log"
-run do apply >/dev/null
-ok "balance keeps weighted-round-robin" '[ "$(cat "$T/patch.log")" = "{\"routing\":{\"strategy\":\"weighted-round-robin\",\"session-affinity\":true,\"session-affinity-subagents\":true}}" ]'
-conf "url=$URL" "key=$CK" "mgmt_key=$MK" mode=failover
-echo '{"strategy":"fill-first","cooldown":{"disable-cooling":true}}' > "$T/routing.json"
-rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows)
-ok "failover with cooling off: mismatch" 'has_line "$out" "⚠ proxy uses fill-first (cooling off), plugin mode is failover"'
-echo v0 > "$T/mode"; rm -f "$T/patch.log"
-run do mode-failover >/dev/null; r1=$?
-echo '"wrr"' > "$T/v0strategy.json"; run do mode-balance >/dev/null
-ok "v0: strategy PUT only"             '[ $r1 = 0 ] && [ ! -e "$T/patch.log" ] && [ "$(cat "$T/put.log")" = "PUT {\"value\":\"fill-first\"}
-PUT {\"value\":\"weighted-round-robin\"}" ]'
-: > "$T/mode"; rm -f "$T/put.log" "$T/v0strategy.json"
+rm -f "$T/fields.log"; res=$(run do down.c1); rc=$?
+ok "down: order= line"                 '[ $rc = 0 ] && grep -qx "order=$NB,$NA,$ND,$NC" "$D/config" && has_line "$res" "wa@example.com: now 2"'
+ok "down: priorities sent in new order" '[ "$(cat "$T/fields.log")" = "$(pr $NB 40 $NA 30 $ND 20 $NC 10)" ]'
+out=$(run rows)
+ok "down: rows follow at once"         '[ "$(dlines | head -2)" = "  ${TAB}1  wb@example.com  on
+  ${TAB}2  wa@example.com  on" ]'
+rm -f "$T/fields.log"; run do up.x1 >/dev/null
+ok "up: order= line"                   'grep -qx "order=$NB,$NA,$NC,$ND" "$D/config" && [ "$(grep -c "^order=" "$D/config")" = 1 ]'
+rm -f "$T/fields.log"
+ok "first up / last down refused"      '! run do up.c2 >/dev/null && ! run do down.c3 >/dev/null && [ ! -e "$T/fields.log" ]'
+setc order "gone.json,$NC"; out=$(run rows)
+ok "order: gone names dropped, rest by name" '[ "$(dlines | cut -c4-)" = "1  wc@example.com  on
+2  wa@example.com  on
+3  wb@example.com  on
+4  wd@example.com  off" ]'
+setc order ""
+res=$(run do off.c1); rc=$?
+ok "off: status PATCH, disabled true"  '[ $rc = 0 ] && [ "$(cat "$T/status.log")" = "/v8/management/credentials/status {\"name\":\"$NA\",\"disabled\":true}" ] && has_line "$res" "wa@example.com: not used"'
+out=$(run rows)
+ok "off: rows and actions follow"      'has_line "$out" "1  wa@example.com  off" && has_line "$(run actions)" "on.c1${TAB}wa@example.com: use"'
+rm -f "$T/status.log"; run do on.c1 >/dev/null
+ok "on: disabled false"                '[ "$(cat "$T/status.log")" = "/v8/management/credentials/status {\"name\":\"$NA\",\"disabled\":false}" ]'
+echo v0 > "$T/mode"; rm -f "$T/status.log"; run do off.c2 >/dev/null; : > "$T/mode"
+ok "status: v0 fallback"               '[ "$(cat "$T/status.log")" = "/v0/management/auth-files/status {\"name\":\"$NB\",\"disabled\":true}" ]'
+rm -f "$T/over.json" "$T/patch.log" "$T/fields.log" "$T/status.log"
+res=$(run do mode-wrr); rc=$?
+ok "mode-wrr: weighted-round-robin + affinity" '[ $rc = 0 ] && grep -qx mode=wrr "$D/config" && [ "$(cat "$T/patch.log")" = "{\"routing\":{\"strategy\":\"weighted-round-robin\",\"session-affinity\":true,\"session-affinity-subagents\":true,\"session-affinity-ttl\":\"1h\"}}" ] && has_line "$res" "weighted round-robin"'
+ok "mode-wrr: every priority cleared"  '[ "$(cat "$T/fields.log")" = "$(pr $NA 0 $NB 0 $ND 0 $NC 0)" ]'
+echo "{\"$NB\":{\"weight\":3},\"$NC\":{\"weight\":0}}" > "$T/over.json"
+fresh
+ok "wrr title, no mismatch"            '[ "$(printf "%s\n" "$out" | head -1)" = "section${TAB}CLIPROXY · all accounts · weighted round-robin" ] && ! has_line "$out" "proxy uses"'
+ok "wrr rows: ×N, off for 0 and unused" '[ "$(dlines)" = "  ${TAB}wa@example.com  ×1
+  ${TAB}wb@example.com  ×3
+  ${TAB}wd@example.com  off
+  ${TAB}wc@example.com  off" ]'
+ok "wrr actions: use, weights"         '[ "$(alines)" = "off.c1${TAB}wa@example.com: don'"'"'t use
+wup.c1${TAB}wa@example.com: weight 1 → 2
+wdown.c1${TAB}wa@example.com: weight 1 → off
+off.c2${TAB}wb@example.com: don'"'"'t use
+wup.c2${TAB}wb@example.com: weight 3 → 4
+wdown.c2${TAB}wb@example.com: weight 3 → 2
+on.c3${TAB}wd@example.com: use
+off.x1${TAB}wc@example.com: don'"'"'t use
+wup.x1${TAB}wc@example.com: weight off → 1" ]'
+ok "action ids fit the charset"        '[ -z "$(run actions | cut -f1 | grep -v "^[A-Za-z0-9._-]*$")" ]'
+rm -f "$T/fields.log"; res=$(run do wup.c2); rc=$?
+ok "raise: fields PATCH, name, integer" '[ $rc = 0 ] && [ "$(cat "$T/fields.log")" = "/v8/management/credentials/fields {\"name\":\"$NB\",\"weight\":4}" ] && has_line "$res" "wb@example.com: weight 4"'
+ok "raise: cache updated at once"      'has_line "$(run actions)" "wup.c2${TAB}wb@example.com: weight 4 → 5" && has_line "$(run rows)" "wb@example.com  ×4"'
+rm -f "$T/fields.log"; res=$(run do wdown.c1)
+ok "lower to 0: off"                   '[ "$(cat "$T/fields.log")" = "/v8/management/credentials/fields {\"name\":\"$NA\",\"weight\":0}" ] && has_line "$res" "off"'
+rm -f "$T/fields.log"
+ok "lower at 0 refused, no PATCH"      '! run do wdown.c1 >/dev/null && [ ! -e "$T/fields.log" ]'
+echo "{\"$NB\":{\"weight\":99}}" > "$T/over.json"; fresh
+ok "raise capped at 99"                '! has_line "$(run actions)" "wup.c2" && ! run do wup.c2 >/dev/null && [ ! -e "$T/fields.log" ]'
+ok "unknown or bad id refused"         '! run do wup.zz >/dev/null && ! run do "off.c1;x" >/dev/null && [ ! -e "$T/fields.log" ] && [ ! -e "$T/status.log" ]'
+echo v0 > "$T/mode"; run do wdown.c2 >/dev/null
+ok "weight: v0 fallback"               '[ "$(cat "$T/fields.log")" = "/v0/management/auth-files/fields {\"name\":\"$NB\",\"weight\":98}" ]'
+: > "$T/mode"; rm -f "$T/fields.log"; run do apply >/dev/null
+ok "apply in wrr clears priorities"    '[ "$(cat "$T/fields.log")" = "$(pr $NA 0 $NB 0 $ND 0 $NC 0)" ]'
+setc order "$NC"; rm -f "$T/fields.log"; run do mode-failover >/dev/null
+ok "back to failover: order priorities restored" '[ "$(cat "$T/fields.log")" = "$(pr $NC 40 $NA 30 $NB 20 $ND 10)" ]'
+rm -f "$T/fields.log"; run do apply >/dev/null
+ok "apply in failover sends the order" '[ "$(cat "$T/fields.log")" = "$(pr $NC 40 $NA 30 $NB 20 $ND 10)" ]'
+setc mode balance; rm -f "$T/patch.log"; fresh
+ok "old mode=balance reads as wrr"     '[ "$(printf "%s\n" "$out" | head -1)" = "section${TAB}CLIPROXY · all accounts · weighted round-robin" ] && run do apply >/dev/null && has_line "$(cat "$T/patch.log")" "\"strategy\":\"weighted-round-robin\""'
+setc mode failover; run do mode-balance >/dev/null
+ok "mode-balance: hidden alias of mode-wrr" 'grep -qx mode=wrr "$D/config"'
+setc mode ""; setc weights on
+echo '{"strategy":"round-robin","session-affinity":true,"session-affinity-subagents":true}' > "$T/routing.json"; fresh
+ok "no mode=, round-robin proxy: wrr"  'grep -qx mode=wrr "$D/config" && has_line "$out" "weighted round-robin"'
+setc mode ""; echo '{"strategy":"wrr"}' > "$T/routing.json"; fresh
+ok "no mode=, wrr proxy: wrr; old weights= ignored" 'grep -qx mode=wrr "$D/config"'
+setc mode ""; echo '{"strategy":"fill-first"}' > "$T/routing.json"; fresh
+ok "no mode=, fill-first proxy: failover, not written" '! grep -q "^mode=" "$D/config" && has_line "$out" "· failover"'
+setc mode ""; echo '{"strategy":"round-robin"}' > "$T/routing.json"; rm -rf "$D/cache"; run do mode-failover >/dev/null
+ok "an explicit mode wins over first sight" 'grep -qx mode=failover "$D/config"'
+echo v0 > "$T/mode"; rm -f "$T/patch.log" "$T/put.log" "$T/fields.log"
+run do mode-failover >/dev/null; r1=$?; run do mode-wrr >/dev/null
+ok "v0: strategy PUT only, v0 priorities" '[ $r1 = 0 ] && [ ! -e "$T/patch.log" ] && [ "$(cat "$T/put.log")" = "PUT {\"value\":\"fill-first\"}
+PUT {\"value\":\"weighted-round-robin\"}" ] && grep -q "^/v0/management/auth-files/fields .*\"priority\":0" "$T/fields.log"'
+: > "$T/mode"; rm -f "$T/put.log" "$T/patch.log" "$T/fields.log" "$T/status.log"
 conf "url=$URL" "key=$CK"
-res=$(run do mode-balance); rc=$?
-ok "no mgmt key: config only"          '[ $rc = 0 ] && grep -qx mode=balance "$D/config" && has_line "$res" "proxy not changed (no management key)" && [ ! -e "$T/patch.log" ] && [ ! -e "$T/put.log" ]'
-ok "no mgmt key: no apply action"      '! run actions | grep -q "^apply"'
+res=$(run do mode-wrr); rc=$?
+ok "no mgmt key: config only"          '[ $rc = 0 ] && grep -qx mode=wrr "$D/config" && has_line "$res" "proxy not changed (no management key)" && [ ! -e "$T/patch.log" ] && [ ! -e "$T/put.log" ] && [ ! -e "$T/fields.log" ]'
+ok "no mgmt key: no apply, no account actions" '! run actions | grep -q "^apply" && [ -z "$(alines)" ]'
 ok "no mgmt key: do apply refuses"     '! run do apply >/dev/null'
+nk=; for a in on.c1 off.c1 up.c1 down.c1 wup.c1 wdown.c1; do res=$(run do $a); rc=$?; [ $rc != 0 ] && [ "$res" = "needs the management key" ] || nk="$nk $a"; done
+ok "no mgmt key: every account action refuses" '[ -z "$nk" ] && [ ! -e "$T/fields.log" ] && [ ! -e "$T/status.log" ]'
+conf "url=$URL" "key=$CK" "mgmt_key=$MK" mode=failover
+wall=$(run rows; run actions; run do off.c1; run do on.c1; run do down.c1; run do up.c1; run do mode-wrr; run do wup.c1; run do wdown.c1; cat "$D"/cache/* "$T"/*.log 2>/dev/null)
+ok "accounts: keys never printed"      '! printf "%s" "$wall" | grep -qe "$CK" -e "$MK"'
+rm -f "$T/creds.json" "$T/routing.json" "$T/over.json" "$T"/fields.log "$T/status.log" "$T/patch.log"; rm -rf "$D/cache"
+conf "url=$URL" "key=$CK" "mgmt_key=$MK"
 
 # ── proxy text cannot inject control chars ──
 conf "url=$URL" "key=$CK" "mgmt_key=$MK"
@@ -350,7 +443,6 @@ conf "url=$URL" "key=$CK" "mgmt_key=$MK"
 # ── all accounts limited ──
 LIM='{"five_hour":{"utilization":100,"resets_at":"RESET"},"seven_day":{"utilization":10,"resets_at":null}}'
 FREE='{"five_hour":{"utilization":5,"resets_at":null},"seven_day":{"utilization":5,"resets_at":null}}'
-fresh() { rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows); }
 cred() { printf '{"auth_index":"%s","provider":"%s","status":"active","disabled":false,"success":1,"failed":0%s}' "$1" "$2" "${3:+,$3}"; }
 rst() { python3 -c "import datetime,sys;print((datetime.datetime.utcnow()+datetime.timedelta(seconds=int(sys.argv[1]))).strftime('%Y-%m-%dT%H:%M:%S+00:00'))" "$1"; }
 r1=$(rst 7500); r2=$(rst 3900)
@@ -374,69 +466,8 @@ fresh
 ok "cooldown/unavailable alone counts"    'has_line "$out" "⚠ all Claude accounts limited · next reset ↻1h" && has_line "$out" "proxy up · Claude limited"'
 rm -f "$T/creds.json" "$T/quota.json"; rm -rf "$D/cache"
 
-# ── weights ──
-conf "url=$URL" "key=$CK" "mgmt_key=$MK" mode=failover
-: > "$T/mode"; rm -f "$T/patch.log" "$T/put.log" "$T/fields.log" "$T/weights.json"
-echo '{"strategy":"fill-first","session-affinity":true,"session-affinity-subagents":true}' > "$T/routing.json"
-wc_() { cred "$1" "$2" "\"name\":\"$2-$3.json\",\"email\":\"$3\"${4:+,$4}"; }
-echo "{\"files\":[$(wc_ c1 claude wa@example.com),$(wc_ c2 claude wb@example.com),$(wc_ c3 claude wd@example.com '"disabled":true'),$(wc_ x1 codex wc@example.com),$(wc_ g1 gemini wg@example.com)]}" > "$T/creds.json"   # a repeated key: the last wins
-fresh
-acts=$(run actions)
-ok "weights: on/off actions, no per-account ones when off" 'has_line "$acts" "weights-on${TAB}Weights: on" && has_line "$acts" "weights-off${TAB}Weights: off" && ! printf "%s\n" "$acts" | grep -q "^w\(up\|down\)\."'
-ok "weights off: no ×N lines, no weighted title" '! has_line "$out" "×" && ! has_line "$out" "weighted"'
-res=$(run do weights-on); rc=$?
-ok "weights-on: config weights=on, mode=balance" '[ $rc = 0 ] && grep -qx weights=on "$D/config" && grep -qx mode=balance "$D/config" && [ "$(grep -c "^mode=" "$D/config")" = 1 ]'
-ok "weights-on: weighted-round-robin + affinity" '[ "$(cat "$T/patch.log")" = "{\"routing\":{\"strategy\":\"weighted-round-robin\",\"session-affinity\":true,\"session-affinity-subagents\":true,\"session-affinity-ttl\":\"1h\"}}" ] && has_line "$res" "load balance by weight"'
-echo '{"claude-wb@example.com.json":3,"codex-wc@example.com.json":0}' > "$T/weights.json"
-fresh
-ok "weighted title"                    '[ "$(printf "%s\n" "$out" | head -1)" = "section${TAB}CLIPROXY · all accounts · load balance · weighted" ] && ! has_line "$out" "proxy uses"'
-ok "rows: ×N per account, 0 is off, missing is 1" 'has_line "$out" "  ${TAB}wa@example.com ×1" && has_line "$out" "  ${TAB}wb@example.com ×3" && has_line "$out" "  ${TAB}wc@example.com off" && ! has_line "$out" "wd@" && ! has_line "$out" "wg@"'
-acts=$(run actions)
-ok "actions: raise / lower labels"     'has_line "$acts" "wup.c1${TAB}wa@example.com: weight 1 → 2" && has_line "$acts" "wdown.c1${TAB}wa@example.com: weight 1 → off" && has_line "$acts" "wup.c2${TAB}wb@example.com: weight 3 → 4" && has_line "$acts" "wup.x1${TAB}wc@example.com: weight off → 1"'
-ok "actions: lower hidden at 0, ids valid" '! has_line "$acts" "wdown.x1" && [ -z "$(printf "%s\n" "$acts" | cut -f1 | grep -v "^[A-Za-z0-9._-]*$")" ]'
-res=$(run do wup.c2); rc=$?
-ok "raise: v8 fields PATCH, name, integer" '[ $rc = 0 ] && [ "$(cat "$T/fields.log")" = "/v8/management/credentials/fields {\"name\":\"claude-wb@example.com.json\",\"weight\":4}" ] && has_line "$res" "wb@example.com: weight 4"'
-ok "raise: cache updated at once"      'has_line "$(run actions)" "wup.c2${TAB}wb@example.com: weight 4 → 5" && has_line "$(run rows)" "wb@example.com ×4"'
-rm -f "$T/fields.log"; res=$(run do wdown.c1)
-ok "lower to 0: off"                   '[ "$(cat "$T/fields.log")" = "/v8/management/credentials/fields {\"name\":\"claude-wa@example.com.json\",\"weight\":0}" ] && has_line "$res" "off"'
-rm -f "$T/fields.log"
-ok "lower at 0 refused, no PATCH"      '! run do wdown.c1 >/dev/null && [ ! -e "$T/fields.log" ]'
-echo '{"claude-wb@example.com.json":99}' > "$T/weights.json"; fresh
-ok "raise capped at 99"                '! has_line "$(run actions)" "wup.c2" && ! run do wup.c2 >/dev/null && [ ! -e "$T/fields.log" ]'
-ok "unknown or bad id refused"         '! run do wup.zz >/dev/null && ! run do "wup.c1;x" >/dev/null && [ ! -e "$T/fields.log" ]'
-echo v0 > "$T/mode"; run do wdown.c2 >/dev/null
-ok "v0 fallback for the weight"        '[ "$(cat "$T/fields.log")" = "/v0/management/auth-files/fields {\"name\":\"claude-wb@example.com.json\",\"weight\":98}" ]'
-: > "$T/mode"; rm -f "$T/fields.log"
-res=$(run do weights-off); rc=$?
-ok "weights-off in balance: round-robin" '[ $rc = 0 ] && grep -qx weights=off "$D/config" && has_line "$(tail -1 "$T/patch.log")" "\"strategy\":\"round-robin\""'
-fresh
-ok "weights off: no lines, no actions" '! has_line "$out" "×" && ! has_line "$out" "weighted" && ! run actions | grep -q "^wup\."'
-echo '{"strategy":"weighted-round-robin","session-affinity":true,"session-affinity-subagents":true}' > "$T/routing.json"; fresh
-ok "weights off + wrr proxy: mismatch" 'has_line "$out" "⚠ proxy uses weighted-round-robin, plugin mode is load balance"'
-rm -f "$T/patch.log"; run do apply >/dev/null
-ok "apply respects weights=off"        'has_line "$(cat "$T/patch.log")" "\"strategy\":\"round-robin\""'
-setw() { grep -v "^weights=" "$D/config" > "$D/c.tmp"; [ -n "$1" ] && echo "weights=$1" >> "$D/c.tmp"; mv "$D/c.tmp" "$D/config"; chmod 600 "$D/config"; }
-setw on; rm -f "$T/patch.log"; run do apply >/dev/null
-ok "apply respects weights=on"         'has_line "$(cat "$T/patch.log")" "\"strategy\":\"weighted-round-robin\""'
-setw on; run do mode-failover >/dev/null; rm -f "$T/patch.log"
-res=$(run do weights-off)
-ok "weights-off in failover: no proxy change" '[ ! -e "$T/patch.log" ] && has_line "$res" "failover mode does not use weights"'
-setw ""; run do mode-balance >/dev/null; setw ""
-echo '{"strategy":"wrr","session-affinity":true,"session-affinity-subagents":true}' > "$T/routing.json"; fresh
-ok "first sight of wrr proxy: weights on" 'grep -qx weights=on "$D/config" && ! has_line "$out" "proxy uses" && has_line "$(run actions)" "wup.c1"'
-conf "url=$URL" "key=$CK" mode=balance weights=on
-res=$(run do wup.c1); rc=$?
-ok "no mgmt key: weight action refuses" '[ $rc != 0 ] && [ "$res" = "needs the management key" ]'
-res=$(run do weights-on); rc=$?
-ok "no mgmt key: weights-on config only" '[ $rc = 0 ] && has_line "$res" "proxy not changed (no management key)"'
-conf "url=$URL" "key=$CK" "mgmt_key=$MK" mode=balance weights=on
-wall=$(run rows; run actions; run do wup.c1; run do wdown.c1; run do weights-off; run do weights-on; cat "$D"/cache/* "$T"/*.log 2>/dev/null)
-ok "weights: keys never printed"       '! printf "%s" "$wall" | grep -qe "$CK" -e "$MK"'
-rm -f "$T/creds.json" "$T/quota.json" "$T/routing.json" "$T/weights.json" "$T/fields.log"; rm -rf "$D/cache"
-conf "url=$URL" "key=$CK" "mgmt_key=$MK"
-
 # ── key safety ──
-all=$(run rows; run actions; run launch nope 2>&1; run do apply; run do mode-failover; run do weights-on; run do wup.c1; run do weights-off; cat "$D"/cache/* "$T"/*.log 2>/dev/null)
+all=$(run rows; run actions; run launch nope 2>&1; run do apply; run do mode-failover; run do mode-wrr; cat "$D"/cache/* "$T"/*.log 2>/dev/null)
 ok "keys never printed or cached"      '! printf "%s" "$all" | grep -qe "$CK" -e "$MK" -e "$MYKEY"'
 ok "cache is private"                  'case $(ls -ld "$D/cache") in drwx------*) true;; *) false;; esac'
 

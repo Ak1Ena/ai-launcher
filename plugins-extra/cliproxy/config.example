@@ -7,6 +7,6 @@ mgmt_key_env=CLIPROXY_MGMT_KEY  # env var holding the management key (merged usa
 # stop_cmd=...
 # proxy_config=...              # the proxy's config.yaml that setup edits (relative = in this folder)
 mode=failover                   # failover: one account until it is limited, then the next (same chat, no restart)
-                                # balance: spread chats across accounts, each chat stays on one
-                                # switch with: ai plugin do cliproxy mode-balance (or mode-failover), or TUI a
-# weights=on                    # balance by per-account weight (weighted-round-robin): ai plugin do cliproxy weights-on / weights-off
+                                # wrr: weighted round-robin, chats spread by weight, each chat stays on one
+                                # switch with: ai plugin do cliproxy mode-wrr (or mode-failover), or TUI a
+# order=...                     # failover order, auth file names (set by the move up / down actions)
