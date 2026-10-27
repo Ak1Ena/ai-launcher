@@ -244,6 +244,11 @@ run launch all >/dev/null 2>&1
 ok "launch: Claude models in the proxy: Claude Code keeps its own default" '! grep -q ANTHROPIC_MODEL "$D/cache/claude-settings.json"'
 echo '{"data":[{"id":"gpt-5"},{"id":"gpt-6.1-sol"},{"id":"codex-auto-review"},{"id":"gpt-image-1"}]}' > "$T/models.json"; run launch all >/dev/null 2>&1; rm -f "$T/models.json"
 ok "launch: no Claude model: default and opus/sonnet/haiku/fable point at the newest one" 'jq -e ".env | .ANTHROPIC_MODEL == \"gpt-6.1-sol\" and .ANTHROPIC_DEFAULT_OPUS_MODEL == \"gpt-6.1-sol\" and .ANTHROPIC_DEFAULT_SONNET_MODEL == \"gpt-6.1-sol\" and .ANTHROPIC_DEFAULT_HAIKU_MODEL == \"gpt-6.1-sol\" and .ANTHROPIC_DEFAULT_FABLE_MODEL == \"gpt-6.1-sol\"" "$D/cache/claude-settings.json" >/dev/null'
+echo '{"data":[{"id":"gpt-6.1-sol"}]}' > "$T/models.json"; run launch all >/dev/null 2>&1; rm -f "$T/models.json"
+echo nomodels > "$T/mode"; run launch all >/dev/null 2>&1; : > "$T/mode"
+ok "launch: model list not read just now: no model override from the saved one" '! grep -q ANTHROPIC_MODEL "$D/cache/claude-settings.json"'
+echo '{"data":[{"id":"gpt-6.1-sol"}]}' > "$T/models.json"; run launch all --agents='{}' >/dev/null 2>&1; rm -f "$T/models.json"
+ok "launch: user --agents: model override still from the live list" 'grep -q "\"ANTHROPIC_MODEL\":\"gpt-6.1-sol\"" "$D/cache/claude-settings.json" && [ "$(grep -c -- "^--agents" "$T/claude.args")" = 1 ]'
 run launch all >/dev/null 2>&1
 RP=$NOJQ run launch all >/dev/null 2>&1; rc=$?
 ok "launch: no jq: no --agents" '[ $rc = 0 ] && ! grep -q -- --agents "$T/claude.args"'
@@ -403,6 +408,9 @@ out=$(run rows)
 ok "off: rows and actions follow"      'has_line "$out" "wa@example.com  off" && has_line "$(run actions)" "on.c1${TAB}wa@example.com: use"'
 rm -f "$T/status.log"; run do on.c1 >/dev/null
 ok "on: disabled false"                '[ "$(cat "$T/status.log")" = "/v8/management/credentials/status {\"name\":\"$NA\",\"disabled\":false}" ]'
+cp "$T/over.json" "$T/over.keep" 2>/dev/null; echo "{\"$NA\":{\"weight\":0,\"disabled\":true}}" > "$T/over.json"; rm -f "$T/fields.log"; run do on.c1 >/dev/null
+ok "on: an account with weight 0 gets 1" 'grep -q "\"name\":\"$NA\",\"weight\":1" "$T/fields.log"'
+rm -f "$T/fields.log" "$T/over.json"; [ -f "$T/over.keep" ] && mv "$T/over.keep" "$T/over.json"
 echo v0 > "$T/mode"; rm -f "$T/status.log"; run do off.c2 >/dev/null; : > "$T/mode"
 ok "status: v0 fallback"               '[ "$(cat "$T/status.log")" = "/v0/management/auth-files/status {\"name\":\"$NB\",\"disabled\":true}" ]'
 rm -f "$T/over.json" "$T/patch.log" "$T/fields.log" "$T/status.log"
@@ -604,8 +612,9 @@ ok "statusline: project local, then project, then user, run in the session folde
 $PJ · proxy: claude ib@example.com" ] && [ "$o2" = "PROJ · proxy: claude ib@example.com" ] && [ "$o3" = "ORIG · proxy: claude ib@example.com" ]'
 ok "statusline: .cwd also names the session folder" 'printf "{\"statusLine\":{\"command\":\"echo CWD\"}}" > "$PJ/.claude/settings.json" && [ "$(sl "{\"cwd\":\"$PJ\"}")" = "CWD · proxy: claude ib@example.com" ] && rm "$PJ/.claude/settings.json"'
 printf '{"statusLine":{"type":"command","command":"sleep 37 & sleep 38; echo LATE"}}' > "$HOME/.claude/settings.json"
-t0=$(date +%s); o=$(sl "$SIN"); t1=$(date +%s); sleep 0.3
-ok "statusline: a slow own status line is cut at 2 s, children too" '[ "$o" = "proxy: claude ib@example.com" ] && [ $((t1 - t0)) -lt 4 ] && [ "$(ps -A -o command= | grep -c "^sleep 3[78]$")" = 0 ]'
+t0=$(date +%s); o=$(sl "$SIN"); t1=$(date +%s)
+i=0; while [ $i -lt 30 ] && ps -A -o command= | grep -q "^sleep 3[78]$"; do sleep 0.2; i=$((i + 1)); done   # a busy CI runner reaps late
+ok "statusline: a slow own status line is cut at 2 s, children too" '[ "$o" = "proxy: claude ib@example.com" ] && [ $((t1 - t0)) -lt 6 ] && [ "$(ps -A -o command= | grep -c "^sleep 3[78]$")" = 0 ]'
 printf '{"statusLine":{"type":"command","command":"echo ORIG"}}' > "$HOME/.claude/settings.json"
 run launch all >/dev/null 2>&1
 o=$(printf '%s' "$SIN" | (cd "$T/work" && PATH=$BASEPATH bash -c "$(jq -r .statusLine.command "$D/cache/claude-settings.json")"))

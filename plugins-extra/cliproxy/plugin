@@ -287,6 +287,8 @@ setuse() {
   acct "$2" || return 1
   mpatch status "$(jq -cn --arg n "$nm" --argjson d "$([ "$1" = on ] && echo false || echo true)" '{name: $n, disabled: $d}')" ||
     { echo "could not change $e ($(hc "$code"))"; return 1; }
+  # weight 0 is never picked: an account switched on gets at least 1
+  if [ "$1" = on ]; then case $w in ''|*[!0-9]*|0) mpatch fields "$(jq -cn --arg n "$nm" '{name: $n, weight: 1}')" ;; esac; fi
   fetchaccts >/dev/null
   if [ "$1" = on ]; then echo "$e: used"; else echo "$e: not used"; fi
 }
@@ -384,6 +386,7 @@ agents() {
   if has curl && [ -n "$key" ]; then
     m=$(kcurl "$key" -m 2 "$url/v1/models")
     if [ "${m##*$'\n'}" = 200 ]; then
+      agents_live=1
       j=$(printf '%s\n' "${m%$'\n'*}" | jq -c "$JQDEF"'[.data[]? | select(.id | type == "string" and test("^[A-Za-z0-9._:-]+$") and (test("image") | not))
           | {id, n: (.id | ascii_downcase | gsub("[^a-z0-9-]"; "-") | gsub("-+"; "-") | gsub("^-|-$"; "")),
              o: ((.owned_by // "" | clean) as $ob | if $ob != "" then $ob else .id | mprov | {claude: "Claude", codex: "Codex", gemini: "Gemini"}[.] // . end)}
@@ -501,7 +504,10 @@ case ${1:-} in
     ! envname "$mgmt_key_env" || unset "$mgmt_key_env"
     export ANTHROPIC_BASE_URL=$url ANTHROPIC_AUTH_TOKEN=$key CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
     ag=; for a; do case $a in --agents|--agents=*) ag=user; break ;; esac; done   # the user's own --agents wins
-    if [ -z "$ag" ]; then ag=$(agents); [ -z "$ag" ] || set -- --agents "$ag" "$@"; fi
+    mkdir -p "$CACHE" && chmod 700 "$CACHE"
+    agents_live=; agents > "$CACHE/agents.out.$$" 2>/dev/null   # not in $( ): agents_live must survive
+    if [ -z "$ag" ]; then ag=$(cat "$CACHE/agents.out.$$" 2>/dev/null); [ -z "$ag" ] || set -- --agents "$ag" "$@"; fi
+    rm -f "$CACHE/agents.out.$$"
     # an env block in ~/.claude/settings.json (e.g. another ANTHROPIC_BASE_URL) beats the process env;
     # --settings beats user settings. A file, not an argument, so the key is never on a command line.
     cs=$D/cache/claude-settings.json
@@ -509,7 +515,7 @@ case ${1:-} in
     # no Claude model in the proxy (only other providers' accounts on): Claude Code's default and its
     # opus/sonnet/haiku/fable names would all fail, so they all point at the newest model the proxy has
     me=
-    if has jq && [ -f "$CACHE/agents.json" ]; then
+    if [ -n "$agents_live" ] && has jq && [ -f "$CACHE/agents.json" ]; then   # only a list read just now
       ids=$(jq -r '.[].model | strings' "$CACHE/agents.json" 2>/dev/null)
       if [ -n "$ids" ] && ! printf '%s\n' "$ids" | grep -q '^claude-'; then
         dm=$(printf '%s\n' "$ids" | grep -v review | sort -V -r 2>/dev/null | head -n 1)
