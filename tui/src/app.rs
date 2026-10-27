@@ -84,6 +84,9 @@ pub struct PluginState {
     /// `plugin actions`: (action, label)
     pub actions: Vec<(String, String)>,
     loading: bool,
+    /// a reload was asked while one ran (e.g. after a `do`): it runs again when that ends,
+    /// since the running one may have read the state from before
+    again: bool,
     /// a `plugin do` runs (one at a time)
     doing: bool,
     /// `rows` ran once this session: later runs get the short timeout
@@ -360,6 +363,7 @@ impl App {
                     rows: None,
                     actions: Vec::new(),
                     loading: false,
+                    again: false,
                     doing: false,
                     ran: false,
                 },
@@ -393,11 +397,20 @@ impl App {
     /// Runs `rows` (then `actions`) of every plugin that is on, each on its own thread, unless
     /// one already runs. Results arrive in `tick`.
     pub fn reload_plugins(&mut self) {
+        for s in self.plugins.iter_mut() {
+            s.again = true;
+        }
+        self.load_due();
+    }
+
+    /// Starts the loads asked for: a plugin still loading waits, and `tick` starts it after.
+    fn load_due(&mut self) {
         for s in self
             .plugins
             .iter_mut()
-            .filter(|s| s.plugin.on && !s.loading)
+            .filter(|s| s.plugin.on && s.again && !s.loading)
         {
+            s.again = false;
             s.loading = true;
             let timeout = if s.ran {
                 plugins::ROWS_TIMEOUT
@@ -1102,8 +1115,8 @@ impl App {
         if s.actions.is_empty() {
             return self.say(format!("{name} has no actions."));
         }
-        let labels = s.actions.iter().map(|(_, l)| l.clone()).collect();
-        self.modal = Some(Modal::Form(Form::actions(name, labels)));
+        let actions = s.actions.clone();
+        self.modal = Some(Modal::Form(Form::actions(name, actions)));
     }
 
     /// Runs `plugin do <action>` on a thread; its last output line goes to the flash bar, and
@@ -1298,15 +1311,10 @@ impl App {
         let (label, command) = (f.get("Label"), f.get("Command"));
         match &f.purpose {
             Purpose::AddPlugin => self.install(plugins::expand_home(&f.get("Source"))),
-            Purpose::Action(name) => {
-                let action = self
-                    .plugins
-                    .iter()
-                    .find(|s| &s.plugin.name == name)
-                    .and_then(|s| s.actions.get(f.index("Action")))
-                    .map(|(a, _)| a.clone());
-                if let Some(a) = action {
-                    self.run_do(&name.clone(), &a);
+            Purpose::Action(name, actions) => {
+                // the id paired with the label shown, never re-read from the refreshed list
+                if let Some((a, _)) = actions.get(f.index("Action")) {
+                    self.run_do(name, a);
                 }
             }
             Purpose::Model => {
@@ -1865,7 +1873,10 @@ impl App {
             match m {
                 PluginMsg::Rows(name, rows) => {
                     if let Some(s) = self.plugin(&name) {
-                        s.loading = false;
+                        // good rows: the load ends when its actions arrive
+                        if rows.is_none() {
+                            s.loading = false;
+                        }
                         // a failure after good rows keeps them on screen
                         if rows.is_some() || !matches!(s.rows, Some(Some(_))) {
                             s.rows = Some(rows);
@@ -1875,6 +1886,7 @@ impl App {
                 PluginMsg::Actions(name, actions) => {
                     if let Some(s) = self.plugin(&name) {
                         s.actions = actions;
+                        s.loading = false;
                     }
                 }
                 PluginMsg::Done(name, line) => {
@@ -1899,6 +1911,7 @@ impl App {
                 PluginMsg::Review(s) => self.open_review(SetupTarget::Install(s)),
             }
         }
+        self.load_due();
         self.finish_setups();
         if changed {
             self.refresh();
@@ -3141,6 +3154,70 @@ esac"#;
         select(&mut a, "plugin:bad");
         key(&mut a, KeyCode::Char('a'));
         assert!(a.modal.is_none());
+    }
+
+    /// A background refresh replaces the plugin's action list while the menu is open: Enter
+    /// must still run the id of the label the user saw, never the new list's item at that index.
+    #[cfg(unix)]
+    #[test]
+    fn action_menu_runs_the_shown_action_after_a_refresh() {
+        let mut a = plugin_app();
+        settle(&mut a, |a| {
+            a.plugins
+                .iter()
+                .any(|p| p.plugin.name == "good" && !p.actions.is_empty())
+        });
+        let set = |a: &mut App, list: &[(&str, &str)]| {
+            a.plugin("good").unwrap().actions = list
+                .iter()
+                .map(|(i, l)| (i.to_string(), l.to_string()))
+                .collect();
+        };
+        set(&mut a, &[("one", "first"), ("two", "second")]);
+        select(&mut a, "plugin:good/a");
+        key(&mut a, KeyCode::Char('a'));
+        key(&mut a, KeyCode::Right);
+        let Some(Modal::Form(f)) = &a.modal else {
+            panic!("no action menu")
+        };
+        assert_eq!(f.get("Action"), "second");
+        // the refresh lands: a new item before it, so index 1 is now "first"
+        set(
+            &mut a,
+            &[("new", "new one"), ("one", "first"), ("two", "second")],
+        );
+        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Enter);
+        assert!(a.modal.is_none());
+        let flash = |a: &App| a.flash.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
+        settle(&mut a, |a| flash(a).contains("started"));
+        assert_eq!(flash(&a), "good: started two");
+    }
+
+    /// A `do` that ends while a rows/actions load is in flight still gets a fresh load after
+    /// it, so the next menu shows the state the action left.
+    #[cfg(unix)]
+    #[test]
+    fn a_do_reloads_actions_even_when_a_load_is_in_flight() {
+        let mut a = plugin_app();
+        settle(&mut a, |a| a.plugins.iter().all(|p| !p.loading));
+        let s = a.plugin("good").unwrap();
+        s.loading = true; // a load already running, started before the `do` changed state
+        s.actions.clear();
+        a.plugin_tx
+            .send(PluginMsg::Done("good".into(), "ok".into()))
+            .unwrap();
+        a.tick();
+        // the in-flight load ends with stale (here: none) actions
+        a.plugin_tx
+            .send(PluginMsg::Rows("good".into(), None))
+            .unwrap();
+        settle(&mut a, |a| {
+            a.plugins
+                .iter()
+                .any(|p| p.plugin.name == "good" && !p.actions.is_empty())
+        });
+        assert!(!a.plugin("good").unwrap().actions.is_empty());
     }
 
     #[cfg(unix)]
