@@ -369,13 +369,20 @@ ok "plugins: CR and control chars stripped" 'echo "$crow" | plain | grep -q "Al\
 rm -rf "$PL/sec" "$PL/crl"
 mkdir -p "$T/src/myp" "$T/src/noplug" "$T/keepplug"; printf '#!/bin/sh\necho mine\n' > "$T/src/myp/plugin"; chmod +x "$T/src/myp/plugin"
 AI() { "$REPO/bin/ai" "$@"; }
+# cliproxy's setup against fakes (no network, no real brew): a brew without cliproxyapi, a cliproxyapi whose start
+# marks the proxy up, and a curl whose probe is up after that start and whose API calls answer 200
+mkdir -p "$T/cpfake"
+printf '#!/bin/sh\ntouch "%s/cpup"\n' "$T" > "$T/cpfake/cliproxyapi"
+printf '#!/bin/sh\ncase " $* " in *" -w "*) printf "\\n200" ;; *) [ -e "%s/cpup" ] ;; esac\n' "$T" > "$T/cpfake/curl"
+printf '#!/bin/sh\nexit 1\n' > "$T/cpfake/brew"; chmod +x "$T"/cpfake/*
+AIcp() { rm -f "$T/cpup"; PATH=$T/cpfake:$PATH AI_YES=1 CLIPROXY_SETUP_ACCOUNTS=none AI "$@" </dev/null; }
 ok "plugin add: local folder" 'AI plugin add "$T/src/myp/" >/dev/null 2>&1 && [ -x "$PL/myp/plugin" ] && [ ! -e "$PL/myp/.source" ]'
 mkdir -p "$T/src/real"; cp "$T/src/myp/plugin" "$T/src/real/"; ln -s real "$T/src/lnkp"
 ok "plugin add: symlinked folder copies contents" 'AI plugin add "$T/src/lnkp" >/dev/null 2>&1 && [ -d "$PL/lnkp" ] && [ ! -L "$PL/lnkp" ] && [ -x "$PL/lnkp/plugin" ]; rm -rf "$PL/lnkp"'
 echo changed > "$T/src/myp/plugin"
 ok "plugin add: refuses to overwrite" '! AI plugin add "$T/src/myp" >/dev/null 2>&1 && grep -q mine "$PL/myp/plugin"'
 ok "plugin add: refuses a folder without plugin" '! AI plugin add "$T/src/noplug" >/dev/null 2>&1 && [ ! -e "$PL/noplug" ]'
-ok "plugin add: bundled cliproxy" 'AI plugin add cliproxy >/dev/null 2>&1 && [ -x "$PL/cliproxy/plugin" ]'
+ok "plugin add: bundled cliproxy" 'AIcp plugin add cliproxy >/dev/null 2>&1 && [ -x "$PL/cliproxy/plugin" ] && grep -q "^mgmt_key=" "$PL/cliproxy/config" && grep -qx proxy_config=run/config.yaml "$PL/cliproxy/config"'
 mkdir -p "$T/src/ran"; printf '#!/bin/sh\ntouch "%s/ran.rows"\n' "$T" > "$T/src/ran/plugin"; chmod +x "$T/src/ran/plugin"
 ok "plugin add: runs rows once at install" 'AI plugin add "$T/src/ran" >/dev/null 2>&1 && [ -e "$T/ran.rows" ]'
 mkdir -p "$T/src/bad.name"; cp "$T/src/ran/plugin" "$T/src/bad.name/"
@@ -464,8 +471,8 @@ ok "plugin new: creates a working plugin" 'AI plugin new demo >/dev/null 2>&1 &&
 cp -R "$PL/demo" "$T/demo.bak"
 ok "plugin new: refuses existing and bad names" '! AI plugin new demo >/dev/null 2>&1 && ! AI plugin new "a b" >/dev/null 2>&1 && diff -r "$PL/demo" "$T/demo.bak" >/dev/null'
 lsout=$(AI plugin ls 2>&1 | plain)
-ok "plugin ls: lists available bundled with about" 'echo "$lsout" | grep -A3 "^available" | grep -q "cliproxy.*Claude Code through CLIProxyAPI: all accounts as one"'
-ok "plugin ls: installed bundled leaves available" 'AI_YES=1 AI plugin add cliproxy >/dev/null 2>&1 && AI plugin ls 2>&1 | plain | grep -q "no other bundled plugins"'
+ok "plugin ls: lists available bundled with about" 'echo "$lsout" | grep -A3 "^available" | grep -q "cliproxy.*Claude Code through CLIProxyAPI: all accounts as one (has setup)"'
+ok "plugin ls: installed bundled leaves available" 'AIcp plugin add cliproxy >/dev/null 2>&1 && AI plugin ls 2>&1 | plain | grep -q "no other bundled plugins"'
 AI_PLUGIN_DIR=$PL/demo "$PL/demo/setup" >/dev/null 2>&1; cp "$PL/demo/config" "$T/demo.cfg"
 ok "template setup is safe to run twice" 'AI_PLUGIN_DIR=$PL/demo "$PL/demo/setup" >/dev/null 2>&1 && cmp -s "$PL/demo/config" "$T/demo.cfg"'
 

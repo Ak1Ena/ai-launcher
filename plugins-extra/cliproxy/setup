@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# cliproxy setup: install CLIProxyAPI, make the keys, sign accounts in, start the proxy.
+# ai-launcher runs it after you read and approve it (ai plugin add cliproxy / ai plugin setup cliproxy).
+# Safe to run again: each step says use it / kept / done when it is already true.
+# Exit 0 = ready, 2 = you install CLIProxyAPI yourself, 1 = failed. Never prints a key.
+# Network: only brew install or the release download you choose in step 1, and the local proxy.
+# Test hooks: CLIPROXY_RELEASE_BASE (release download folder), CLIPROXY_SETUP_ACCOUNTS=all|none (no checklist).
+D=${AI_PLUGIN_DIR:-$(pwd)}
+cd "$D" || exit 1
+CONF=config TAB=$(printf '\t') DL= BODY= started=
+has() { command -v "$1" >/dev/null 2>&1; }
+brew_managed() { has brew && brew list cliproxyapi >/dev/null 2>&1; }
+stop_proxy() {  # the proxy this run started
+  if brew_managed; then brew services stop cliproxyapi >/dev/null 2>&1; else (bash -c "$(cget stop_cmd)") >/dev/null 2>&1; fi
+  started=
+}
+# a failed or cancelled setup leaves no proxy behind (the installer then removes the staging folder)
+trap 'rc=$?; rm -rf "$DL" "$BODY"; [ $rc != 0 ] && [ -n "$started" ] && stop_proxy; exit $rc' EXIT
+trap 'exit 130' INT TERM
+die() { echo "  $*"; exit 1; }
+has curl || die "setup needs curl"
+
+# ── plugin config: key=value lines, same rules as plugin, never sourced ──
+[ -f "$CONF" ] || { (umask 077; cp config.example "$CONF" 2>/dev/null || echo 'url=http://127.0.0.1:8317' > "$CONF"); chmod 600 "$CONF"; }
+cget() {  # last value of <key>=
+  local l v r=
+  while IFS= read -r l || [ -n "$l" ]; do
+    l=${l%$'\r'}
+    case $l in "$1="*) ;; *) continue ;; esac
+    v=${l#*=}; v=${v%% #*}; v=${v%%"$TAB"#*}
+    while case $v in *' '|*"$TAB") true ;; *) false ;; esac; do v=${v%?}; done
+    r=$v
+  done < "$CONF"
+  printf '%s\n' "$r"
+}
+cset() {  # rewrite only the <key>= line (or add it); the file stays 600
+  ( umask 077; seen=
+    while IFS= read -r l || [ -n "$l" ]; do
+      case $l in "$1="*) [ -n "$seen" ] && continue; l="$1=$2" seen=1 ;; esac
+      printf '%s\n' "$l"
+    done < "$CONF" > "$CONF.$$"
+    [ -n "$seen" ] || printf '%s=%s\n' "$1" "$2" >> "$CONF.$$"
+  ) && chmod 600 "$CONF.$$" && mv "$CONF.$$" "$CONF"
+}
+url=$(cget url); url=${url:-http://127.0.0.1:8317}; url=${url%/}
+key=$(cget key) mk=$(cget mgmt_key) Y=$(cget proxy_config) start_cmd=$(cget start_cmd)
+key_env=$(cget key_env) mgmt_key_env=$(cget mgmt_key_env)
+
+up() { curl -s -m 1 -o /dev/null "$url/"; }
+# curl with the key in a config read from stdin, never on the command line; body, then the HTTP code
+kcurl() {
+  local k=$1; shift; k=${k//\\/\\\\}; k=${k//\"/\\\"}
+  printf 'header = "Authorization: Bearer %s"\n' "$k" | curl -s -K - -w '\n%{http_code}' "$@"
+}
+step() {  # step <n> <name> <detail> <result>
+  local l="$3 "; while [ ${#l} -lt 48 ]; do l="$l."; done
+  printf '  [%s/4] %-9s %s %s\n' "$1" "$2" "$l" "$4"
+}
+ask() { local a; printf '  %s ' "$1"; read -r a || a=; ANS=$(printf '%s' "$a" | cut -c1 | tr 'A-Z' 'a-z'); }
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }  # shell-quote for start_cmd
+envname() { case $1 in ''|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;; esac; }   # only a valid name reaches eval
+# okkey client|mgmt <key>: does the proxy accept it? sets code
+okkey() {
+  local out
+  if [ "$1" = client ]; then out=$(kcurl "$2" -m 5 "$url/v1/models"); else out=$(kcurl "$2" -m 10 "$url/v0/management/auth-files"); fi
+  code=${out##*$'\n'}; [ "$code" = 200 ]
+}
+# getkey client|mgmt: K = a key the proxy accepts: from the env first, then pasted (3 tries), else stop
+getkey() {
+  local what=$1 e t=0 nm="client key" envs="$key_env CLIPROXY_API_KEY"
+  [ "$what" = mgmt ] && nm="management key" envs="$mgmt_key_env CLIPROXY_MGMT_KEY"
+  for e in $envs; do
+    envname "$e" || continue; eval "K=\${$e:-}"
+    [ -n "$K" ] && okkey "$what" "$K" && return 0
+    [ -n "$K" ] && echo "  the proxy refused the $nm in \$$e (HTTP ${code:-no answer})"
+  done
+  while [ $t -lt 3 ]; do
+    printf '  paste the %s: ' "$nm"; read -r -s K || K=; echo
+    case $K in
+      '') echo "  no key given" ;;
+      *[[:space:]]*) echo "  a key has no spaces" ;;
+      *) okkey "$what" "$K" && return 0; echo "  the proxy refused that key (HTTP ${code:-no answer})" ;;
+    esac
+    t=$((t + 1))
+  done
+  die "no working $nm: setup stopped, nothing saved for it"
+}
+# a proxy config this setup just installed: localhost only, no sample client keys (never a config you had)
+sanitize() {
+  ( umask 077; sed -e 's/^\(  host: \)""/\1"127.0.0.1"/' -e '/^[[:blank:]]*- "your-api-key-[0-9]*"[[:blank:]]*$/d' "$1" > "$1.$$" ) &&
+    cat "$1.$$" > "$1"; local rc=$?
+  rm -f "$1.$$"; [ $rc = 0 ] || die "could not edit $1"
+}
+start_proxy() {  # start it unless it answers; how = what was done
+  up && return 0
+  if brew_managed; then how="brew services start cliproxyapi"; brew services start cliproxyapi >/dev/null || die "brew services start cliproxyapi failed"
+  elif [ -n "$start_cmd" ]; then how="start_cmd"; bash -c "$start_cmd" || die "start_cmd failed"
+  else die "proxy at $url is not running and there is no way to start it here"
+  fi
+  started=1
+  local i=0; while [ $i -lt 20 ] && ! up; do sleep 0.5; i=$((i + 1)); done
+  if ! up; then step 4 Start "$how" "failed"; [ -f run/log ] && tail -n 5 run/log; exit 1; fi
+}
+
+# ── 1. find or install ──
+download() {
+  local os arch ext exe= base sum asset s a got t v
+  case $(uname -s) in Darwin) os=darwin ;; Linux) os=linux ;; MINGW*|MSYS*|CYGWIN*) os=windows exe=.exe ;; *) die "no CLIProxyAPI release for $(uname -s)" ;; esac
+  case $(uname -m) in arm64|aarch64) arch=aarch64 ;; x86_64|amd64) arch=amd64 ;; *) die "no CLIProxyAPI release for $(uname -m)" ;; esac
+  ext=tar.gz; [ $os = windows ] && ext=zip
+  base=${CLIPROXY_RELEASE_BASE:-https://github.com/router-for-me/CLIProxyAPI/releases/latest/download}
+  step 1 Install "CLIProxyAPI_<ver>_${os}_${arch}.$ext into bin/" "not found"
+  ask "[d]ownload / [m]yself?"
+  [ "$ANS" = d ] || { echo "  download CLIProxyAPI_<ver>_${os}_${arch}.$ext from $base/"; echo "  then put its cli-proxy-api$exe at $D/bin/cliproxyapi$exe and run setup again"; exit 2; }
+  t=run/dl.$$; DL=$D/$t; rm -rf "$t"; mkdir -p "$t/x" || exit 1
+  curl -fsSL -m 60 -o "$t/checksums.txt" "$base/checksums.txt" || die "download failed: $base/checksums.txt"
+  while read -r s a; do
+    a=${a#\*}
+    case $a in *[!A-Za-z0-9._+-]*) continue ;; CLIProxyAPI_[0-9]*_"${os}_${arch}.$ext") ;; *) continue ;; esac
+    v=${a#CLIProxyAPI_}; v=${v%_"${os}_${arch}.$ext"}
+    case $v in *_*) continue ;; esac   # a variant build (CLIProxyAPI_<ver>_<variant>_<os>_<arch>), not the plain one
+    sum=$s asset=$a; break
+  done < "$t/checksums.txt"
+  [ -n "$asset" ] || die "no ${os}_${arch} entry in checksums.txt: not installed"
+  curl -fsSL -m 600 -o "$t/$asset" "$base/$asset" || die "download failed: $base/$asset"
+  if has shasum; then got=$(shasum -a 256 "$t/$asset"); elif has sha256sum; then got=$(sha256sum "$t/$asset")
+  else die "needs shasum or sha256sum to check the download: not installed"; fi
+  got=${got%% *}
+  [ "$(echo "$got" | tr 'A-F' 'a-f')" = "$(echo "$sum" | tr 'A-F' 'a-f')" ] || die "checksum mismatch for $asset: not installed"
+  if [ $ext = zip ]; then has unzip || die "needs unzip"; unzip -q "$t/$asset" -d "$t/x"; else tar -xzf "$t/$asset" -C "$t/x"; fi || die "could not unpack $asset"
+  [ -f "$t/x/cli-proxy-api$exe" ] || die "no cli-proxy-api$exe in $asset"
+  mkdir -p bin && mv "$t/x/cli-proxy-api$exe" "bin/cliproxyapi$exe" && chmod +x "bin/cliproxyapi$exe" || die "could not write bin/"
+  [ -f "$t/x/config.example.yaml" ] && mv "$t/x/config.example.yaml" bin/config.example.yaml
+  bin=bin/cliproxyapi$exe
+  step 1 Install "$asset" "installed"
+}
+yedit() {  # yedit <awk program>: edit the proxy config in place (keeps its permissions), backed up once
+  [ -n "$own" ] || [ -e "$Y.ai-launcher.bak" ] || cp -p "$Y" "$Y.ai-launcher.bak" || die "could not back up $Y"
+  ( umask 077; MK=$mk K=$key awk "BEGIN { mk = ENVIRON[\"MK\"]; k = ENVIRON[\"K\"] } $1" "$Y" > "$Y.$$" ) && [ -s "$Y.$$" ] && cat "$Y.$$" > "$Y"; local rc=$?
+  rm -f "$Y.$$"; [ $rc = 0 ] || die "could not edit $Y"
+}
+secret() {  # value of the first secret-key: line
+  awk '/^[ \t]*secret-key:/ { v = $0; sub(/^[ \t]*secret-key:[ \t]*/, "", v); sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v)
+    if (v ~ /^".*"$/ || v ~ /^'\''.*'\''$/) v = substr(v, 2, length(v) - 2); print v; exit }' "$Y"
+}
+keys_empty() {  # no client key in the proxy config yet
+  awk '!s && /^[ \t]*api-keys:/ { v = $0; sub(/^[ \t]*api-keys:[ \t]*/, "", v); sub(/[ \t]*#.*$/, "", v)
+      if (v != "" && v != "[]") exit 1; s = 1; next }
+    s && /^[ \t]*(#|$)/ { next }
+    s { exit ($0 ~ /^[ \t]*- /) }' "$Y"
+}
+echo "  CLIProxyAPI setup"
+how="already running"
+fresh=  #1 = this run installed it, so its stock config may be made safe
+if bin=$(command -v cliproxyapi); then step 1 Install "found $bin" "use it"
+elif brew_managed; then bin=$(brew --prefix cliproxyapi)/bin/cliproxyapi; step 1 Install "brew cliproxyapi" "use it"
+elif [ -x bin/cliproxyapi ] || [ -x bin/cliproxyapi.exe ]; then bin=bin/cliproxyapi; [ -x "$bin" ] || bin=$bin.exe; step 1 Install "$bin" "use it"
+elif up; then bin=; step 1 Install "proxy at $url" "use it"
+elif has brew; then
+  step 1 Install "brew install cliproxyapi" "not found"
+  ask "[i]nstall / [m]yself?"
+  [ "$ANS" = i ] || { echo "  install it with: brew install cliproxyapi"; echo "  then run setup again"; exit 2; }
+  brew install cliproxyapi || die "brew install cliproxyapi failed"
+  bin=$(brew --prefix cliproxyapi)/bin/cliproxyapi fresh=1
+  step 1 Install "brew install cliproxyapi" "installed"
+else download; fresh=1
+fi
+
+# ── 2. keys ──
+gen() { od -An -tx1 -N32 /dev/urandom | tr -d ' \n'; }
+own= keysonly= res=kept api_key= wrote_sk= need_mk=
+if [ -z "$Y" ]; then
+  if brew_managed; then
+    p=$(brew --prefix)
+    for Y in "$p/etc/cliproxyapi.conf" "$p/etc/cliproxyapi/config.yaml"; do [ -f "$Y" ] && break; done
+  elif [ ! -f run/config.yaml ] && up; then
+    # a proxy that runs with a config setup did not make: never invent keys for it
+    if [ -n "$key" ] && [ -n "$mk" ]; then keysonly=1
+    else
+      echo "  a proxy already runs at $url, with a config setup does not know"
+      ask "give its [c]onfig.yaml path, or its [k]eys?"
+      case $ANS in
+        c) printf '  path of its config.yaml: '; read -r Y || Y=
+           case $Y in "~/"*) Y=$HOME/${Y#"~/"} ;; esac
+           [ -f "$Y" ] || die "no file at '$Y': setup stopped" ;;
+        k) keysonly=1 ;;
+        *) die "setup stopped: run it again with the proxy's config path or keys" ;;
+      esac
+    fi
+  else Y=run/config.yaml
+  fi
+fi
+if [ -n "$keysonly" ]; then
+  # both keys come from you or the env, each checked against the proxy before it is saved
+  if [ -z "$key" ] || ! okkey client "$key"; then getkey client; key=$K res=saved; fi
+  if [ -z "$mk" ] || ! okkey mgmt "$mk"; then getkey mgmt; mk=$K res=saved; fi
+  cset key "$key" && cset mgmt_key "$mk" || die "could not write $D/$CONF"
+  step 2 Keys "client key + management key" "$res"
+else
+  if [ "$Y" = run/config.yaml ] && [ ! -f "$Y" ]; then
+    # our own proxy config
+    own=1 port=${url##*:}; case $port in ''|*[!0-9]*) port=8317 ;; esac
+    mkdir -p run && chmod 700 run || exit 1
+    ( umask 077
+      if [ -f bin/config.example.yaml ]; then sed "s/^\(  port: \)8317\$/\1$port/" bin/config.example.yaml
+      else printf 'server:\n  host: "127.0.0.1"\n  port: %s\nmanagement:\n  secret-key: ""\naccess:\n  api-keys: []\n' "$port"
+      fi > "$Y" ) || die "could not write $Y"
+    sanitize "$Y"
+  fi
+  [ -f "$Y" ] || die "proxy config not found: $Y (set proxy_config= in $D/$CONF)"
+  [ -n "$fresh" ] && [ -z "$own" ] && sanitize "$Y"   # the stock config brew just installed
+  if [ -n "$bin" ] && [ -z "$start_cmd" ] && ! brew_managed; then
+    # no brew services: run it in the background from the plugin folder (the plugin runs these there)
+    start_cmd="mkdir -p run; nohup $(q "$bin") -config $(q "$Y") >run/log 2>&1 & echo \$! >run/pid"
+    cset start_cmd "$start_cmd" && cset stop_cmd 'kill "$(cat run/pid)" && rm -f run/pid' || die "could not write $D/$CONF"
+  fi
+  [ -n "$key" ] || { key=$(gen); res=created; }
+  sk=$(secret)
+  if [ -z "$sk" ]; then [ -n "$mk" ] || { mk=$(gen); res=created; }
+  elif [ -z "$mk" ]; then need_mk=1
+  fi
+  # plugin config first, so a key is never lost
+  cset key "$key" && cset proxy_config "$Y" || die "could not write $D/$CONF"
+  [ -z "$mk" ] || [ -n "$need_mk" ] || cset mgmt_key "$mk" || die "could not write $D/$CONF"
+  if [ -z "$sk" ]; then
+    wrote_sk=1
+    if grep -q '^[ \t]*secret-key:' "$Y"; then yedit '!d && /^[ \t]*secret-key:/ { i = $0; sub(/secret-key:.*/, "", i); print i "secret-key: \"" mk "\""; d = 1; next } { print }'
+    elif grep -q '^management:' "$Y"; then yedit '{ print } !d && /^management:/ { print "  secret-key: \"" mk "\""; d = 1 }'
+    else yedit '{ print } END { print "management:"; print "  secret-key: \"" mk "\"" }'
+    fi
+  fi
+  if keys_empty; then
+    if grep -q '^[ \t]*api-keys:' "$Y"; then yedit '!d && /^[ \t]*api-keys:/ { i = $0; sub(/api-keys:.*/, "", i); print i "api-keys:"; print i "  - \"" k "\""; d = 1; next } { print }'
+    elif grep -q '^access:' "$Y"; then yedit '{ print } !d && /^access:/ { print "  api-keys:"; print "    - \"" k "\""; d = 1 }'
+    else yedit '{ print } END { print "access:"; print "  api-keys:"; print "    - \"" k "\"" }'
+    fi
+  else api_key=1  # the proxy has client keys: add ours through the management API once it is up
+  fi
+  if [ -n "$need_mk" ]; then
+    # the proxy already has a management key: check the one you give against the running proxy
+    echo "  the proxy already has a management key"
+    start_proxy; getkey mgmt; mk=$K
+    cset mgmt_key "$mk" || die "could not write $D/$CONF"
+    [ $res = created ] || res=saved
+  fi
+  step 2 Keys "client key + management key" "$res"
+fi
+
+# ── start (shown as step 4, run now: the account list needs the management API) ──
+start_proxy
+if ! okkey mgmt "$mk"; then
+  [ -n "$wrote_sk" ] && die "the proxy refused the new management key (HTTP ${code:-no answer}): restart the proxy, then run setup again"
+  echo "  the proxy refused the saved management key (HTTP ${code:-no answer})"
+  getkey mgmt; mk=$K; cset mgmt_key "$mk" || die "could not write $D/$CONF"
+fi
+add_key() {  # append our client key to access.api-keys; existing keys are sent back unchanged
+  local out code p=/v8/management/config/access/api-keys body=run/body.$$
+  has jq || die "adding the client key to the proxy needs jq: add it to access.api-keys yourself, then run setup again"
+  out=$(kcurl "$mk" -m 5 "$url$p"); code=${out##*$'\n'}
+  if [ "$code" = 404 ]; then p=/v0/management/api-keys; out=$(kcurl "$mk" -m 5 "$url$p"); code=${out##*$'\n'}; fi
+  [ "$code" = 200 ] || die "could not read the proxy's client keys (HTTP ${code:-no answer})"
+  mkdir -p run; BODY=$D/$body
+  ( umask 077; printf '%s\n' "${out%$'\n'*}" | K=$key jq -c 'if type == "object" then (.["api-keys"] // .items // []) else . end
+    | if index([env.K]) then empty else . + [env.K] end' > "$body" 2>/dev/null ) || die "could not read the proxy's client keys"
+  [ -s "$body" ] || return 0  # already there
+  out=$(kcurl "$mk" -m 10 -X PUT -H 'Content-Type: application/json' --data-binary "@$body" "$url$p"); code=${out##*$'\n'}
+  rm -f "$body"
+  [ "$code" = 200 ] || die "could not add the client key to the proxy (HTTP ${code:-no answer})"
+}
+[ -n "$api_key" ] && add_key
+okkey client "$key" || die "the proxy refused the client key (HTTP ${code:-no answer}): restart the proxy, then run setup again"
+
+# ── 3. accounts ──
+clean() { tr -d '\000-\011\013-\037\177'; }  # control chars, newline kept
+emails() {  # EM = emails of the proxy's logins, lower case; fails with code set when the list cannot be read
+  local out; out=$(kcurl "$mk" -m 10 "$url/v0/management/auth-files"); code=${out##*$'\n'} EM=
+  [ "$code" = 200 ] || return 1
+  EM=$(printf '%s\n' "${out%$'\n'*}" | jq -r '.files[]? | (.email // .account // "") | strings | select(. != "") | ascii_downcase' 2>/dev/null | clean)
+}
+minus() { printf '%s\n' "$1" | while IFS= read -r x; do [ -n "$x" ] && ! printf '%s\n' "$2" | grep -qxF -- "$x" && echo "$x"; done; }
+# one launcher account per index: kind (claude|codex), name, email (? when unknown), sel (1 = ticked)
+n=0
+add_acct() { kind[n]=$1 name[n]=$2 mail[n]=$3 sel[n]=1; n=$((n + 1)); }
+codex_mail() {  # email claim of the codex login's id_token
+  jq -r '.tokens.id_token // empty | split(".")[1] // empty | gsub("-"; "+") | gsub("_"; "/")
+    | . + ([range(0; (4 - length % 4) % 4)] | map("=") | join("")) | @base64d | fromjson | .email // empty' "$1/auth.json" 2>/dev/null
+}
+if [ "${CLIPROXY_SETUP_ACCOUNTS:-}" = none ]; then step 3 Accounts "not changed" "skipped"
+elif ! has jq; then step 3 Accounts "needs jq" "skipped"
+elif ! emails; then step 3 Accounts "could not list the proxy's accounts" "failed"
+  echo "  management API: HTTP ${code:-no answer}"; exit 1
+else
+  P=$EM
+  for d in "${CLA_ROOT:-$HOME/.claude-accounts}"/*/; do
+    [ -d "$d" ] || continue; a=${d%/}; a=${a##*/}
+    e=$(jq -r '.oauthAccount.emailAddress // empty' "$d/.claude.json" 2>/dev/null | clean)
+    add_acct claude "$(printf '%s' "$a" | clean)" "${e:-?}"
+  done
+  PF=${AI_PROVIDERS:-$HOME/.config/ai-launcher/providers}
+  if [ -f "$PF" ]; then
+    while IFS="$TAB" read -r a c _; do
+      [ "$(printf '%s\n' "$c" | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {n = split($i, p, "/"); print p[n]; exit}}')" = codex ] || continue
+      case $a in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+      h=${AI_ACCOUNTS:-$HOME/.ai-accounts}/codex/$a; [ "$a" = codex ] && h=${CODEX_HOME:-$HOME/.codex}
+      e=$(codex_mail "$h" | clean)
+      add_acct codex "$a" "${e:-?}"
+    done < "$PF"
+  fi
+  i=0 m=0
+  while [ $i -lt $n ]; do
+    if printf '%s\n' "$P" | grep -qixF -- "${mail[i]}"; then sel[i]=-; else m=$((m + 1)); fi
+    i=$((i + 1))
+  done
+  pc=$(printf '%s\n' "$P" | grep -c .)
+  count() { c=0; i=0; while [ $i -lt $n ]; do [ "${sel[i]}" = 1 ] && c=$((c + 1)); i=$((i + 1)); done; }
+  draw() {
+    count; printf '  [3/4] Accounts %46s\n' "$c of $m selected"
+    [ $m -gt 0 ] && echo "        FROM AI-LAUNCHER"
+    i=0; while [ $i -lt $n ]; do
+      if [ "${sel[i]}" != - ]; then
+        x=' '; [ "${sel[i]}" = 1 ] && x=x
+        printf '    %2s [%s] %-7s %-12s %-28s %s\n' $((i + 1)) "$x" "${kind[i]}" "${name[i]}" "${mail[i]}" "$([ "${kind[i]}" = codex ] && echo 'device code' || echo browser)"
+      fi; i=$((i + 1))
+    done
+    [ "$pc" -gt 0 ] && { echo "        IN PROXY ALREADY"; printf '%s\n' "$P" | while IFS= read -r e; do printf '               %-41s kept\n' "$e"; done; }
+  }
+  setall() { i=0; while [ $i -lt $n ]; do [ "${sel[i]}" = - ] || sel[i]=$1; i=$((i + 1)); done; }
+  pick_fzf() {  # 0 = picked, 1 = cancelled, 2 = fzf could not run
+    local out rc l j
+    out=$(i=0; while [ $i -lt $n ]; do [ "${sel[i]}" = - ] || printf '%s\t%-7s %-12s %s\n' $((i + 1)) "${kind[i]}" "${name[i]}" "${mail[i]}"; i=$((i + 1)); done |
+      fzf --multi --bind start:select-all --delimiter "$TAB" --with-nth 2.. --prompt 'accounts> ' \
+        --header 'sign these in to the proxy · tab toggle · enter continue · esc cancel'); rc=$?
+    [ $rc = 130 ] && return 1; [ $rc -ge 2 ] && return 2
+    setall 0
+    while IFS= read -r l; do j=${l%%"$TAB"*}; case $j in ''|*[!0-9]*) ;; *) sel[j - 1]=1 ;; esac; done <<<"$out"
+  }
+  if [ $m = 0 ]; then
+    step 3 Accounts "$pc in proxy, none to add" "kept"
+  else
+    case ${CLIPROXY_SETUP_ACCOUNTS:-} in
+      all) ;;
+      *) while :; do
+           if has fzf; then pick_fzf; r=$?; [ $r = 1 ] && die "cancelled"; else r=2; fi
+           if [ $r = 2 ]; then
+             draw
+             printf '  numbers toggle (1 3), a all, n none, Enter continue: '
+             if ! read -r ans; then ans=; count; [ $c = 0 ] && [ "$pc" = 0 ] && die "pick at least one account"; fi
+             case $ans in
+               a) setall 1; continue ;; n) setall 0; continue ;;
+               ?*) for w in $ans; do case $w in *[!0-9]*) ;; *) [ "$w" -ge 1 ] && [ "$w" -le $n ] && [ "${sel[w - 1]}" != - ] && sel[w - 1]=$((1 - sel[w - 1])) ;; esac; done; continue ;;
+             esac
+           fi
+           count; [ $c -gt 0 ] || [ "$pc" -gt 0 ] && break
+           echo "  pick at least one account"
+         done ;;
+    esac
+    count; done_n=0 i=0
+    while [ $i -lt $n ]; do
+      if [ "${sel[i]}" = 1 ]; then
+        echo "  sign in as ${mail[i]} (${kind[i]} ${name[i]})"
+        if [ -z "$bin" ]; then echo "  no cliproxyapi here to sign in with: skipped"; i=$((i + 1)); continue; fi
+        f=-claude-login; [ "${kind[i]}" = codex ] && f=-codex-device-login
+        emails; before=$EM
+        if if [ -n "$Y" ]; then "$bin" -config "$Y" $f; else "$bin" $f; fi; then
+          j=0; new=; while [ $j -lt 6 ]; do emails; new=$(minus "$EM" "$before"); [ -n "$new" ] && break; sleep 0.5; j=$((j + 1)); done
+          new=$(printf '%s' "$new" | head -1)
+          if [ -z "$new" ]; then echo "  no new account showed up in the proxy"
+          elif [ "${mail[i]}" != '?' ] && [ "$new" != "$(echo "${mail[i]}" | tr 'A-Z' 'a-z')" ]; then echo "  signed in as $new, expected ${mail[i]}: kept"
+          else echo "  signed in as $new"; fi
+          done_n=$((done_n + 1))
+        else echo "  sign-in failed (exit $?)"; fi
+      fi
+      i=$((i + 1))
+    done
+    step 3 Accounts "$done_n signed in, $pc in proxy before" "done"
+  fi
+fi
+
+# ── 4. start (done above) and mode ──
+step 4 Start "$how" "proxy up"
+AI_PLUGIN_DIR=$D bash ./plugin do apply 2>&1 | sed 's/^/        /'
+AI_PLUGIN_DIR=$D bash ./plugin do affinity 2>&1 | sed 's/^/        /'
+okkey client "$key" || die "the proxy refused the client key (HTTP ${code:-no answer}): not ready"
+case $(uname -s)/$D in
+  MINGW*/*/.*.install|MSYS*/*/.*.install|CYGWIN*/*/.*.install)
+    # Windows cannot rename the staging folder while the proxy runs from it
+    [ -n "$started" ] && { stop_proxy; echo "  proxy stopped so the install can finish: start it with the start action"; } ;;
+esac
+echo '  Done. "Claude Code · all accounts" is ready.'
