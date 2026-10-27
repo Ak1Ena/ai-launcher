@@ -93,6 +93,11 @@ CREDS = {"observed_at": "2026-10-26T10:00:00Z", "files": [
 def jfile(n):
     try: return json.load(open(T + '/' + n))
     except Exception: return None
+def creds():  # weights.json: name -> weight, set by the fields PATCH; absent = no weight key (proxy default 1)
+    c = jfile('creds.json') or json.loads(json.dumps(CREDS)); w = jfile('weights.json') or {}
+    for f in c.get('files', []):
+        if f.get('name') in w: f['weight'] = w[f['name']]
+    return c
 def quota(ai):
     now = int(time.time())
     o = (jfile('quota.json') or {}).get(ai)
@@ -140,7 +145,11 @@ class H(BaseHTTPRequestHandler):
                 r = json.load(open(T + '/routing.json')) if os.path.exists(T + '/routing.json') else {}
                 r.update(json.loads(body).get('routing', {})); json.dump(r, open(T + '/routing.json', 'w'))
                 return self.send(200, {"status": "ok"})
-            if p in ('/v8/management/credentials', '/v0/management/auth-files'): return self.send(200, jfile('creds.json') or CREDS)
+            if p in ('/v8/management/credentials', '/v0/management/auth-files'): return self.send(200, creds())
+            if p in ('/v8/management/credentials/fields', '/v0/management/auth-files/fields') and self.command == 'PATCH':
+                open(T + '/fields.log', 'a').write(p + ' ' + body + '\n'); b = json.loads(body)
+                w = jfile('weights.json') or {}; w[b['name']] = b['weight']; json.dump(w, open(T + '/weights.json', 'w'))
+                return self.send(200, {"status": "ok"})
             if p in ('/v8/management/requests/api-call', '/v0/management/api-call'):
                 req = json.loads(body or '{}'); code, obj = quota(req.get('auth_index'))
                 return self.send(200, {"status_code": code, "header": {}, "body": json.dumps(obj)})
@@ -365,8 +374,69 @@ fresh
 ok "cooldown/unavailable alone counts"    'has_line "$out" "⚠ all Claude accounts limited · next reset ↻1h" && has_line "$out" "proxy up · Claude limited"'
 rm -f "$T/creds.json" "$T/quota.json"; rm -rf "$D/cache"
 
+# ── weights ──
+conf "url=$URL" "key=$CK" "mgmt_key=$MK" mode=failover
+: > "$T/mode"; rm -f "$T/patch.log" "$T/put.log" "$T/fields.log" "$T/weights.json"
+echo '{"strategy":"fill-first","session-affinity":true,"session-affinity-subagents":true}' > "$T/routing.json"
+wc_() { cred "$1" "$2" "\"name\":\"$2-$3.json\",\"email\":\"$3\"${4:+,$4}"; }
+echo "{\"files\":[$(wc_ c1 claude wa@example.com),$(wc_ c2 claude wb@example.com),$(wc_ c3 claude wd@example.com '"disabled":true'),$(wc_ x1 codex wc@example.com),$(wc_ g1 gemini wg@example.com)]}" > "$T/creds.json"   # a repeated key: the last wins
+fresh
+acts=$(run actions)
+ok "weights: on/off actions, no per-account ones when off" 'has_line "$acts" "weights-on${TAB}Weights: on" && has_line "$acts" "weights-off${TAB}Weights: off" && ! printf "%s\n" "$acts" | grep -q "^w\(up\|down\)\."'
+ok "weights off: no ×N lines, no weighted title" '! has_line "$out" "×" && ! has_line "$out" "weighted"'
+res=$(run do weights-on); rc=$?
+ok "weights-on: config weights=on, mode=balance" '[ $rc = 0 ] && grep -qx weights=on "$D/config" && grep -qx mode=balance "$D/config" && [ "$(grep -c "^mode=" "$D/config")" = 1 ]'
+ok "weights-on: weighted-round-robin + affinity" '[ "$(cat "$T/patch.log")" = "{\"routing\":{\"strategy\":\"weighted-round-robin\",\"session-affinity\":true,\"session-affinity-subagents\":true,\"session-affinity-ttl\":\"1h\"}}" ] && has_line "$res" "load balance by weight"'
+echo '{"claude-wb@example.com.json":3,"codex-wc@example.com.json":0}' > "$T/weights.json"
+fresh
+ok "weighted title"                    '[ "$(printf "%s\n" "$out" | head -1)" = "section${TAB}CLIPROXY · all accounts · load balance · weighted" ] && ! has_line "$out" "proxy uses"'
+ok "rows: ×N per account, 0 is off, missing is 1" 'has_line "$out" "  ${TAB}wa@example.com ×1" && has_line "$out" "  ${TAB}wb@example.com ×3" && has_line "$out" "  ${TAB}wc@example.com off" && ! has_line "$out" "wd@" && ! has_line "$out" "wg@"'
+acts=$(run actions)
+ok "actions: raise / lower labels"     'has_line "$acts" "wup.c1${TAB}wa@example.com: weight 1 → 2" && has_line "$acts" "wdown.c1${TAB}wa@example.com: weight 1 → off" && has_line "$acts" "wup.c2${TAB}wb@example.com: weight 3 → 4" && has_line "$acts" "wup.x1${TAB}wc@example.com: weight off → 1"'
+ok "actions: lower hidden at 0, ids valid" '! has_line "$acts" "wdown.x1" && [ -z "$(printf "%s\n" "$acts" | cut -f1 | grep -v "^[A-Za-z0-9._-]*$")" ]'
+res=$(run do wup.c2); rc=$?
+ok "raise: v8 fields PATCH, name, integer" '[ $rc = 0 ] && [ "$(cat "$T/fields.log")" = "/v8/management/credentials/fields {\"name\":\"claude-wb@example.com.json\",\"weight\":4}" ] && has_line "$res" "wb@example.com: weight 4"'
+ok "raise: cache updated at once"      'has_line "$(run actions)" "wup.c2${TAB}wb@example.com: weight 4 → 5" && has_line "$(run rows)" "wb@example.com ×4"'
+rm -f "$T/fields.log"; res=$(run do wdown.c1)
+ok "lower to 0: off"                   '[ "$(cat "$T/fields.log")" = "/v8/management/credentials/fields {\"name\":\"claude-wa@example.com.json\",\"weight\":0}" ] && has_line "$res" "off"'
+rm -f "$T/fields.log"
+ok "lower at 0 refused, no PATCH"      '! run do wdown.c1 >/dev/null && [ ! -e "$T/fields.log" ]'
+echo '{"claude-wb@example.com.json":99}' > "$T/weights.json"; fresh
+ok "raise capped at 99"                '! has_line "$(run actions)" "wup.c2" && ! run do wup.c2 >/dev/null && [ ! -e "$T/fields.log" ]'
+ok "unknown or bad id refused"         '! run do wup.zz >/dev/null && ! run do "wup.c1;x" >/dev/null && [ ! -e "$T/fields.log" ]'
+echo v0 > "$T/mode"; run do wdown.c2 >/dev/null
+ok "v0 fallback for the weight"        '[ "$(cat "$T/fields.log")" = "/v0/management/auth-files/fields {\"name\":\"claude-wb@example.com.json\",\"weight\":98}" ]'
+: > "$T/mode"; rm -f "$T/fields.log"
+res=$(run do weights-off); rc=$?
+ok "weights-off in balance: round-robin" '[ $rc = 0 ] && grep -qx weights=off "$D/config" && has_line "$(tail -1 "$T/patch.log")" "\"strategy\":\"round-robin\""'
+fresh
+ok "weights off: no lines, no actions" '! has_line "$out" "×" && ! has_line "$out" "weighted" && ! run actions | grep -q "^wup\."'
+echo '{"strategy":"weighted-round-robin","session-affinity":true,"session-affinity-subagents":true}' > "$T/routing.json"; fresh
+ok "weights off + wrr proxy: mismatch" 'has_line "$out" "⚠ proxy uses weighted-round-robin, plugin mode is load balance"'
+rm -f "$T/patch.log"; run do apply >/dev/null
+ok "apply respects weights=off"        'has_line "$(cat "$T/patch.log")" "\"strategy\":\"round-robin\""'
+setw() { grep -v "^weights=" "$D/config" > "$D/c.tmp"; [ -n "$1" ] && echo "weights=$1" >> "$D/c.tmp"; mv "$D/c.tmp" "$D/config"; chmod 600 "$D/config"; }
+setw on; rm -f "$T/patch.log"; run do apply >/dev/null
+ok "apply respects weights=on"         'has_line "$(cat "$T/patch.log")" "\"strategy\":\"weighted-round-robin\""'
+setw on; run do mode-failover >/dev/null; rm -f "$T/patch.log"
+res=$(run do weights-off)
+ok "weights-off in failover: no proxy change" '[ ! -e "$T/patch.log" ] && has_line "$res" "failover mode does not use weights"'
+setw ""; run do mode-balance >/dev/null; setw ""
+echo '{"strategy":"wrr","session-affinity":true,"session-affinity-subagents":true}' > "$T/routing.json"; fresh
+ok "first sight of wrr proxy: weights on" 'grep -qx weights=on "$D/config" && ! has_line "$out" "proxy uses" && has_line "$(run actions)" "wup.c1"'
+conf "url=$URL" "key=$CK" mode=balance weights=on
+res=$(run do wup.c1); rc=$?
+ok "no mgmt key: weight action refuses" '[ $rc != 0 ] && [ "$res" = "needs the management key" ]'
+res=$(run do weights-on); rc=$?
+ok "no mgmt key: weights-on config only" '[ $rc = 0 ] && has_line "$res" "proxy not changed (no management key)"'
+conf "url=$URL" "key=$CK" "mgmt_key=$MK" mode=balance weights=on
+wall=$(run rows; run actions; run do wup.c1; run do wdown.c1; run do weights-off; run do weights-on; cat "$D"/cache/* "$T"/*.log 2>/dev/null)
+ok "weights: keys never printed"       '! printf "%s" "$wall" | grep -qe "$CK" -e "$MK"'
+rm -f "$T/creds.json" "$T/quota.json" "$T/routing.json" "$T/weights.json" "$T/fields.log"; rm -rf "$D/cache"
+conf "url=$URL" "key=$CK" "mgmt_key=$MK"
+
 # ── key safety ──
-all=$(run rows; run actions; run launch nope 2>&1; run do apply; run do mode-failover; cat "$D"/cache/* "$T"/*.log 2>/dev/null)
+all=$(run rows; run actions; run launch nope 2>&1; run do apply; run do mode-failover; run do weights-on; run do wup.c1; run do weights-off; cat "$D"/cache/* "$T"/*.log 2>/dev/null)
 ok "keys never printed or cached"      '! printf "%s" "$all" | grep -qe "$CK" -e "$MK" -e "$MYKEY"'
 ok "cache is private"                  'case $(ls -ld "$D/cache") in drwx------*) true;; *) false;; esac'
 

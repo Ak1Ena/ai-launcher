@@ -364,6 +364,7 @@ The first `rows` call creates `plugins/cliproxy/config` (mode 600). It is read a
 | `start_cmd` / `stop_cmd` | none | Commands for the start / stop actions when brew has no `cliproxyapi` (run with `bash -c` in the plugin folder) |
 | `proxy_config` | set by setup | The proxy's `config.yaml` that setup edits (a relative path is inside the plugin folder) |
 | `mode` | `failover` | `failover` or `balance`: how the "all accounts" row uses accounts (see below) |
+| `weights` | `off` | `on`: balance by per-account weight (see below). Set to `on` the first time the plugin sees a proxy already on `weighted-round-robin` |
 
 Each line is `key=value`. A ` #` (space then `#`) or tab then `#` starts a comment, and a line starting with `#` is skipped. Quotes are not removed: `key="abc"` gives the key `"abc"` with the quotes.
 
@@ -375,9 +376,11 @@ Actions `start` and `stop` run `brew services` or your `start_cmd` / `stop_cmd` 
 
 **Failover or load balance.** The section title shows the mode: `CLIPROXY · all accounts · failover` or `· load balance`.
 - **failover** (default): one account until it is limited, then the next. The chat keeps going in the same Claude Code session with its whole history, with no restart. The first request on the new account reads the context once more without the cache. The plugin sets the proxy's `routing.strategy` to `fill-first` and `routing.cooldown.disable-cooling` to false (with cooling off, the proxy would keep picking a limited account).
-- **balance**: chats are spread across accounts, and session affinity keeps each chat on one account. The plugin sets `round-robin` (it keeps `weighted-round-robin` if the proxy already uses it) and turns session affinity on.
+- **balance**: chats are spread across accounts, and session affinity keeps each chat on one account. The plugin sets `round-robin`, or `weighted-round-robin` when weights are on, and turns session affinity on.
 
 Switch with the actions **Mode: failover** / **Mode: load balance** (`a` in the TUI, or `ai plugin do cliproxy mode-failover` / `mode-balance`). They write `mode=` into the config, then change the proxy with one `PATCH /v8/management/config`; an older proxy without v8 gets only the strategy, through `PUT /v0/management/routing/strategy`. Without a management key only the config changes, and the plugin says `proxy not changed (no management key)`. When the proxy does not match the mode, the section shows `⚠ proxy uses <strategy>, plugin mode is <mode>` and an **Apply** action (`ai plugin do cliproxy apply`). The proxy's config changes only on these actions and on **Keep each chat on one account**. Session affinity and the mode check need a management key and a proxy with the v8 management API.
+
+**Weights.** The actions **Weights: on** / **Weights: off** (`ai plugin do cliproxy weights-on` / `weights-off`) write `weights=` into the config. On also switches to load balance and sets the proxy to `weighted-round-robin` with session affinity; off sets `round-robin` when the mode is load balance. Failover ignores weights. While weights are on in load balance, the title ends in `· weighted`, the section lists each enabled Claude and Codex account as `<email> ×N` (`off` for 0), and the actions list `<email>: weight N → N+1` (`wup.<auth index>`) and `<email>: weight N → N-1` (`wdown.<auth index>`, only above 0) for each. Weights go from 0 to 99, default 1; 0 means the account is never picked. The plugin sets a weight through the proxy's management API (`PATCH /v8/management/credentials/fields`, or `/v0/management/auth-files/fields` on an older proxy), never by editing auth files, and it takes effect at once. Weights only pick the account for a new chat: session affinity still keeps each chat on its account. The weight actions need the management key.
 
 **When every account is limited.** The section shows `⚠ all Claude accounts limited · next reset ↻…` (the same for Codex). CLIProxyAPI has no built-in fallback to another model: when every Claude account is limited, Claude Code gets HTTP 429 `model_cooldown` from the proxy. Pick another model yourself with `/model`, or wait for the reset.
 

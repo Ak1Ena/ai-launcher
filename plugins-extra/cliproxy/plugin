@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cliproxy plugin for ai-launcher: one "all accounts" Claude Code channel through a local CLIProxyAPI.
-# Protocol: plugin rows | actions | do <start|stop|affinity|apply|mode-failover|mode-balance> | launch all [args...]   (see the README "Plugins")
+# Protocol: plugin rows | actions | do <start|stop|affinity|apply|mode-failover|mode-balance|weights-on|weights-off|wup.<idx>|wdown.<idx>> | launch all [args...]   (see the README "Plugins")
 # API facts: docs/superpowers/notes/cliproxyapi.md. Never prints a key.
 D=${AI_PLUGIN_DIR:-$(cd "$(dirname "$0")" && pwd)}
 CONF=$D/config CACHE=$D/cache TAB=$(printf '\t')
@@ -9,16 +9,17 @@ has() { command -v "$1" >/dev/null 2>&1; }
 
 # ── config: key=value lines, never sourced ──
 [ -f "$CONF" ] || { (umask 077; cp "$D/config.example" "$CONF" 2>/dev/null || echo 'url=http://127.0.0.1:8317' > "$CONF"); chmod 600 "$CONF"; }
-url= key= key_env=CLIPROXY_API_KEY mgmt_key= mgmt_key_env=CLIPROXY_MGMT_KEY start_cmd= stop_cmd= mode=
+url= key= key_env=CLIPROXY_API_KEY mgmt_key= mgmt_key_env=CLIPROXY_MGMT_KEY start_cmd= stop_cmd= mode= weights=
 while IFS= read -r l || [ -n "$l" ]; do
   l=${l%$'\r'}
   case $l in '#'*) continue ;; *=*) ;; *) continue ;; esac
   k=${l%%=*} v=${l#*=}; v=${v%% #*}; v=${v%%"$TAB"#*}
   while case $v in *' '|*"$TAB") true ;; *) false ;; esac; do v=${v%?}; done
-  case $k in url|key|key_env|mgmt_key|mgmt_key_env|start_cmd|stop_cmd|mode) eval "$k=\$v" ;; esac
+  case $k in url|key|key_env|mgmt_key|mgmt_key_env|start_cmd|stop_cmd|mode|weights) eval "$k=\$v" ;; esac
 done < "$CONF"
 url=${url:-http://127.0.0.1:8317}; url=${url%/}
 case $mode in balance) ;; *) mode=failover ;; esac
+wset=$weights; [ "$weights" = on ] || weights=off   # wset empty: never chosen yet
 envname() { case $1 in ''|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;; esac; }   # only a valid name reaches eval
 [ -n "$key" ] || ! envname "$key_env" || eval "key=\${$key_env:-}"
 [ -n "$mgmt_key" ] || ! envname "$mgmt_key_env" || eval "mgmt_key=\${$mgmt_key_env:-}"
@@ -44,7 +45,11 @@ JQDEF='def clean: tostring | gsub("[[:cntrl:]]"; "");
   def strat: (. // "" | clean | ascii_downcase) as $s
     | if $s == "" or $s == "rr" or $s == "roundrobin" then "round-robin"
       elif $s == "wrr" or $s == "weightedroundrobin" then "weighted-round-robin"
-      elif $s == "ff" or $s == "fillfirst" then "fill-first" else $s end;'
+      elif $s == "ff" or $s == "fillfirst" then "fill-first" else $s end;
+  def aid: .auth_index // "" | clean | gsub("[^A-Za-z0-9._-]"; "");
+  def who: .email // .account // .name // .id // "?" | clean;
+  def wt: .weight // 1 | (tonumber? // 1) | floor | if . < 0 then 0 else . end;
+  def wacct: select((.disabled != true) and ((.provider // .type // "") | ascii_downcase | test("^(claude|codex)$")));'
 
 # ── usage cache: line 1 = fetch time, then detail lines ──
 refresh() {
@@ -72,8 +77,12 @@ refresh() {
       404) line="usage: management API off (set remote-management secret-key in the proxy config)" ;;
       *) line="usage: management API unavailable (${code:-no answer})" ;;
     esac
+    rm -f "$CACHE/weights"
     { date +%s; printf '  \t%s\n' "$line"; } > "$f"; mv "$f" "$CACHE/usage"; return
   fi
+  # weights cache: <idx> TAB <email> TAB <weight> per enabled claude / codex account
+  jq -r "$JQDEF"'.files[] | wacct | [aid, who, wt] | select(.[0] != "") | @tsv' "$creds" > "$CACHE/weights.$$" 2>/dev/null &&
+    mv "$CACHE/weights.$$" "$CACHE/weights"
   # each enabled claude / codex login: its provider's own usage endpoint through the proxy (as the Management Center does)
   jq -r '.files[] | select((.disabled != true) and ((.provider // .type // "") | ascii_downcase | test("^(claude|codex)$")))
     | [.auth_index, (.provider // .type | ascii_downcase), (.id_token.chatgpt_account_id? // "")] | @tsv' "$creds" 2>/dev/null |
@@ -164,25 +173,31 @@ usage() {
 routing() {
   aff_state=unknown r_strategy= r_cool= r_ttl= mode_ok=unknown
   [ -n "$mgmt_key" ] && [ -f "$CACHE/routing" ] || return 0
-  local a s
+  local a s want=round-robin
   IFS="$TAB" read -r r_strategy a s r_cool r_ttl < "$CACHE/routing"
   [ "$a" = true ] && [ "$s" = true ] && aff_state=on || aff_state=off
+  firstwrr "$r_strategy"
+  [ $weights = on ] && want=weighted-round-robin
   mode_ok=no
   case $mode/$r_strategy/$r_cool in
     failover/fill-first/false) mode_ok=yes ;;
-    balance/round-robin/*|balance/weighted-round-robin/*) [ $aff_state = on ] && mode_ok=yes ;;
+    balance/$want/*) [ $aff_state = on ] && mode_ok=yes ;;
   esac
 }
+# a proxy already on weighted-round-robin, before weights= was ever chosen: the user uses weights
+firstwrr() { [ -z "$wset" ] && [ "$1" = weighted-round-robin ] && setkey weights on && weights=on wset=on; return 0; }
+weighted() { [ $weights/$mode = on/balance ] && [ -n "$mgmt_key" ] && [ -f "$CACHE/weights" ]; }
+wl() { [ "$1" -gt 0 ] && echo "$1" || echo off; }
 modename() { [ "$1" = balance ] && echo 'load balance' || echo failover; }
 
-# mode=<m> into the config: other lines kept, file stays 600
-setmode() {
+# <key>=<value> into the config: other lines kept, file stays 600
+setkey() {
   ( umask 077; seen=
     while IFS= read -r l || [ -n "$l" ]; do
-      case $l in mode=*) [ -n "$seen" ] && continue; l="mode=$1" seen=1 ;; esac
+      case $l in "$1="*) [ -n "$seen" ] && continue; l="$1=$2" seen=1 ;; esac
       printf '%s\n' "$l"
     done < "$CONF" > "$CONF.$$"
-    [ -n "$seen" ] || printf 'mode=%s\n' "$1" >> "$CONF.$$"
+    [ -n "$seen" ] || printf '%s=%s\n' "$1" "$2" >> "$CONF.$$"
   ) && chmod 600 "$CONF.$$" && mv "$CONF.$$" "$CONF"
 }
 # GET the v8 routing config: sets out (body) and code
@@ -205,8 +220,9 @@ apply() {
   getrouting
   if [ "$code" = 200 ]; then
     cur=$(printf '%s\n' "$out" | jq -r "$JQDEF"'.strategy | strat' 2>/dev/null)
+    firstwrr "$cur"
     if [ "$mode" = failover ]; then body='{"routing":{"strategy":"fill-first","cooldown":{"disable-cooling":false}}}'
-    else s=round-robin; [ "$cur" = weighted-round-robin ] && s=$cur
+    else s=round-robin; [ $weights = on ] && s=weighted-round-robin
       body="{\"routing\":{\"strategy\":\"$s\",$(affkeys)}}"
     fi
     out=$(kcurl "$mgmt_key" -m 10 -X PATCH -H 'Content-Type: application/json' --data-binary "$body" "$url/v8/management/config"); code=${out##*$'\n'}
@@ -215,35 +231,65 @@ apply() {
     if [ "$mode" = balance ]; then
       s=$(kcurl "$mgmt_key" -m 5 "$url/v0/management/routing/strategy")
       s=$(printf '%s\n' "${s%$'\n'*}" | jq -r "$JQDEF"'.strategy | strat' 2>/dev/null)
-      [ "$s" = weighted-round-robin ] || s=round-robin
+      firstwrr "$s"; s=round-robin; [ $weights = on ] && s=weighted-round-robin
     fi
     out=$(kcurl "$mgmt_key" -m 10 -X PUT -H 'Content-Type: application/json' --data-binary "{\"value\":\"$s\"}" "$url/v0/management/routing/strategy"); code=${out##*$'\n'}
   fi
   if [ "$code" != 200 ]; then echo "could not apply mode $(modename "$mode") ($(hc "$code"))"; return 1; fi
   case $mode in
     failover) echo "proxy now uses failover: one account until it is limited, then the next" ;;
-    balance) echo "proxy now uses load balance: chats spread across accounts, each chat stays on one" ;;
+    balance) echo "proxy now uses load balance$([ $weights = on ] && echo ' by weight'): chats spread across accounts, each chat stays on one" ;;
   esac
+}
+
+# wup / wdown <idx>: read the account live, PATCH its weight (v8 fields, v0 on 404), update the weights cache
+setweight() {
+  [ -n "$mgmt_key" ] || { echo 'needs the management key'; return 1; }
+  has curl && has jq || { echo 'weights need curl and jq'; return 1; }
+  local id=$2 a e w n body
+  case $id in ''|*[!A-Za-z0-9._-]*) echo "unknown account: $id"; return 1 ;; esac
+  out=$(kcurl "$mgmt_key" -m 10 "$url/v8/management/credentials"); code=${out##*$'\n'}
+  [ "$code" = 404 ] && { out=$(kcurl "$mgmt_key" -m 10 "$url/v0/management/auth-files"); code=${out##*$'\n'}; }
+  [ "$code" = 200 ] || { echo "could not read the accounts ($(hc "$code"))"; return 1; }
+  a=$(printf '%s\n' "${out%$'\n'*}" | jq -c --arg id "$id" "$JQDEF"'first(.files[]? | wacct | select(aid == $id)
+    | {name: (.name // .id), e: who, w: wt} | select(.name != null))' 2>/dev/null)
+  [ -n "$a" ] || { echo "unknown account: $id"; return 1; }
+  e=$(printf '%s\n' "$a" | jq -r .e) w=$(printf '%s\n' "$a" | jq -r .w)
+  if [ "$1" = up ]; then n=$((w + 1)); else n=$((w - 1)); fi
+  [ $n -ge 0 ] && [ $n -le 99 ] || { echo "$e: weight stays $(wl "$w") (range 0 to 99)"; return 1; }
+  body=$(printf '%s\n' "$a" | jq -c --argjson n "$n" '{name: (.name | tostring), weight: $n}')
+  out=$(kcurl "$mgmt_key" -m 10 -X PATCH -H 'Content-Type: application/json' --data-binary "$body" "$url/v8/management/credentials/fields"); code=${out##*$'\n'}
+  [ "$code" = 404 ] && { out=$(kcurl "$mgmt_key" -m 10 -X PATCH -H 'Content-Type: application/json' --data-binary "$body" "$url/v0/management/auth-files/fields"); code=${out##*$'\n'}; }
+  [ "$code" = 200 ] || { echo "could not set the weight of $e ($(hc "$code"))"; return 1; }
+  [ -f "$CACHE/weights" ] && awk -F "$TAB" -v OFS="$TAB" -v id="$id" -v n="$n" '$1 == id { $3 = n } 1' "$CACHE/weights" > "$CACHE/weights.$$" &&
+    mv "$CACHE/weights.$$" "$CACHE/weights"
+  if [ $n = 0 ]; then echo "$e: weight 0, off (never picked)"; else echo "$e: weight $n"; fi
 }
 
 brew_has() { has brew && [ -d "$(brew --prefix 2>/dev/null)/opt/cliproxyapi" ]; }
 
 case ${1:-} in
   rows)
-    printf 'section\tCLIPROXY · all accounts · %s\n' "$(modename "$mode")"
+    routing
+    printf 'section\tCLIPROXY · all accounts · %s%s\n' "$(modename "$mode")" "$(weighted && echo ' · weighted')"
     printf 'all\tClaude Code · all accounts\t'
     if [ -z "$key" ]; then nokey; exit 0; fi
     up || { echo "$DOWN"; exit 0; }
     warn=; [ -f "$CACHE/usage" ] && warn=$(tail -n +2 "$CACHE/usage" | grep -F '⚠ all ')
     case $warn in *'all Claude accounts limited'*) echo 'proxy up · Claude limited' ;; *) echo 'proxy up' ;; esac
     [ -z "$warn" ] || printf '%s\n' "$warn"
-    routing
     case $aff_state in
       off) printf '  \t⚠ session affinity off: a chat can move between accounts and re-send its whole context — TUI: a, or ai plugin do cliproxy affinity\n' ;;
       on) printf '  \trouting: %s · sticky per chat%s\n' "$r_strategy" "$([ "$r_ttl" = - ] || printf ' (%s)' "$r_ttl")" ;;
     esac
     s=$r_strategy; [ "$r_cool" = true ] && s="$s (cooling off)"
     [ $mode_ok = no ] && printf '  \t⚠ proxy uses %s, plugin mode is %s — apply: TUI a, or ai plugin do cliproxy apply\n' "$s" "$(modename "$mode")"
+    if weighted; then
+      while IFS="$TAB" read -r i e w; do
+        case $w in ''|*[!0-9]*) continue ;; esac
+        if [ "$w" -gt 0 ]; then printf '  \t%s ×%s\n' "$e" "$w"; else printf '  \t%s off\n' "$e"; fi
+      done < "$CACHE/weights"
+    fi
     usage ;;
   actions)
     if brew_has || [ -n "$start_cmd" ]; then printf 'start\tstart proxy\n'; fi
@@ -252,6 +298,14 @@ case ${1:-} in
     routing
     [ $mode_ok = no ] && printf 'apply\tApply %s to the proxy\n' "$(modename "$mode")"
     [ -n "$mgmt_key" ] && [ "$aff_state" != on ] && printf 'affinity\tKeep each chat on one account\n'
+    printf 'weights-on\tWeights: on\nweights-off\tWeights: off\n'
+    if weighted; then
+      while IFS="$TAB" read -r i e w; do
+        case $w in ''|*[!0-9]*) continue ;; esac
+        [ "$w" -lt 99 ] && printf 'wup.%s\t%s: weight %s → %s\n' "$i" "$e" "$(wl "$w")" "$(wl $((w + 1)))"
+        [ "$w" -gt 0 ] && printf 'wdown.%s\t%s: weight %s → %s\n' "$i" "$e" "$(wl "$w")" "$(wl $((w - 1)))"
+      done < "$CACHE/weights"
+    fi
     exit 0 ;;
   do)
     if [ "${2:-}" = affinity ]; then
@@ -267,7 +321,13 @@ case ${1:-} in
     fi
     case ${2:-} in
       apply) [ -n "$mgmt_key" ] || { echo "proxy not changed (no management key)"; exit 1; }; apply; exit ;;
-      mode-failover|mode-balance) mode=${2#mode-}; setmode "$mode" || { echo "could not write $CONF"; exit 1; }; apply; exit ;;
+      mode-failover|mode-balance) mode=${2#mode-}; setkey mode "$mode" || { echo "could not write $CONF"; exit 1; }; apply; exit ;;
+      weights-on) weights=on mode=balance; { setkey weights on && setkey mode balance; } || { echo "could not write $CONF"; exit 1; }; apply; exit ;;
+      weights-off) weights=off; setkey weights off || { echo "could not write $CONF"; exit 1; }
+        [ "$mode" = balance ] && { apply; exit; }
+        echo "weights off (failover mode does not use weights)"; exit 0 ;;
+      wup.*) setweight up "${2#wup.}"; exit ;;
+      wdown.*) setweight down "${2#wdown.}"; exit ;;
     esac
     case ${2:-} in start|stop) ;; *) echo "unknown action: ${2:-}"; exit 1 ;; esac
     if brew_has; then exec brew services "$2" cliproxyapi; fi
@@ -283,5 +343,5 @@ case ${1:-} in
     ! envname "$mgmt_key_env" || unset "$mgmt_key_env"
     export ANTHROPIC_BASE_URL=$url ANTHROPIC_AUTH_TOKEN=$key CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
     exec claude "$@" ;;
-  *) echo "usage: plugin rows | actions | do <start|stop|affinity|apply|mode-failover|mode-balance> | launch all [args...]" >&2; exit 1 ;;
+  *) echo "usage: plugin rows | actions | do <start|stop|affinity|apply|mode-failover|mode-balance|weights-on|weights-off|wup.<idx>|wdown.<idx>> | launch all [args...]" >&2; exit 1 ;;
 esac
