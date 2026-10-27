@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Runs once with a terminal, after the user reads and approves this file.
+# Make it safe to run twice: check before you change anything.
+set -e
+cd "${AI_PLUGIN_DIR:-.}"
+if [ -e config ]; then
+  echo "config exists: leaving it alone"
+else
+  echo "creating config"
+  ( umask 077; printf '# settings for this plugin\n' > config )
+  chmod 600 config
+fi
+echo "setup done"

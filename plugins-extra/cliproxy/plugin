@@ -273,7 +273,7 @@ case ${1:-} in
     if brew_has; then exec brew services "$2" cliproxyapi; fi
     cmd=$start_cmd; [ "$2" = stop ] && cmd=$stop_cmd
     [ -n "$cmd" ] || { echo "no $2 command: install cliproxyapi with brew or set ${2}_cmd= in $CONF"; exit 1; }
-    exec bash -c "$cmd" ;;
+    cd "$D" && exec bash -c "$cmd" ;;   # in the plugin folder: setup's commands use paths relative to it
   launch)
     [ "${2:-}" = all ] || { echo "unknown entry: ${2:-}" >&2; exit 1; }
     shift 2

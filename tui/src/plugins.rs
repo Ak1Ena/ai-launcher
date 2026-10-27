@@ -17,15 +17,25 @@ pub const DO_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The bundled cliproxy plugin, shipped inside the binary (npm has no repo): file, text, executable.
-const CLIPROXY: [(&str, &str, bool); 2] = [
+const CLIPROXY: [(&str, &str, bool); 4] = [
     (
         "plugin",
         include_str!("../../plugins-extra/cliproxy/plugin"),
         true,
     ),
     (
+        "setup",
+        include_str!("../../plugins-extra/cliproxy/setup"),
+        true,
+    ),
+    (
         "config.example",
         include_str!("../../plugins-extra/cliproxy/config.example"),
+        false,
+    ),
+    (
+        "about",
+        include_str!("../../plugins-extra/cliproxy/about"),
         false,
     ),
 ];
@@ -347,18 +357,26 @@ pub fn hide_userinfo(s: &str) -> String {
     out + rest
 }
 
-/// Installs a plugin from `source`: a bundled name (`cliproxy`), a local folder (copied), or a
-/// git URL / `owner/repo` (`git clone --depth 1`, URL saved in `.source`). Never overwrites.
-/// Returns the installed name.
-pub fn add(paths: &Paths, source: &str) -> Result<String, String> {
+/// A plugin fetched into `<plugins>/.<name>.install`, not installed yet. `setup` is its setup
+/// script, read once: the text to review, and the exact text `setup_copy` writes to run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Staged {
+    pub name: String,
+    pub dir: PathBuf,
+    pub setup: Option<String>,
+    /// where it came from, for display (no userinfo)
+    pub source: String,
+}
+
+/// The name `source` installs as, and its git URL if it is one (else bundled or a folder).
+/// Same order as bash: a bundled name, then an existing folder, then git.
+pub fn source_name(source: &str) -> Result<(String, Option<String>), String> {
     let source = source.trim();
     if source.is_empty() {
         return Err("Give a folder, a git URL, owner/repo, or cliproxy.".into());
     }
-    // bundled name, then an existing folder, then git: the same order as bash
     let bundled = source == "cliproxy";
-    let folder = Path::new(source);
-    let is_dir = !bundled && folder.is_dir();
+    let is_dir = !bundled && Path::new(source).is_dir();
     let git = (!bundled && !is_dir)
         .then(|| git_url(source.trim_end_matches('/')))
         .flatten();
@@ -386,38 +404,177 @@ pub fn add(paths: &Paths, source: &str) -> Result<String, String> {
             "Bad plugin name '{name}': letters, digits, _ or - only."
         ));
     }
-    let dest = paths.plugins.join(&name);
-    if dest.symlink_metadata().is_ok() {
+    Ok((name, git))
+}
+
+/// Fetches a plugin from `source` into staging `<plugins>/.<name>.install` (a stale one is
+/// removed first): a bundled name (`cliproxy`), a local folder (copied), or a git URL /
+/// `owner/repo` (`git clone --depth 1`, URL saved in `.source`). Never touches an installed
+/// plugin. Any failure removes staging. Same rules as bash `_ai_plugin_add`.
+pub fn stage(paths: &Paths, source: &str) -> Result<Staged, String> {
+    let source = source.trim();
+    let (name, git) = source_name(source)?;
+    let bundled = source == "cliproxy";
+    let folder = Path::new(source);
+    if paths.plugins.join(&name).symlink_metadata().is_ok() {
         return Err(format!("{name} is already installed."));
     }
-    if !bundled && git.is_none() && !executable(&folder.join("plugin")) {
-        return Err(format!("{source} has no executable 'plugin'."));
+    if !bundled && git.is_none() {
+        if !executable(&folder.join("plugin")) {
+            return Err(format!("{source} has no executable 'plugin'."));
+        }
+        // the copy below follows links (bash `cp -R` keeps them), so refuse a linked setup here
+        setup_text(folder)?;
     }
     std::fs::create_dir_all(&paths.plugins).map_err(|e| e.to_string())?;
-    let done = match (bundled, git) {
-        (true, _) => write_bundled(&dest, &CLIPROXY),
-        (false, Some(url)) => clone(&url, &dest),
-        _ => crate::failover::copy_dir(folder, &dest)
+    let dir = paths.plugins.join(format!(".{name}.install"));
+    // a stale one from a crash; a link loses only the link
+    let _ = config::remove_entry(&dir);
+    let shown = hide_userinfo(git.as_deref().unwrap_or(source));
+    let done = match (bundled, &git) {
+        (true, _) => write_bundled(&dir, &CLIPROXY),
+        (false, Some(url)) => clone(url, &dir),
+        _ => crate::failover::copy_dir(folder, &dir)
             .map_err(|e| e.to_string())
             .inspect(|()| {
-                // a copy starts on and is not git-updatable
-                let _ = std::fs::remove_file(dest.join(".off"));
-                let _ = std::fs::remove_file(dest.join(".source"));
+                // a copy is not git-updatable
+                let _ = std::fs::remove_file(dir.join(".source"));
             }),
     };
-    let done = done.and_then(|()| {
-        if executable(&dest.join("plugin")) {
-            Ok(())
-        } else {
-            Err(format!("{source} has no executable 'plugin'."))
+    let done = done
+        .and_then(|()| {
+            // new installs start on
+            let _ = std::fs::remove_file(dir.join(".off"));
+            if executable(&dir.join("plugin")) {
+                Ok(())
+            } else {
+                Err(format!("{source} has no executable 'plugin'."))
+            }
+        })
+        .and_then(|()| setup_text(&dir));
+    match done {
+        Ok(setup) => Ok(Staged {
+            name,
+            dir,
+            setup,
+            source: shown,
+        }),
+        Err(e) => {
+            // a half install would look installed: take it back
+            let _ = config::remove_entry(&dir);
+            Err(e)
         }
-    });
-    if let Err(e) = done {
-        // a half install would look installed: take it back
-        let _ = config::remove_entry(&dest);
-        return Err(e);
     }
-    Ok(name)
+}
+
+/// `<dir>/setup` as text, or None without one. It must be a regular file in the folder: a link
+/// could point anywhere and change after review (a folder or other non-file is refused alike).
+pub fn setup_text(dir: &Path) -> Result<Option<String>, String> {
+    let p = dir.join("setup");
+    match p.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+        Ok(m) if !m.file_type().is_file() => Err("setup is a link: not run".into()),
+        Ok(_) => std::fs::read(&p)
+            .map(|b| Some(String::from_utf8_lossy(&b).into_owned()))
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// Writes the reviewed setup text to a new temp file and returns its path: that copy is what
+/// runs, never `<dir>/setup` again. The caller removes it after the run.
+pub fn setup_copy(text: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let p = std::env::temp_dir().join(format!("ai-setup.{}.{nanos}.{n}", std::process::id()));
+    let mut o = std::fs::OpenOptions::new();
+    // create_new: never write through a file or link someone put there
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let mut f = o.open(&p).map_err(|e| e.to_string())?;
+    if let Err(e) = f.write_all(text.as_bytes()) {
+        let _ = std::fs::remove_file(&p);
+        return Err(e.to_string());
+    }
+    Ok(p)
+}
+
+/// Moves staging in as `<plugins>/<name>` (never over an installed one), warms its `rows` once
+/// (macOS scans a new script on its first run: pay for it at install) and says what it did.
+pub fn commit(paths: &Paths, s: &Staged) -> Result<String, String> {
+    let dest = paths.plugins.join(&s.name);
+    if dest.symlink_metadata().is_ok() {
+        abort(s);
+        return Err(format!("{} is already installed.", s.name));
+    }
+    let _ = std::fs::remove_file(s.dir.join(".off"));
+    if let Err(e) = std::fs::rename(&s.dir, &dest) {
+        abort(s);
+        return Err(e.to_string());
+    }
+    let _ = run(&dest, &["rows"], FIRST_TIMEOUT);
+    Ok(format!("Installed plugin {} from {}.", s.name, s.source))
+}
+
+/// Removes staging; a link loses only the link.
+pub fn abort(s: &Staged) {
+    let _ = config::remove_entry(&s.dir);
+}
+
+/// `config` → `config.bak` before setup runs again, if there is a config.
+pub fn backup_config(dir: &Path) -> std::io::Result<()> {
+    let c = dir.join("config");
+    if c.is_file() {
+        std::fs::copy(&c, dir.join("config.bak"))?;
+    }
+    Ok(())
+}
+
+/// A bundled plugin that is not installed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Available {
+    pub name: String,
+    pub about: String,
+    pub has_setup: bool,
+}
+
+/// Bundled plugins not installed (a link by that name counts as installed).
+pub fn available(paths: &Paths) -> Vec<Available> {
+    if paths.plugins.join("cliproxy").symlink_metadata().is_ok() {
+        return Vec::new();
+    }
+    let file = |n: &str| CLIPROXY.iter().find(|f| f.0 == n).map(|f| f.1);
+    vec![Available {
+        name: "cliproxy".into(),
+        about: about_text(file("about").unwrap_or("")),
+        has_setup: file("setup").is_some(),
+    }]
+}
+
+/// The first line of `<dir>/about`, control chars stripped (TAB stays), 60 chars. Same as bash.
+pub fn about(dir: &Path) -> String {
+    let p = dir.join("about");
+    if !p.is_file() {
+        return String::new();
+    }
+    about_text(&String::from_utf8_lossy(
+        &std::fs::read(p).unwrap_or_default(),
+    ))
+}
+
+fn about_text(s: &str) -> String {
+    s.split('\n')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|&c| c == '\t' || !(c < ' ' || c == '\x7f'))
+        .take(60)
+        .collect()
 }
 
 fn write_bundled(dest: &Path, files: &[(&str, &str, bool)]) -> Result<(), String> {
@@ -449,33 +606,26 @@ fn clone(url: &str, dest: &Path) -> Result<(), String> {
     std::fs::write(dest.join(".source"), format!("{url}\n")).map_err(|e| e.to_string())
 }
 
-/// `git pull --ff-only` for a plugin installed from git; returns git's last line.
+/// `git pull --ff-only` for a plugin installed from git; returns git's last line, plus a note
+/// when its setup changed.
 pub fn update(paths: &Paths, name: &str) -> Result<String, String> {
     let dir = checked(paths, name)?;
     if !from_git(&dir) {
         return Err(format!("{name} was not installed from git."));
     }
+    let before = std::fs::read(dir.join("setup")).ok();
     let out = git(&["-C", &dir.to_string_lossy(), "pull", "--ff-only"])?;
-    Ok(last_line(&out).unwrap_or_else(|| "up to date".into()))
+    let line = last_line(&out).unwrap_or_else(|| "up to date".into());
+    // never run by itself
+    if std::fs::read(dir.join("setup")).ok() != before {
+        return Ok(format!("{line} · setup changed: run setup again to apply"));
+    }
+    Ok(line)
 }
 
 /// Whether the plugin in `dir` came from `git clone` (so `update` can pull it).
 pub fn from_git(dir: &Path) -> bool {
     dir.join(".source").is_file() && dir.join(".git").is_dir()
-}
-
-/// Where a plugin came from, for display: its `.source` URL without userinfo, `bundled` for
-/// the cliproxy written from this binary, else `local`.
-// shortcut: bundled is told by an unchanged `plugin` file, so one from an older release shows local
-pub fn source(p: &Plugin) -> String {
-    if let Ok(s) = std::fs::read_to_string(p.dir.join(".source"))
-        && !s.trim().is_empty()
-    {
-        return hide_userinfo(s.trim());
-    }
-    let bundled = p.name == "cliproxy"
-        && std::fs::read_to_string(p.dir.join("plugin")).is_ok_and(|t| t == CLIPROXY[0].1);
-    if bundled { "bundled" } else { "local" }.to_string()
 }
 
 /// The folder of an installed plugin, after checking the name.
@@ -509,6 +659,16 @@ pub fn set_on(paths: &Paths, name: &str, on: bool) -> Result<(), String> {
 
 #[cfg(test)]
 pub mod tests {
+    /// `stage` then `commit`, refusing a setup: the install the TUI does without a review.
+    fn add(paths: &Paths, source: &str) -> Result<String, String> {
+        let s = stage(paths, source)?;
+        if s.setup.is_some() {
+            abort(&s);
+            return Err(format!("{} has a setup script: review it first.", s.name));
+        }
+        commit(paths, &s)
+    }
+
     use super::*;
     use std::fs;
 
@@ -706,7 +866,10 @@ pub mod tests {
         fs::write(src.join(".off"), "").unwrap();
         fs::write(src.join(".source"), "https://x/y\n").unwrap();
         fs::write(src.join("data"), "x").unwrap();
-        assert_eq!(add(&p, &src.to_string_lossy()), Ok("mine".into()));
+        assert_eq!(
+            add(&p, &src.to_string_lossy()),
+            Ok(format!("Installed plugin mine from {}.", src.display()))
+        );
         assert_eq!(
             fs::read_to_string(p.plugins.join("mine/data")).unwrap(),
             "x"
@@ -719,8 +882,15 @@ pub mod tests {
                 .contains("already")
         );
 
-        assert_eq!(add(&p, "cliproxy"), Ok("cliproxy".into()));
+        // cliproxy ships a setup: add refuses, stage + commit (after review) installs
+        assert!(add(&p, "cliproxy").unwrap_err().contains("review"));
+        let s = stage(&p, "cliproxy").unwrap();
+        assert_eq!(
+            commit(&p, &s),
+            Ok("Installed plugin cliproxy from cliproxy.".into())
+        );
         assert!(executable(&p.plugins.join("cliproxy/plugin")));
+        assert!(executable(&p.plugins.join("cliproxy/setup")));
         assert!(p.plugins.join("cliproxy/config.example").is_file());
         assert!(add(&p, "cliproxy").is_err());
 
@@ -736,7 +906,11 @@ pub mod tests {
         script(&real, "true");
         std::os::unix::fs::symlink(&real, p.home.join("src/linked")).unwrap();
         let typed = format!("{}/", p.home.join("src/linked").display());
-        assert_eq!(add(&p, &typed), Ok("linked".into()));
+        assert!(
+            add(&p, &typed)
+                .unwrap()
+                .starts_with("Installed plugin linked ")
+        );
         // `.` and `..` are never a name
         let dot = format!("{}/.", src.display());
         assert!(add(&p, &dot).unwrap_err().contains("Bad plugin name"));
@@ -863,6 +1037,208 @@ pub mod tests {
         let t = Instant::now();
         assert!(git(&["ls-remote", "https://127.0.0.1:1/x"]).is_err());
         assert!(t.elapsed() < Duration::from_secs(30), "{:?}", t.elapsed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_then_commit_installs() {
+        let p = tmp("stage");
+        let src = p.home.join("src/mine");
+        script(&src, "true");
+        let s = stage(&p, &src.to_string_lossy()).unwrap();
+        assert_eq!(s.name, "mine");
+        assert_eq!(s.dir, p.plugins.join(".mine.install"));
+        assert_eq!(s.setup, None);
+        assert!(list(&p).is_empty(), "staging is never listed");
+        let msg = commit(&p, &s).unwrap();
+        assert_eq!(
+            msg,
+            format!("Installed plugin mine from {}.", src.display())
+        );
+        assert!(p.plugins.join("mine/plugin").is_file());
+        assert!(!s.dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_with_setup_returns_text_and_installs_nothing() {
+        let p = tmp("stagesetup");
+        let src = p.home.join("src/withsetup");
+        script(&src, "true");
+        fs::write(src.join("setup"), "echo hi\n").unwrap();
+        let s = stage(&p, &src.to_string_lossy()).unwrap();
+        assert_eq!(s.setup.as_deref(), Some("echo hi\n"));
+        assert!(p.plugins.join("withsetup").symlink_metadata().is_err());
+        assert!(list(&p).is_empty());
+        // the copy is exactly the reviewed text, even if setup changes afterwards
+        fs::write(s.dir.join("setup"), "echo evil\n").unwrap();
+        let c = setup_copy(s.setup.as_deref().unwrap()).unwrap();
+        assert_eq!(fs::read_to_string(&c).unwrap(), "echo hi\n");
+        let _ = fs::remove_file(c);
+        abort(&s);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abort_removes_staging() {
+        let p = tmp("abort");
+        let src = p.home.join("src/ab");
+        script(&src, "true");
+        let s = stage(&p, &src.to_string_lossy()).unwrap();
+        assert!(s.dir.is_dir());
+        abort(&s);
+        assert!(s.dir.symlink_metadata().is_err());
+        assert!(src.join("plugin").is_file());
+        // a staging that is a link loses only the link
+        let real = p.home.join("real");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("keep"), "x").unwrap();
+        std::os::unix::fs::symlink(&real, &s.dir).unwrap();
+        abort(&s);
+        assert!(s.dir.symlink_metadata().is_err());
+        assert!(real.join("keep").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_link_is_refused() {
+        let p = tmp("setuplink");
+        let d = p.home.join("d");
+        fs::create_dir_all(&d).unwrap();
+        assert_eq!(setup_text(&d), Ok(None));
+        fs::write(p.home.join("elsewhere"), "echo x\n").unwrap();
+        std::os::unix::fs::symlink(p.home.join("elsewhere"), d.join("setup")).unwrap();
+        assert_eq!(setup_text(&d), Err("setup is a link: not run".into()));
+        fs::remove_file(d.join("setup")).unwrap();
+        fs::create_dir_all(d.join("setup")).unwrap();
+        assert_eq!(setup_text(&d), Err("setup is a link: not run".into()));
+        // a source whose setup is a link is refused and leaves nothing behind
+        let src = p.home.join("src/lnk");
+        script(&src, "true");
+        std::os::unix::fs::symlink(p.home.join("elsewhere"), src.join("setup")).unwrap();
+        assert_eq!(
+            stage(&p, &src.to_string_lossy()).unwrap_err(),
+            "setup is a link: not run"
+        );
+        assert!(p.plugins.join(".lnk.install").symlink_metadata().is_err());
+        assert!(p.plugins.join("lnk").symlink_metadata().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_staging_is_replaced() {
+        let p = tmp("stale");
+        let src = p.home.join("src/st");
+        script(&src, "true");
+        let stale = p.plugins.join(".st.install");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("junk"), "x").unwrap();
+        let s = stage(&p, &src.to_string_lossy()).unwrap();
+        assert!(!s.dir.join("junk").exists());
+        assert!(s.dir.join("plugin").is_file());
+        commit(&p, &s).unwrap();
+        // never overwrites an installed plugin
+        assert!(
+            stage(&p, &src.to_string_lossy())
+                .unwrap_err()
+                .contains("already")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dot_folders_are_never_listed() {
+        let p = tmp("dot");
+        script(&p.plugins.join(".x.install"), "true");
+        script(&p.plugins.join(".hidden"), "true");
+        script(&p.plugins.join("seen"), "true");
+        let names: Vec<String> = list(&p).into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["seen"]);
+    }
+
+    #[test]
+    fn available_lists_bundled_not_installed_with_about() {
+        let p = tmp("avail");
+        let a = available(&p);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].name, "cliproxy");
+        assert_eq!(
+            a[0].about,
+            "Claude Code through CLIProxyAPI: all accounts as one"
+        );
+        assert!(a[0].has_setup);
+        let s = stage(&p, "cliproxy").unwrap();
+        commit(&p, &s).unwrap();
+        assert!(p.plugins.join("cliproxy/about").is_file());
+        assert!(available(&p).is_empty());
+        // about: first line, control chars gone (TAB stays), 60 chars
+        let d = p.home.join("ab");
+        fs::create_dir_all(&d).unwrap();
+        assert_eq!(about(&d), "");
+        fs::write(
+            d.join("about"),
+            format!("a\tb\x1b[1m\r{}\nsecond\n", "é".repeat(70)),
+        )
+        .unwrap();
+        let want = format!("a\tb[1m{}", "é".repeat(54));
+        assert_eq!(about(&d), want);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_reports_setup_changed() {
+        let p = tmp("upsetup");
+        let repo = p.home.join("repo/up");
+        script(&repo, "true");
+        fs::write(repo.join("setup"), "echo one\n").unwrap();
+        let g = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(["-C", &repo.to_string_lossy()])
+                    .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            )
+        };
+        g(&["init", "-q"]);
+        g(&["add", "."]);
+        g(&["commit", "-qm", "one"]);
+        let url = format!("file://{}", repo.display());
+        fs::create_dir_all(&p.plugins).unwrap();
+        clone(&url, &p.plugins.join("up")).unwrap();
+        fs::write(repo.join("other"), "o").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "two"]);
+        let out = update(&p, "up").unwrap();
+        assert!(!out.contains("setup changed"), "{out}");
+        fs::write(repo.join("setup"), "echo two\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "three"]);
+        let out = update(&p, "up").unwrap();
+        assert!(
+            out.ends_with(" · setup changed: run setup again to apply"),
+            "{out}"
+        );
+        // never run by itself
+        assert_eq!(
+            fs::read_to_string(p.plugins.join("up/setup")).unwrap(),
+            "echo two\n"
+        );
+    }
+
+    #[test]
+    fn backup_config_copies_config() {
+        let p = tmp("bak");
+        let d = p.home.join("pl");
+        fs::create_dir_all(&d).unwrap();
+        backup_config(&d).unwrap();
+        assert!(!d.join("config.bak").exists());
+        fs::write(d.join("config"), "k=v\n").unwrap();
+        backup_config(&d).unwrap();
+        assert_eq!(fs::read_to_string(d.join("config.bak")).unwrap(), "k=v\n");
     }
 
     #[cfg(unix)]

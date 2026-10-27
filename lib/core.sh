@@ -138,7 +138,9 @@ ai failover auto [on|off]        at a limit, move by itself after a countdown (o
 ai trust [on|off|status]         share folder trust between agents (off by default)
 ai plugin ls                     user plugins: their own picker section, never in failover
 ai plugin add <src> [name]       install from a folder, a git URL / owner/repo, or bundled (cliproxy)
+ai plugin new <name>             start a new plugin from the template
 ai plugin update [name]          git pull the plugins installed from git
+ai plugin setup <name>           run its setup again (you read and approve it first)
 ai plugin rm|on|off <name>       delete / turn on / turn off (off = never run)
 ai plugin do <name> <action>     run one of its actions (30 s limit)
 cla [name] [team] [args]         Claude accounts: pick or start one   (cla add|ls|rm|mv)

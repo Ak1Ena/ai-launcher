@@ -50,7 +50,7 @@ It reads and writes the same config as the bash `ai` (providers file, failover o
 | `w` | switch between failover and weighted round-robin |
 | `s` | at a limit: auto-switch after a countdown, or ask y/N (default); shown as `switch: auto` / `switch: ask` in the title bar (click it to toggle); turning it off stops a running countdown, which then waits for `y` |
 | `+` `-` | round-robin: raise / lower the account's weight (0 to 99, default 1; 0 is never picked) |
-| `n` | round-robin: open the next account (or click `▶ Auto`) |
+| `n` | round-robin: open the next account (or click `› Auto`) |
 | `m` | set the Auto decision model |
 | `r` | clear the account's limit |
 | `x` | close the current tab (highlighted in the tab bar) |
@@ -58,7 +58,7 @@ It reads and writes the same config as the bash `ai` (providers file, failover o
 | `tab` | next tab |
 | `q` / `ctrl-c` | quit |
 
-Routing mode (`w`, or click the mode label in the title bar) is saved in `<failover file>.mode`. In failover mode the list is a priority order. In round-robin mode each account shows `×weight`, and `n` (or `▶ Auto`) opens the next account in a new tab by smooth weighted round-robin: with weights 3 and 1 you get A A B A (then it repeats). Accounts that are off, weight 0 or limited are skipped. Weights are saved in `<failover file>.weights` and the rotation in `$AI_FO_STATE/wrr`, so it continues after a restart.
+Routing mode (`w`, or click the mode label in the title bar) is saved in `<failover file>.mode`. In failover mode the list is a priority order. In round-robin mode each account shows `×weight`, and `n` (or `› Auto`) opens the next account in a new tab by smooth weighted round-robin: with weights 3 and 1 you get A A B A (then it repeats). Accounts that are off, weight 0 or limited are skipped. Weights are saved in `<failover file>.weights` and the rotation in `$AI_FO_STATE/wrr`, so it continues after a restart.
 
 Optionally let a model choose instead: press `m` and enter a model name (for example `haiku`; empty means plain round-robin). Auto then runs `claude -p --model <model>` on one of your free Claude accounts, with each account's weight and usage, in the background (20 second timeout, the UI keeps working). If it fails, times out or answers with anything but an account name, the round-robin pick is used. The model name is saved in `<failover file>.model`. This is the only thing the tool asks a model; it uses your own `claude` login and counts against its plan. Bash `ai` ignores these files.
 
@@ -79,10 +79,10 @@ On macOS, alt (⌥) keys need "Option as Meta" turned on in the terminal setting
 | click a tab (or `✻ home`) | go to it |
 | click a tab's `✕` | close it |
 | click an account | select it; click it again to open it |
-| `+ Add` / `✎ Edit` / `✕ Delete` | add, edit or delete the selected account |
+| `+ Add` / `✎ Edit` / `× Delete` | add, edit or delete the selected account |
 | Failover switch (title bar) | failover on / off |
 | Mode label (title bar, `mode: …`) | failover / round-robin |
-| `▶ Auto` (round-robin mode) | open the next account |
+| `› Auto` (round-robin mode) | open the next account |
 | wheel | scroll a CLI's output (unless the CLI uses the mouse itself) |
 
 In a tab, every key goes to the CLI except these:
@@ -276,7 +276,9 @@ ai plugin add cliproxy                 # a bundled plugin, by name
 ai plugin add ~/code/my-plugin         # a local folder (copied in)
 ai plugin add owner/repo               # a git repo (GitHub shorthand)
 ai plugin add https://example.com/x/y.git [name]   # or any https git URL
-ai plugin ls                           # installed plugins, on/off, section title, source
+ai plugin new <name>                   # start a plugin from the template (see "Writing a plugin")
+ai plugin ls                           # installed plugins, on/off, section title, source; then the bundled ones not installed (available)
+ai plugin setup <name>                 # review and run an installed plugin's setup again
 ai plugin update [name]                # git pull --ff-only for git plugins (all when no name)
 ai plugin off <name>                   # stop it without removing it (on: start again)
 ai plugin rm <name>                    # asks [y/N], deletes the folder (a symlink loses only the link)
@@ -285,11 +287,25 @@ ai plugin do <name> <action>           # run one of the plugin's actions
 
 `add` looks at its argument in this order: a bundled name, then an existing local folder, then a git source. Git sources are HTTPS only: an `https://` URL, or `owner/repo`, which becomes `https://github.com/owner/repo.git`. It never overwrites an installed plugin and refuses a folder without an executable `plugin`. New plugins start on, and `add` runs the plugin's `rows` once right away (macOS scans a new script on its first run, which can take seconds). Git needs `git`. The TUI's `p` form follows the same rules and expands a leading `~/`.
 
-TUI keys on a plugin row: `a` actions, `o` on/off, `u` update, `d` delete, `e` show its folder. `p` (or the `+ Plugin` button) adds a plugin from anywhere on home. On a plugin row, `a`, `d` and `e` are plugin actions; adding an account stays on the button and on other rows.
+**Setup scripts.** A plugin may ship an optional `setup` file for the work that must happen once (install a tool, make keys, log in). `add` first copies the plugin into a hidden staging folder `.<name>.install` (never listed, never run), then shows you the whole `setup` with line numbers, control bytes as `^X`. Only after you approve (`y`) does it run, once, with your terminal, in the plugin folder, with `AI_PLUGIN_DIR` set. What you read is a copy, and the copy is what runs. If you say no, or setup exits non-zero, or you press Ctrl-C, the staging folder is deleted and nothing is installed (`setup failed (exit N): plugin not installed`). `ai plugin setup <name>` does the same for an installed plugin; a failure there keeps the plugin, and `config` is saved as `config.bak` first. `setup` must be a regular file, never a link. `update` never runs setup: it only says `setup changed: run setup again to apply`. In tests only, `AI_YES=1` approves the review without asking (and `rm` without asking).
 
-`P` (or the `⚙ Plugins` button) opens the Plugins window: every installed plugin with its state, source (`bundled`, its https URL, or `local`) and status (`ok`, `failed`, `off`, `loading…`). In it: `o` on/off, `u` update, `d` remove, Enter or `a` actions, `+` / `p` add, Esc closes.
+`ai plugin new <name>` copies `templates/plugin/` into the plugins folder and does not run its setup. `ai plugin ls` ends with an `available` list: bundled plugins not installed yet, with `(has setup)` when they need one.
+
+TUI keys on a plugin row: `a` actions, `o` on/off, `u` update, `d` delete, `e` show its folder. `p` (or the `+ Plugin` button) opens the Plugins screen with its add form, from anywhere on home. On a plugin row, `a`, `d` and `e` are plugin actions; adding an account stays on the button and on other rows.
+
+`P` (or the `Plugins` button) opens the Plugins screen: installed plugins (name, `about` or title, status `● ok` / `× failed` / `·` off / `loading…`, on/off, `actions`, `↻ update` for git plugins, `[-]`), then bundled plugins not installed yet (`has setup`, `[+]`), then `[+ Add from git / folder]`. In it: Enter actions, space or `o` on/off, `u` update, `-` remove (asks first), `+` installs the bundled plugin under the cursor or opens the add form, `/` searches names and `about` text. Esc closes the innermost thing: the add form, the search text, then the screen. Every `[+]`, `[-]`, `actions`, `↻ update` and on/off is clickable. `s` runs the setup of the plugin under the cursor again.
+
+**Review in the TUI.** Installing a plugin that has a `setup` (`+` / `[+]` / the add form) opens the review over the Plugins screen: the whole script, numbered, long lines wrapped, invisible characters shown as `<U+XXXX>`. Enter (or `[ Approve and install ]`) approves, Esc cancels, arrows and PgUp / PgDn scroll. Approve is ignored for 0.7 s after the review opens, so a stray key cannot approve it, and a window too small to show the buttons refuses approval. Approved, the script runs in its own tab. Closing that tab counts as a failure (`setup failed (tab closed): plugin not installed`). If you are not in the Plugins screen when a staged install is ready, a message says `<name> ready to review: open Plugins`. `-` refuses while a plugin is busy (installing, in review or running setup). The review opens only inside the Plugins screen.
 
 ### Writing a plugin
+
+For developers and AI agents. Quick start:
+
+```bash
+ai plugin new demo          # copies templates/plugin/ to ~/.config/ai-launcher/plugins/demo/
+$EDITOR ~/.config/ai-launcher/plugins/demo/plugin
+ai                          # the demo section shows up in the picker
+```
 
 `ai` runs `plugin <command>` in your current folder, with no tty and the env var `AI_PLUGIN_DIR` set to the plugin's folder (keep config and cache there). On Windows it runs `bash <dir>/plugin`.
 
@@ -304,17 +320,39 @@ An entry `<id>` is letters, digits, `.`, `_` or `-`. Status and detail text is p
 
 Two marker files sit in the plugin folder. `.off` (empty) turns it off: it is never run, and its section shows `<name> · off`. `.source` holds the git URL it was installed from, used by `update`. A plugin is code you chose to run, with your permissions, so install only plugins you trust. `ai plugin add|update` with a git source is the only time `ai` touches the network for plugins; everything else is up to the plugin.
 
+**`setup` contract** (optional file, same folder as `plugin`):
+
+- A regular file, not a link. It runs once, with a tty, only after the user reads and approves it.
+- `AI_PLUGIN_DIR` is set and it runs in that folder. Keep state in files relative to it.
+- Exit 0 means installed. Anything else means failed: a new install is removed, an existing plugin is kept.
+- It must be safe to run again (`ai plugin setup <name>`): check before you change anything, and never overwrite user config.
+- It is shown in full before it runs, so keep it readable, without hidden or control characters.
+
+**`about` contract** (optional file): the first line is a short description (60 characters, control characters dropped). It is shown in the Plugins screen, in `ai plugin ls` and in the available list.
+
+**Rules for `plugin`:**
+
+- `rows` and `actions` are fast and never prompt (no tty, 2 s limit). Cache anything slow.
+- Plain text only. Never print secrets (keys, tokens, URLs with credentials).
+- No network in `rows` unless the plugin's purpose needs it, and then cache the answer.
+- Keep config and cache under `AI_PLUGIN_DIR`, with mode 600 for anything secret.
+
+**Test by hand:** `AI_PLUGIN_DIR=$PWD ./plugin rows` (also `actions`, `do <action>`). For setup, run `AI_PLUGIN_DIR=$PWD bash setup` twice. For a fuller check, build a fake environment like `tests/cliproxy.sh` does: a temporary `$HOME`, a fake proxy or fake commands first on `PATH`, never real config.
+
+**Publish:** put `plugin` (and optionally `setup`, `about`) at the top of a git repo; others install it with `ai plugin add owner/repo`.
+
 ### cliproxy
 
 The bundled `cliproxy` plugin starts Claude Code through [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), a local proxy that holds several logins (Claude, Codex, Gemini...) and spreads requests across them. You get one row, "Claude Code · all accounts", that works like one more account for all of them together. The failover section stays as it is.
 
-Needs CLIProxyAPI installed, logged in and running (`brew services start cliproxyapi`); the plugin does not install it or log in for you. It also needs `curl`, and `jq` for the usage lines.
+`ai plugin add cliproxy` runs its setup after you review it (again later with `ai plugin setup cliproxy`, the way to add accounts):
 
-```bash
-export CLIPROXY_API_KEY=...    # a client key from the proxy's config
-export CLIPROXY_MGMT_KEY=...   # its management key (only for the usage lines)
-ai plugin add cliproxy
-```
+1. **Install.** Uses `cliproxyapi` on `PATH`, brew's, the plugin's own `bin/` copy, or a proxy already answering at `url`. Otherwise it offers `brew install cliproxyapi`, or without brew downloads the latest release for your OS into `plugins/cliproxy/bin/` after checking it against the release's `checksums.txt` (and fills `start_cmd` / `stop_cmd`). Choosing "myself" prints the command and stops. Setup never installs Homebrew.
+2. **Keys.** Makes a client key and a management key once and keeps them in `config` (mode 600). It edits the proxy's `config.yaml` (brew: `$(brew --prefix)/etc/cliproxyapi.conf`, else `plugins/cliproxy/run/config.yaml`) only to fill an empty `secret-key` and to add a client key when there is none; it backs the file up once to `config.yaml.ai-launcher.bak`. A proxy that already has a management key asks you to paste it (after trying `CLIPROXY_MGMT_KEY`); existing client keys stay, and the new one is appended through the management API. A proxy that is already running with a config setup does not know asks for that config's path or for its two keys. Every key you give is checked against the proxy before it is saved (3 tries), and setup says ready only when the client key works. A proxy config that setup itself just created or installed (the stock brew config, or `run/config.yaml`) loses its sample `your-api-key-*` keys and listens on 127.0.0.1 only; a config that was already there is never touched except for the key edits above, and is backed up first. If setup fails after starting the proxy, it stops it again.
+3. **Accounts.** A checklist of your `cla` accounts and Codex providers; each ticked one gets a fresh login for the proxy (`-claude-login`, `-codex-device-login`). Setup never copies the tokens of your `cla` or Codex accounts: the proxy keeps its own refreshable login, and sharing one token between two tools would make each refresh log the other out. Accounts the proxy already has are kept.
+4. **Start.** Starts the proxy if it is down, then sets failover mode and session affinity.
+
+It needs `curl`, and `jq` for accounts and the usage lines. To set it up by hand instead, export `CLIPROXY_API_KEY` (a client key from the proxy's config) and `CLIPROXY_MGMT_KEY` (its management key).
 
 The first `rows` call creates `plugins/cliproxy/config` (mode 600). It is read as `key=value` lines, never run as a script:
 
@@ -323,7 +361,8 @@ The first `rows` call creates `plugins/cliproxy/config` (mode 600). It is read a
 | `url` | `http://127.0.0.1:8317` | Where the proxy listens |
 | `key_env` / `key` | `CLIPROXY_API_KEY` | Env var holding the client key, or the key itself (`key` wins) |
 | `mgmt_key_env` / `mgmt_key` | `CLIPROXY_MGMT_KEY` | Same, for the management key |
-| `start_cmd` / `stop_cmd` | none | Commands for the start / stop actions when brew has no `cliproxyapi` (run with `bash -c`) |
+| `start_cmd` / `stop_cmd` | none | Commands for the start / stop actions when brew has no `cliproxyapi` (run with `bash -c` in the plugin folder) |
+| `proxy_config` | set by setup | The proxy's `config.yaml` that setup edits (a relative path is inside the plugin folder) |
 | `mode` | `failover` | `failover` or `balance`: how the "all accounts" row uses accounts (see below) |
 
 Each line is `key=value`. A ` #` (space then `#`) or tab then `#` starts a comment, and a line starting with `#` is skipped. Quotes are not removed: `key="abc"` gives the key `"abc"` with the quotes.

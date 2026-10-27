@@ -369,13 +369,20 @@ ok "plugins: CR and control chars stripped" 'echo "$crow" | plain | grep -q "Al\
 rm -rf "$PL/sec" "$PL/crl"
 mkdir -p "$T/src/myp" "$T/src/noplug" "$T/keepplug"; printf '#!/bin/sh\necho mine\n' > "$T/src/myp/plugin"; chmod +x "$T/src/myp/plugin"
 AI() { "$REPO/bin/ai" "$@"; }
+# cliproxy's setup against fakes (no network, no real brew): a brew without cliproxyapi, a cliproxyapi whose start
+# marks the proxy up, and a curl whose probe is up after that start and whose API calls answer 200
+mkdir -p "$T/cpfake"
+printf '#!/bin/sh\ntouch "%s/cpup"\n' "$T" > "$T/cpfake/cliproxyapi"
+printf '#!/bin/sh\ncase " $* " in *" -w "*) printf "\\n200" ;; *) [ -e "%s/cpup" ] ;; esac\n' "$T" > "$T/cpfake/curl"
+printf '#!/bin/sh\nexit 1\n' > "$T/cpfake/brew"; chmod +x "$T"/cpfake/*
+AIcp() { rm -f "$T/cpup"; PATH=$T/cpfake:$PATH AI_YES=1 CLIPROXY_SETUP_ACCOUNTS=none AI "$@" </dev/null; }
 ok "plugin add: local folder" 'AI plugin add "$T/src/myp/" >/dev/null 2>&1 && [ -x "$PL/myp/plugin" ] && [ ! -e "$PL/myp/.source" ]'
 mkdir -p "$T/src/real"; cp "$T/src/myp/plugin" "$T/src/real/"; ln -s real "$T/src/lnkp"
 ok "plugin add: symlinked folder copies contents" 'AI plugin add "$T/src/lnkp" >/dev/null 2>&1 && [ -d "$PL/lnkp" ] && [ ! -L "$PL/lnkp" ] && [ -x "$PL/lnkp/plugin" ]; rm -rf "$PL/lnkp"'
 echo changed > "$T/src/myp/plugin"
 ok "plugin add: refuses to overwrite" '! AI plugin add "$T/src/myp" >/dev/null 2>&1 && grep -q mine "$PL/myp/plugin"'
 ok "plugin add: refuses a folder without plugin" '! AI plugin add "$T/src/noplug" >/dev/null 2>&1 && [ ! -e "$PL/noplug" ]'
-ok "plugin add: bundled cliproxy" 'AI plugin add cliproxy >/dev/null 2>&1 && [ -x "$PL/cliproxy/plugin" ]'
+ok "plugin add: bundled cliproxy" 'AIcp plugin add cliproxy >/dev/null 2>&1 && [ -x "$PL/cliproxy/plugin" ] && grep -q "^mgmt_key=" "$PL/cliproxy/config" && grep -qx proxy_config=run/config.yaml "$PL/cliproxy/config"'
 mkdir -p "$T/src/ran"; printf '#!/bin/sh\ntouch "%s/ran.rows"\n' "$T" > "$T/src/ran/plugin"; chmod +x "$T/src/ran/plugin"
 ok "plugin add: runs rows once at install" 'AI plugin add "$T/src/ran" >/dev/null 2>&1 && [ -e "$T/ran.rows" ]'
 mkdir -p "$T/src/bad.name"; cp "$T/src/ran/plugin" "$T/src/bad.name/"
@@ -394,6 +401,8 @@ if has git; then
   printf '#!/bin/sh\necho v2\n' > "$G/plugin"; git -C "$G" -c user.email=t@example.com -c user.name=t commit -qam v2; git -C "$G" push -q "$T/g.git" HEAD 2>/dev/null
   ok "plugin update: pulls" 'AI plugin update gp >/dev/null 2>&1 && grep -q v2 "$PL/gp/plugin"'
   ok "plugin add: git name from url with trailing slash" 'AI plugin add "file://$T/g.git/" >/dev/null 2>&1 && [ -x "$PL/g/plugin" ]; rm -rf "$PL/g"'
+  printf 'true\n' > "$G/setup"; git -C "$G" add setup; git -C "$G" -c user.email=t@example.com -c user.name=t commit -qm setup; git -C "$G" push -q "$T/g.git" HEAD 2>/dev/null
+  ok "setup: update says setup changed" 'AI plugin update gp 2>&1 | grep -qx "setup changed: run setup again to apply" && ! AI plugin update gp 2>&1 | grep -q "setup changed"'
 fi
 ok "plugin off/on writes .off" 'AI plugin off myp >/dev/null && [ -e "$PL/myp/.off" ] && AI plugin on myp >/dev/null && [ ! -e "$PL/myp/.off" ]'
 mkdir -p "$PL/usr"; printf '#!/bin/sh\n:\n' > "$PL/usr/plugin"; chmod +x "$PL/usr/plugin"; echo "https://bob:s3cret@example.com/x.git" > "$PL/usr/.source"
@@ -424,7 +433,52 @@ o=$(_ai_plugin_add https://tokentok@127.0.0.1:9/x.git leak 2>&1); rm -rf "$PL/le
 ok "plugins: add never prints the URL token" '! echo "$o" | grep -q tokentok && echo "$o" | grep -q "git clone failed"'
 ok "plugins: sanitizer strips userinfo anywhere" '[ "$(echo "x '"'"'https://u:tokentok@h/p'"'"' y" | _ai_plugin_nouser)" = "x '"'"'https://h/p'"'"' y" ]'
 
+# ── plugin setup scripts: review, staging, rollback ──
+mksetup() { mkdir -p "$T/src/$1"; printf '#!/bin/sh\necho hi\n' > "$T/src/$1/plugin"; chmod +x "$T/src/$1/plugin"; printf '%s\n' "$2" > "$T/src/$1/setup"; }
+okset='echo "cfg $(date +%s%N)" >"$AI_PLUGIN_DIR/config"; pwd >"'"$T"'/setup.log"'
+mksetup withsetup "$okset"
+o=$(AI_YES=1 _ai_plugin_add "$T/src/withsetup" 2>&1)
+ok "setup: approved runs in staging, then installs" '[ -f "$PL/withsetup/config" ] && case $(cat "$T/setup.log") in */.withsetup.install) true;; *) false;; esac && [ ! -e "$PL/.withsetup.install" ] && echo "$o" | grep -q "SETUP SCRIPT · review before running"'
+mksetup withsetup2 "$okset"
+ok "setup: refused leaves nothing" '! echo n | _ai_plugin_add "$T/src/withsetup2" >/dev/null 2>&1 && [ ! -e "$PL/withsetup2" ] && [ ! -e "$PL/.withsetup2.install" ] && [ "$(echo n | _ai_plugin_add "$T/src/withsetup2" 2>&1 | tail -1)" = "cancelled: plugin not installed" ]'
+mksetup failset 'exit 3'
+o=$(AI_YES=1 _ai_plugin_add "$T/src/failset" 2>&1); rc=$?
+ok "setup: failing setup leaves nothing" '[ $rc != 0 ] && echo "$o" | grep -qx "setup failed (exit 3): plugin not installed" && [ ! -e "$PL/failset" ] && [ ! -e "$PL/.failset.install" ]'
+mksetup lnkset x; rm "$T/src/lnkset/setup"; printf 'touch "%s/evil.ran"\n' "$T" > "$T/evil"; ln -s "$T/evil" "$T/src/lnkset/setup"
+o=$(AI_YES=1 _ai_plugin_add "$T/src/lnkset" 2>&1)
+ok "setup: a linked setup is never run" 'echo "$o" | grep -qx "setup is a link: not run" && [ ! -e "$T/evil.ran" ] && [ ! -e "$PL/lnkset" ] && [ ! -e "$PL/.lnkset.install" ]'
+printf 'printf "\\033[2J"\n\033[2Jboom\n' > "$T/escset"
+o=$(_ai_plugin_review "$T/escset")
+ok "setup: review escapes control bytes" 'case $o in *"^[[2Jboom"*) true;; *) false;; esac && ! printf "%s" "$o" | grep -q "$(printf "\033")" && echo "$o" | grep -q "^ *2 "'
+mksetup withsetup3 "$okset"; mkdir -p "$PL/.withsetup3.install"; touch "$PL/.withsetup3.install/junk" "$PL/.withsetup3.install/plugin"
+ok "setup: stale staging is replaced" 'AI_YES=1 _ai_plugin_add "$T/src/withsetup3" >/dev/null 2>&1 && [ -f "$PL/withsetup3/config" ] && [ ! -e "$PL/withsetup3/junk" ] && [ ! -e "$PL/.withsetup3.install" ]'
+mkdir -p "$PL/.dotted"; cp "$T/src/withsetup/plugin" "$PL/.dotted/"
+ok "setup: dot folders are never plugins" '! _ai_plugin_names | grep -q "^\."; rm -rf "$PL/.dotted"'
+cp "$PL/withsetup/config" "$T/config.prev"; sleep 1
+ok "setup: plugin setup reruns and keeps config.bak" 'AI_YES=1 AI plugin setup withsetup >/dev/null 2>&1 && cmp -s "$PL/withsetup/config.bak" "$T/config.prev" && ! cmp -s "$PL/withsetup/config" "$T/config.prev" && [ "$(cat "$T/setup.log")" = "$PL/withsetup" ]'
+printf 'exit 4\n' > "$PL/withsetup/setup"
+ok "setup: failed rerun keeps the plugin" '[ "$(AI_YES=1 AI plugin setup withsetup 2>&1 | tail -1)" = "setup failed (exit 4)" ] && [ -x "$PL/withsetup/plugin" ]'
+ok "setup: refused rerun runs nothing" 'printf "touch %s/rerun.ran\n" "$T" > "$PL/withsetup/setup" && ! AI plugin setup withsetup <<<n >/dev/null 2>&1 && [ ! -e "$T/rerun.ran" ]'
+printf 'touch %s/bak.ran\n' "$T" > "$PL/withsetup/setup"; rm -f "$PL/withsetup/config.bak"; : > "$PL/withsetup/config.bak"; chmod 400 "$PL/withsetup/config.bak"
+ok "setup: a failed config backup stops before setup" '! AI_YES=1 AI plugin setup withsetup >/dev/null 2>&1 && [ ! -e "$T/bak.ran" ]; r=$?; chmod 600 "$PL/withsetup/config.bak"; rm -f "$PL/withsetup/config.bak"; [ $r = 0 ]'
+ok "setup: plugin setup needs a setup" '! AI plugin setup myp >/dev/null 2>&1 && ! AI plugin setup nope >/dev/null 2>&1'
+mksetup sleepy 'touch "'"$T"'/setup.started"; sleep 30'; mkdir -p "$T/tmpx"
+( set -m; TMPDIR=$T/tmpx AI_YES=1 "$REPO/bin/ai" plugin add "$T/src/sleepy" >"$T/int.out" 2>&1 & p=$!
+  i=0; while [ ! -e "$T/setup.started" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  kill -INT -- -$p; wait $p ) 2>/dev/null
+ok "setup: interrupt removes staging and the temp copy" '[ -e "$T/setup.started" ] && [ ! -e "$PL/sleepy" ] && [ ! -e "$PL/.sleepy.install" ] && grep -qx "setup failed (exit 130): plugin not installed" "$T/int.out" && [ -z "$(ls -A "$T/tmpx")" ]'
+
+# plugin new, about, available list
+ok "plugin new: creates a working plugin" 'AI plugin new demo >/dev/null 2>&1 && [ -x "$PL/demo/plugin" ] && [ -x "$PL/demo/setup" ] && "$PL/demo/plugin" rows | head -1 | grep -q "^section${TAB}" && _ai_plugin_rows demo | cut -f1,2 | grep -q "^plugin:demo${TAB}hello"'
+cp -R "$PL/demo" "$T/demo.bak"
+ok "plugin new: refuses existing and bad names" '! AI plugin new demo >/dev/null 2>&1 && ! AI plugin new "a b" >/dev/null 2>&1 && diff -r "$PL/demo" "$T/demo.bak" >/dev/null'
+lsout=$(AI plugin ls 2>&1 | plain)
+ok "plugin ls: lists available bundled with about" 'echo "$lsout" | grep -A3 "^available" | grep -q "cliproxy.*Claude Code through CLIProxyAPI: all accounts as one (has setup)"'
+ok "plugin ls: installed bundled leaves available" 'AIcp plugin add cliproxy >/dev/null 2>&1 && AI plugin ls 2>&1 | plain | grep -q "no other bundled plugins"'
+AI_PLUGIN_DIR=$PL/demo "$PL/demo/setup" >/dev/null 2>&1; cp "$PL/demo/config" "$T/demo.cfg"
+ok "template setup is safe to run twice" 'AI_PLUGIN_DIR=$PL/demo "$PL/demo/setup" >/dev/null 2>&1 && cmp -s "$PL/demo/config" "$T/demo.cfg"'
+
 # the bundled cliproxy plugin has its own suite (fake proxy, fake HOME)
-ok "cliproxy plugin suite" 'bash "$REPO/tests/cliproxy.sh" >/dev/null 2>&1'
+ok "cliproxy plugin suite" 'cpo=$(bash "$REPO/tests/cliproxy.sh" 2>&1) || { echo "$cpo" | grep -A3 "^FAIL" >&2; false; }'
 
 echo; if [ $fails -gt 0 ]; then echo "$fails failed"; exit 1; else echo "all passed"; fi
