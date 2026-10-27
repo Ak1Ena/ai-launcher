@@ -17,10 +17,15 @@ pub const DO_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The bundled cliproxy plugin, shipped inside the binary (npm has no repo): file, text, executable.
-const CLIPROXY: [(&str, &str, bool); 3] = [
+const CLIPROXY: [(&str, &str, bool); 4] = [
     (
         "plugin",
         include_str!("../../plugins-extra/cliproxy/plugin"),
+        true,
+    ),
+    (
+        "setup",
+        include_str!("../../plugins-extra/cliproxy/setup"),
         true,
     ),
     (
@@ -877,11 +882,15 @@ pub mod tests {
                 .contains("already")
         );
 
+        // cliproxy ships a setup: add refuses, stage + commit (after review) installs
+        assert!(add(&p, "cliproxy").unwrap_err().contains("review"));
+        let s = stage(&p, "cliproxy").unwrap();
         assert_eq!(
-            add(&p, "cliproxy"),
+            commit(&p, &s),
             Ok("Installed plugin cliproxy from cliproxy.".into())
         );
         assert!(executable(&p.plugins.join("cliproxy/plugin")));
+        assert!(executable(&p.plugins.join("cliproxy/setup")));
         assert!(p.plugins.join("cliproxy/config.example").is_file());
         assert!(add(&p, "cliproxy").is_err());
 
@@ -1157,8 +1166,9 @@ pub mod tests {
             a[0].about,
             "Claude Code through CLIProxyAPI: all accounts as one"
         );
-        assert_eq!(a[0].has_setup, CLIPROXY.iter().any(|f| f.0 == "setup"));
-        add(&p, "cliproxy").unwrap();
+        assert!(a[0].has_setup);
+        let s = stage(&p, "cliproxy").unwrap();
+        commit(&p, &s).unwrap();
         assert!(p.plugins.join("cliproxy/about").is_file());
         assert!(available(&p).is_empty());
         // about: first line, control chars gone (TAB stays), 60 chars

@@ -3440,11 +3440,11 @@ esac"#;
 
     #[cfg(unix)]
     #[test]
-    fn plus_on_available_without_setup_installs() {
+    fn plus_on_available_with_setup_opens_review() {
         let mut a = plugin_app();
         key(&mut a, KeyCode::Char('P'));
         let at = names_of(&a).iter().position(|n| n == "+cliproxy").unwrap();
-        let has_setup = a.available[0].has_setup;
+        assert!(a.available[0].has_setup);
         let (_, hits) = screen(&a);
         let plus = hits
             .plugin_btns
@@ -3455,24 +3455,15 @@ esac"#;
         click(&mut a, &hits, plus.x, plus.y);
         let done = |a: &App| flash(a).contains("Installed") || review(a).is_some();
         settle(&mut a, done);
-        let installed = a.paths.plugins.join("cliproxy/plugin").is_file();
-        // the bundled one gains a setup later: then it waits for the review screen
-        assert_eq!(installed, !has_setup, "{}", flash(&a));
-        if has_setup {
-            assert!(review(&a).is_some(), "{}", flash(&a));
-        } else {
-            assert!(
-                flash(&a).contains("Installed plugin cliproxy"),
-                "{}",
-                flash(&a)
-            );
-            assert!(a.available.is_empty());
+        assert!(review(&a).is_some(), "{}", flash(&a));
+        // staged only: nothing installed until the review is approved
+        assert!(!a.paths.plugins.join("cliproxy/plugin").exists());
+        assert!(a.paths.plugins.join(".cliproxy.install/setup").is_file());
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = fs::metadata(a.paths.plugins.join(".cliproxy.install/setup")).unwrap();
+            assert_eq!(m.permissions().mode() & 0o111, 0o111);
         }
-        // staging waits only while its review is open
-        assert_eq!(
-            a.paths.plugins.join(".cliproxy.install").exists(),
-            has_setup
-        );
         assert!(a.plugins_win.is_some());
     }
 
