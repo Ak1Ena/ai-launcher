@@ -3,10 +3,11 @@
 //! one-line usage status; then modal windows (forms, failover notices). `draw` returns where
 //! everything clickable landed, for the mouse.
 
-use crate::app::{App, Modal, Notice};
+use crate::app::{App, Item, Modal, Notice, PluginsWin};
 use crate::config::Kind;
 use crate::form::{Confirm, Form, Input};
 use crate::usage;
+use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -31,7 +32,7 @@ pub enum Button {
     Add,
     /// install a plugin
     AddPlugin,
-    /// the plugins window
+    /// the Plugins screen
     Plugins,
     Edit,
     Delete,
@@ -57,8 +58,10 @@ pub struct Hits {
     pub switches: Vec<(Rect, usize)>,
     /// each plugin section's on/off pill, by plugin name
     pub plugins: Vec<(Rect, String)>,
-    /// the plugins window's rows, by index into `app.plugins`
+    /// the Plugins screen's rows, by index into `app.plugins_items()`
     pub plugin_rows: Vec<(Rect, usize)>,
+    /// the Plugins screen's clickable cells: the row they act on and the key they press
+    pub plugin_btns: Vec<(Rect, usize, KeyCode)>,
     /// form fields by index; `fields.len()` is the Save button
     pub fields: Vec<(Rect, usize)>,
     pub pane: Rect,
@@ -122,8 +125,8 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
             footer(f, app, bottom);
         }
     }
-    if let Some(sel) = app.plugins_win {
-        plugins_window(f, app, sel, f.area(), &mut hits);
+    if let Some(w) = &app.plugins_win {
+        plugins_screen(f, app, w, f.area(), &mut hits);
     }
     match &app.modal {
         Some(Modal::Form(form)) => form_window(f, form, f.area(), &mut hits),
@@ -847,23 +850,8 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
         }
     }
 
-    let auto = if app.deciding.is_some() {
-        " ⋯ asking "
-    } else {
-        " ▶ Auto "
-    };
-    let mut labels = vec![
-        (" + Add ", Button::Add),
-        (" ✎ Edit ", Button::Edit),
-        (" ✕ Delete ", Button::Delete),
-        (" + Plugin ", Button::AddPlugin),
-        (" ⚙ Plugins ", Button::Plugins),
-    ];
-    if app.wrr {
-        labels.push((auto, Button::Auto));
-    }
     let mut x = buttons.x;
-    for (label, b) in labels {
+    for (label, b) in home_buttons(app) {
         let w = dw(label) as u16;
         // only whole buttons, inside the list's width
         if buttons.height == 0 || x + w > buttons.right() {
@@ -927,109 +915,340 @@ fn pill(on: bool) -> Span<'static> {
     }
 }
 
-/// Every installed plugin, one row each: NAME, STATE (a clickable pill), SOURCE, STATUS.
-fn plugins_window(f: &mut Frame, app: &App, sel: usize, area: Rect, hits: &mut Hits) {
-    // home's pills are under the window
-    hits.plugins.clear();
-    let n = app.plugins.len();
-    // header, rows, blank, hints; + borders and top padding
-    let inner = window(f, area, "Plugins", 80, n.max(1) as u16 + 6);
-    let w = inner.width as usize;
+/// Home's buttons under the list. Symbols only from the TUI's own set, no emoji.
+pub fn home_buttons(app: &App) -> Vec<(&'static str, Button)> {
+    let mut labels = vec![
+        (" + Add ", Button::Add),
+        (" ✎ Edit ", Button::Edit),
+        (" × Delete ", Button::Delete),
+        (" + Plugin ", Button::AddPlugin),
+        (" Plugins ", Button::Plugins),
+    ];
+    if app.wrr {
+        let auto = if app.deciding.is_some() {
+            " · asking "
+        } else {
+            " › Auto "
+        };
+        labels.push((auto, Button::Auto));
+    }
+    labels
+}
+
+/// The text field's value with the cursor cell lit.
+fn text_input(value: &str, cursor: usize) -> Vec<Span<'static>> {
+    let chars: Vec<char> = value.chars().collect();
+    let before: String = chars[..cursor].iter().collect();
+    let at: String = chars
+        .get(cursor)
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| " ".into());
+    let after: String = chars
+        .get(cursor + 1..)
+        .map(|c| c.iter().collect())
+        .unwrap_or_default();
+    vec![
+        Span::styled(before, s(Color::White)),
+        Span::styled(at, Style::new().fg(Color::Black).bg(ACCENT)),
+        Span::styled(after, s(Color::White)),
+    ]
+}
+
+/// The Plugins screen, over everything: installed plugins, bundled ones not installed, and the
+/// add button (or the add form in its place), filtered by the search text.
+fn plugins_screen(f: &mut Frame, app: &App, w: &PluginsWin, area: Rect, hits: &mut Hits) {
+    // nothing under the screen is clickable
+    *hits = Hits::default();
+    f.render_widget(Clear, area);
+    f.render_widget(Block::new().style(Style::new().bg(PANEL)), area);
+    let width = area.width as usize;
+    let items = app.plugins_items();
+    let sel = w.sel.min(items.len() - 1);
+
+    // title line: home, the screen's name, counts on the right
+    let home = " ✻ home ";
+    let counts = format!(
+        "{} installed · {} available ",
+        app.plugins.len(),
+        app.available.len()
+    );
+    let left = dw(home) + 9;
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(home, s(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled("Plugins", s(Color::White).add_modifier(Modifier::BOLD)),
+            Span::raw(" ".repeat(width.saturating_sub(left + dw(&counts)))),
+            Span::styled(counts, s(MUTED)),
+        ])),
+        Rect { height: 1, ..area },
+    );
+    hits.buttons.push((
+        Rect {
+            width: (dw(home) as u16).min(area.width),
+            height: 1,
+            ..area
+        },
+        Button::Home,
+    ));
+
+    // the list: (line, item it selects or None, clickable cells as (x, width, key))
+    type Cells = Vec<(usize, usize, KeyCode)>;
+    let mut lines: Vec<(Line, Option<usize>, Cells)> = Vec::new();
+    let blank = || (Line::raw(""), None, Vec::new());
+    let mut search = vec![Span::styled("  search: ", s(MUTED))];
+    if w.searching {
+        search.extend(text_input(&w.search, w.search.chars().count()));
+    } else {
+        search.push(Span::styled(w.search.clone(), s(Color::White)));
+    }
+    let slash = "[ / ]";
+    let used = width_of(&search);
+    search.push(Span::raw(" ".repeat(width.saturating_sub(used + 6))));
+    search.push(Span::styled(slash, s(MUTED)));
+    lines.push((
+        Line::from(search),
+        None,
+        vec![(width.saturating_sub(6), 5, KeyCode::Char('/'))],
+    ));
+    lines.push(blank());
+
     let nw = app
         .plugins
         .iter()
         .map(|p| dw(&p.plugin.name))
+        .chain(app.available.iter().map(|p| dw(&p.name)))
         .max()
         .unwrap_or(0)
-        .clamp(4, 20);
-    // the rest after mark, name, pill, STATUS (up to 8) and the gaps between
-    let sw = w.saturating_sub(nw + SWITCH_W as usize + 16).max(6);
-    let mut lines = vec![Line::from(Span::styled(
-        format!(
-            "  {}  {}  {}  STATUS",
-            pad("NAME", nw),
-            pad("STATE", SWITCH_W as usize),
-            pad("SOURCE", sw)
-        ),
-        s(MUTED).add_modifier(Modifier::BOLD),
-    ))];
-    if n == 0 {
-        lines.push(Line::from(Span::styled(
-            "  No plugins yet · + add plugin",
-            s(MUTED),
-        )));
-    }
-    let sel = sel.min(n.saturating_sub(1));
-    for (i, p) in app.plugins.iter().enumerate() {
-        let status = p.status();
-        let color = match status {
-            "ok" => GOOD,
-            "failed" => BAD,
-            _ => MUTED,
-        };
-        let mark = if i == sel {
+        .clamp(4, 16);
+    // name, about, status, pill, actions, update, [-] and the gaps; about takes the rest
+    const STATUS: usize = 10;
+    let aw = width.saturating_sub(nw + 50);
+    let head = |t: &'static str| {
+        (
+            Line::styled(t, s(MUTED).add_modifier(Modifier::BOLD)),
+            None,
+            Vec::new(),
+        )
+    };
+    let mark = |i: usize| {
+        if i == sel {
             Span::styled("▌ ", s(ACCENT))
         } else {
             Span::raw("  ")
+        }
+    };
+    let row_style = |i: usize| {
+        if i == sel {
+            Style::new().bg(SELECT)
+        } else {
+            Style::new()
+        }
+    };
+    let none = |t: &str| (Line::styled(format!("   {t}"), s(MUTED)), None, Vec::new());
+
+    lines.push(head("  INSTALLED"));
+    let installed: Vec<(usize, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(at, it)| match it {
+            Item::Installed(i) => Some((at, *i)),
+            _ => None,
+        })
+        .collect();
+    if installed.is_empty() {
+        lines.push(none(if app.plugins.is_empty() {
+            "no plugins yet"
+        } else {
+            "no match"
+        }));
+    }
+    for (at, i) in installed {
+        let p = &app.plugins[i];
+        let about = if p.about.is_empty() && p.title() != p.plugin.name {
+            p.title()
+        } else {
+            p.about.clone()
         };
-        lines.push(
-            Line::from(vec![
-                mark,
-                Span::styled(
-                    pad(&ellipsize(&p.plugin.name, nw), nw),
-                    s(Color::White).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                pill(p.plugin.on),
-                Span::raw("  "),
-                Span::styled(
-                    pad(&ellipsize(&crate::plugins::source(&p.plugin), sw), sw),
-                    s(MUTED),
-                ),
-                Span::raw("  "),
-                Span::styled(status, s(color)),
-            ])
-            .style(if i == sel {
-                Style::new().bg(SELECT)
-            } else {
-                Style::new()
-            }),
-        );
-        let y = inner.y + 1 + i as u16;
-        if y < inner.bottom() {
-            let row = Rect {
-                y,
-                height: 1,
-                ..inner
-            };
-            hits.plugin_rows.push((row, i));
-            let x = inner.x + (2 + nw + 2) as u16;
-            if x + SWITCH_W <= inner.right() {
-                hits.plugins.push((
-                    Rect {
-                        x,
-                        width: SWITCH_W,
-                        ..row
-                    },
-                    p.plugin.name.clone(),
-                ));
+        let (status, color) = match p.status() {
+            "ok" => ("● ok", GOOD),
+            "failed" => ("× failed", BAD),
+            "off" => ("·", MUTED),
+            other => (other, MUTED),
+        };
+        let actions = p.plugin.on && !p.actions.is_empty();
+        let git = crate::plugins::from_git(&p.plugin.dir);
+        let x0 = 2 + nw + 2 + aw + 2 + STATUS + 2;
+        let mut cells = vec![(x0, SWITCH_W as usize, KeyCode::Char(' '))];
+        if actions {
+            cells.push((x0 + 9, 7, KeyCode::Enter));
+        }
+        if git {
+            cells.push((x0 + 18, 8, KeyCode::Char('u')));
+        }
+        cells.push((x0 + 28, 3, KeyCode::Char('-')));
+        let line = Line::from(vec![
+            mark(at),
+            Span::styled(
+                pad(&ellipsize(&p.plugin.name, nw), nw),
+                s(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(pad(&ellipsize(&about, aw), aw), s(MUTED)),
+            Span::raw("  "),
+            Span::styled(pad(status, STATUS), s(color)),
+            Span::raw("  "),
+            pill(p.plugin.on),
+            Span::raw("  "),
+            Span::styled(pad(if actions { "actions" } else { "" }, 7), s(ACCENT)),
+            Span::raw("  "),
+            Span::styled(pad(if git { "↻ update" } else { "" }, 8), s(ACCENT)),
+            Span::raw("  "),
+            Span::styled("[-]", s(BAD)),
+        ])
+        .style(row_style(at));
+        lines.push((line, Some(at), cells));
+    }
+    lines.push(blank());
+
+    lines.push(head("  AVAILABLE · bundled"));
+    let available: Vec<(usize, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(at, it)| match it {
+            Item::Available(i) => Some((at, *i)),
+            _ => None,
+        })
+        .collect();
+    if available.is_empty() {
+        lines.push(none(if app.available.is_empty() {
+            "no other bundled plugins"
+        } else {
+            "no match"
+        }));
+    }
+    // ends at the same column as an installed row
+    let aw2 = aw + 29;
+    for (at, i) in available {
+        let p = &app.available[i];
+        let line = Line::from(vec![
+            mark(at),
+            Span::styled(
+                pad(&ellipsize(&p.name, nw), nw),
+                s(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(pad(&ellipsize(&p.about, aw2), aw2), s(MUTED)),
+            Span::raw("  "),
+            Span::styled(pad(if p.has_setup { "has setup" } else { "" }, 9), s(WARN)),
+            Span::raw("  "),
+            Span::styled("[+]", s(GOOD)),
+        ])
+        .style(row_style(at));
+        let x = 2 + nw + 2 + aw2 + 2 + 9 + 2;
+        lines.push((line, Some(at), vec![(x, 3, KeyCode::Char('+'))]));
+    }
+    lines.push(blank());
+
+    let add_at = items.len() - 1;
+    match &w.form {
+        None => {
+            let label = "[+ Add from git / folder]";
+            lines.push((
+                Line::from(vec![mark(add_at), Span::styled(label, s(Color::White))])
+                    .style(row_style(add_at)),
+                Some(add_at),
+                vec![(2, dw(label), KeyCode::Char('+'))],
+            ));
+        }
+        Some(form) => {
+            let field = &form.fields[0];
+            let mut input = vec![Span::styled("  Add from git / folder: ", s(ACCENT))];
+            if let Input::Text { value, cursor } = &field.input {
+                input.extend(text_input(value, *cursor));
+            }
+            lines.push((Line::from(input), None, Vec::new()));
+            lines.push((
+                Line::styled(format!("  {}", field.hint), s(FAINT)),
+                None,
+                Vec::new(),
+            ));
+            if let Some(e) = &form.error {
+                lines.push((Line::styled(format!("  {e}"), s(BAD)), None, Vec::new()));
             }
         }
     }
-    lines.push(Line::raw(""));
-    lines.push(hints(plugins_hints(), w));
-    f.render_widget(Paragraph::new(lines), inner);
-}
 
-fn plugins_hints() -> Vec<(u8, Vec<Span<'static>>)> {
-    vec![
-        (1, hint("o", "on/off")),
-        (2, hint("u", "update")),
-        (1, hint("d", "remove")),
-        (0, hint("enter", "actions")),
-        (1, hint("+", "add plugin")),
-        (0, hint("esc", "close")),
-    ]
+    // the list scrolls to keep the selected line in view, between the title and the bottom two
+    let list = Rect {
+        y: area.y + 2,
+        height: area.height.saturating_sub(4),
+        ..area
+    };
+    let at_sel = lines.iter().position(|l| l.1 == Some(sel)).unwrap_or(0);
+    let top = (at_sel + 1).saturating_sub(list.height as usize);
+    for (n, (line, item, cells)) in lines.into_iter().skip(top).enumerate() {
+        if n >= list.height as usize {
+            break;
+        }
+        let r = Rect {
+            y: list.y + n as u16,
+            height: 1,
+            ..list
+        };
+        f.render_widget(Paragraph::new(line), r);
+        if let Some(i) = item {
+            hits.plugin_rows.push((r, i));
+        }
+        for (x, cw, code) in cells {
+            // only whole cells, inside the screen
+            if x + cw <= width {
+                let rect = Rect {
+                    x: r.x + x as u16,
+                    width: cw as u16,
+                    ..r
+                };
+                hits.plugin_btns.push((rect, item.unwrap_or(sel), code));
+            }
+        }
+    }
+
+    let bottom = Rect {
+        y: area.bottom().saturating_sub(1),
+        height: 1,
+        ..area
+    };
+    if let Some((msg, until)) = &app.flash
+        && Instant::now() < *until
+    {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!("  {}", ellipsize(msg, width.saturating_sub(2))),
+                s(WARN),
+            )),
+            Rect {
+                y: bottom.y.saturating_sub(1),
+                ..bottom
+            },
+        );
+    }
+    let keys = if w.form.is_some() {
+        vec![(0, hint("enter", "install")), (0, hint("esc", "cancel"))]
+    } else if w.searching {
+        vec![(0, hint("enter", "done")), (0, hint("esc", "clear"))]
+    } else {
+        vec![
+            (0, hint("enter", "actions")),
+            (2, hint("space", "on/off")),
+            (2, hint("u", "update")),
+            (2, hint("s", "setup")),
+            (1, hint("-", "remove")),
+            (1, hint("+", "install/add")),
+            (1, hint("/", "search")),
+            (0, hint("esc", "back")),
+        ]
+    };
+    f.render_widget(Paragraph::new(hints(keys, width)), bottom);
 }
 
 fn keycap(t: &'static str) -> Span<'static> {
@@ -1190,22 +1409,9 @@ fn form_window(f: &mut Frame, form: &Form, area: Rect, hits: &mut Hits) {
                 Span::styled(" › ", s(if focused { ACCENT } else { FAINT })),
             ]),
             Input::Text { value, cursor } if focused && !field.locked => {
-                let chars: Vec<char> = value.chars().collect();
-                let before: String = chars[..*cursor].iter().collect();
-                let at: String = chars
-                    .get(*cursor)
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| " ".into());
-                let after: String = chars
-                    .get(*cursor + 1..)
-                    .map(|c| c.iter().collect())
-                    .unwrap_or_default();
-                Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(before, s(Color::White)),
-                    Span::styled(at, Style::new().fg(Color::Black).bg(ACCENT)),
-                    Span::styled(after, s(Color::White)),
-                ])
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(text_input(value, *cursor));
+                Line::from(spans)
             }
             Input::Text { value, .. } => Line::from(Span::styled(
                 format!(" {value}"),
@@ -1307,8 +1513,6 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
             (0, hint("enter", "save / confirm")),
             (0, hint("esc", "cancel")),
         ]
-    } else if app.plugins_win.is_some() {
-        plugins_hints()
     } else if app
         .rows
         .get(app.selected)

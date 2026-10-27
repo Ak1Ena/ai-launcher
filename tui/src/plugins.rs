@@ -363,17 +363,6 @@ pub struct Staged {
     pub source: String,
 }
 
-/// Installs a plugin with no setup from `source`: `stage` then `commit`. The TUI calls `stage`
-/// itself when a setup has to be reviewed first.
-pub fn add(paths: &Paths, source: &str) -> Result<String, String> {
-    let s = stage(paths, source)?;
-    if s.setup.is_some() {
-        abort(&s);
-        return Err(format!("{} has a setup script: review it first.", s.name));
-    }
-    commit(paths, &s)
-}
-
 /// Fetches a plugin from `source` into staging `<plugins>/.<name>.install` (a stale one is
 /// removed first): a bundled name (`cliproxy`), a local folder (copied), or a git URL /
 /// `owner/repo` (`git clone --depth 1`, URL saved in `.source`). Never touches an installed
@@ -479,7 +468,7 @@ pub fn setup_text(dir: &Path) -> Result<Option<String>, String> {
     }
 }
 
-// the Plugins screen (next change) calls these; drop the expect then
+// the setup review (next change) calls this; drop the expect then
 #[cfg_attr(not(test), expect(dead_code))]
 /// Writes the reviewed setup text to a new temp file and returns its path: that copy is what
 /// runs, never `<dir>/setup` again. The caller removes it after the run.
@@ -526,7 +515,7 @@ pub fn abort(s: &Staged) {
     let _ = config::remove_entry(&s.dir);
 }
 
-// the Plugins screen (next change) calls these; drop the expect then
+// the setup review (next change) calls this; drop the expect then
 #[cfg_attr(not(test), expect(dead_code))]
 /// `config` → `config.bak` before setup runs again, if there is a config.
 pub fn backup_config(dir: &Path) -> std::io::Result<()> {
@@ -537,8 +526,6 @@ pub fn backup_config(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-// the Plugins screen (next change) calls these; drop the expect then
-#[cfg_attr(not(test), expect(dead_code))]
 /// A bundled plugin that is not installed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Available {
@@ -547,8 +534,6 @@ pub struct Available {
     pub has_setup: bool,
 }
 
-// the Plugins screen (next change) calls these; drop the expect then
-#[cfg_attr(not(test), expect(dead_code))]
 /// Bundled plugins not installed (a link by that name counts as installed).
 pub fn available(paths: &Paths) -> Vec<Available> {
     if paths.plugins.join("cliproxy").symlink_metadata().is_ok() {
@@ -562,8 +547,6 @@ pub fn available(paths: &Paths) -> Vec<Available> {
     }]
 }
 
-// the Plugins screen (next change) calls these; drop the expect then
-#[cfg_attr(not(test), expect(dead_code))]
 /// The first line of `<dir>/about`, control chars stripped (TAB stays), 60 chars. Same as bash.
 pub fn about(dir: &Path) -> String {
     let p = dir.join("about");
@@ -575,8 +558,6 @@ pub fn about(dir: &Path) -> String {
     ))
 }
 
-// the Plugins screen (next change) calls these; drop the expect then
-#[cfg_attr(not(test), expect(dead_code))]
 fn about_text(s: &str) -> String {
     s.split('\n')
         .next()
@@ -638,20 +619,6 @@ pub fn from_git(dir: &Path) -> bool {
     dir.join(".source").is_file() && dir.join(".git").is_dir()
 }
 
-/// Where a plugin came from, for display: its `.source` URL without userinfo, `bundled` for
-/// the cliproxy written from this binary, else `local`.
-// shortcut: bundled is told by an unchanged `plugin` file, so one from an older release shows local
-pub fn source(p: &Plugin) -> String {
-    if let Ok(s) = std::fs::read_to_string(p.dir.join(".source"))
-        && !s.trim().is_empty()
-    {
-        return hide_userinfo(s.trim());
-    }
-    let bundled = p.name == "cliproxy"
-        && std::fs::read_to_string(p.dir.join("plugin")).is_ok_and(|t| t == CLIPROXY[0].1);
-    if bundled { "bundled" } else { "local" }.to_string()
-}
-
 /// The folder of an installed plugin, after checking the name.
 fn checked(paths: &Paths, name: &str) -> Result<PathBuf, String> {
     let dir = paths.plugins.join(name);
@@ -683,6 +650,16 @@ pub fn set_on(paths: &Paths, name: &str, on: bool) -> Result<(), String> {
 
 #[cfg(test)]
 pub mod tests {
+    /// `stage` then `commit`, refusing a setup: the install the TUI does without a review.
+    fn add(paths: &Paths, source: &str) -> Result<String, String> {
+        let s = stage(paths, source)?;
+        if s.setup.is_some() {
+            abort(&s);
+            return Err(format!("{} has a setup script: review it first.", s.name));
+        }
+        commit(paths, &s)
+    }
+
     use super::*;
     use std::fs;
 

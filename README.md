@@ -50,7 +50,7 @@ It reads and writes the same config as the bash `ai` (providers file, failover o
 | `w` | switch between failover and weighted round-robin |
 | `s` | at a limit: auto-switch after a countdown, or ask y/N (default); shown as `switch: auto` / `switch: ask` in the title bar (click it to toggle); turning it off stops a running countdown, which then waits for `y` |
 | `+` `-` | round-robin: raise / lower the account's weight (0 to 99, default 1; 0 is never picked) |
-| `n` | round-robin: open the next account (or click `▶ Auto`) |
+| `n` | round-robin: open the next account (or click `› Auto`) |
 | `m` | set the Auto decision model |
 | `r` | clear the account's limit |
 | `x` | close the current tab (highlighted in the tab bar) |
@@ -58,7 +58,7 @@ It reads and writes the same config as the bash `ai` (providers file, failover o
 | `tab` | next tab |
 | `q` / `ctrl-c` | quit |
 
-Routing mode (`w`, or click the mode label in the title bar) is saved in `<failover file>.mode`. In failover mode the list is a priority order. In round-robin mode each account shows `×weight`, and `n` (or `▶ Auto`) opens the next account in a new tab by smooth weighted round-robin: with weights 3 and 1 you get A A B A (then it repeats). Accounts that are off, weight 0 or limited are skipped. Weights are saved in `<failover file>.weights` and the rotation in `$AI_FO_STATE/wrr`, so it continues after a restart.
+Routing mode (`w`, or click the mode label in the title bar) is saved in `<failover file>.mode`. In failover mode the list is a priority order. In round-robin mode each account shows `×weight`, and `n` (or `› Auto`) opens the next account in a new tab by smooth weighted round-robin: with weights 3 and 1 you get A A B A (then it repeats). Accounts that are off, weight 0 or limited are skipped. Weights are saved in `<failover file>.weights` and the rotation in `$AI_FO_STATE/wrr`, so it continues after a restart.
 
 Optionally let a model choose instead: press `m` and enter a model name (for example `haiku`; empty means plain round-robin). Auto then runs `claude -p --model <model>` on one of your free Claude accounts, with each account's weight and usage, in the background (20 second timeout, the UI keeps working). If it fails, times out or answers with anything but an account name, the round-robin pick is used. The model name is saved in `<failover file>.model`. This is the only thing the tool asks a model; it uses your own `claude` login and counts against its plan. Bash `ai` ignores these files.
 
@@ -79,10 +79,10 @@ On macOS, alt (⌥) keys need "Option as Meta" turned on in the terminal setting
 | click a tab (or `✻ home`) | go to it |
 | click a tab's `✕` | close it |
 | click an account | select it; click it again to open it |
-| `+ Add` / `✎ Edit` / `✕ Delete` | add, edit or delete the selected account |
+| `+ Add` / `✎ Edit` / `× Delete` | add, edit or delete the selected account |
 | Failover switch (title bar) | failover on / off |
 | Mode label (title bar, `mode: …`) | failover / round-robin |
-| `▶ Auto` (round-robin mode) | open the next account |
+| `› Auto` (round-robin mode) | open the next account |
 | wheel | scroll a CLI's output (unless the CLI uses the mouse itself) |
 
 In a tab, every key goes to the CLI except these:
@@ -285,9 +285,9 @@ ai plugin do <name> <action>           # run one of the plugin's actions
 
 `add` looks at its argument in this order: a bundled name, then an existing local folder, then a git source. Git sources are HTTPS only: an `https://` URL, or `owner/repo`, which becomes `https://github.com/owner/repo.git`. It never overwrites an installed plugin and refuses a folder without an executable `plugin`. New plugins start on, and `add` runs the plugin's `rows` once right away (macOS scans a new script on its first run, which can take seconds). Git needs `git`. The TUI's `p` form follows the same rules and expands a leading `~/`.
 
-TUI keys on a plugin row: `a` actions, `o` on/off, `u` update, `d` delete, `e` show its folder. `p` (or the `+ Plugin` button) adds a plugin from anywhere on home. On a plugin row, `a`, `d` and `e` are plugin actions; adding an account stays on the button and on other rows.
+TUI keys on a plugin row: `a` actions, `o` on/off, `u` update, `d` delete, `e` show its folder. `p` (or the `+ Plugin` button) opens the Plugins screen with its add form, from anywhere on home. On a plugin row, `a`, `d` and `e` are plugin actions; adding an account stays on the button and on other rows.
 
-`P` (or the `⚙ Plugins` button) opens the Plugins window: every installed plugin with its state, source (`bundled`, its https URL, or `local`) and status (`ok`, `failed`, `off`, `loading…`). In it: `o` on/off, `u` update, `d` remove, Enter or `a` actions, `+` / `p` add, Esc closes.
+`P` (or the `Plugins` button) opens the Plugins screen: installed plugins (name, `about` or title, status `● ok` / `× failed` / `·` off / `loading…`, on/off, `actions`, `↻ update` for git plugins, `[-]`), then bundled plugins not installed yet (`has setup`, `[+]`), then `[+ Add from git / folder]`. In it: Enter actions, space or `o` on/off, `u` update, `-` remove (asks first), `+` installs the bundled plugin under the cursor or opens the add form, `/` searches names and `about` text. Esc closes the innermost thing: the add form, the search text, then the screen. Every `[+]`, `[-]`, `actions`, `↻ update` and on/off is clickable. A plugin with a `setup` script is not installed from the TUI yet.
 
 ### Writing a plugin
 
