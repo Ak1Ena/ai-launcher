@@ -523,7 +523,8 @@ case ${1:-} in
     if [ -n "$cs" ] && mkdir -p "$D/cache" && (umask 077; printf '{"env":{"ANTHROPIC_BASE_URL":"%s","ANTHROPIC_AUTH_TOKEN":"%s"}}\n' "$url" "$key" > "$cs.$$") && mv "$cs.$$" "$cs"; then
       exec claude --settings "$cs" "$@"
     fi
-    rm -f "$cs.$$" 2>/dev/null
+    [ -z "$cs" ] || rm -f "$cs.$$"
+    echo "cliproxy: could not write the claude settings file: an env block in ~/.claude/settings.json may override the proxy" >&2
     exec claude "$@" ;;
   *) echo "usage: plugin rows | actions | menu | do <start|stop|affinity|apply|mode-failover|mode-wrr|on.<idx>|off.<idx>|up.<idx>|down.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link" >&2; exit 1 ;;
 esac

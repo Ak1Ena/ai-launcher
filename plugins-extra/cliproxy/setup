@@ -316,6 +316,7 @@ fi
 keyfile=
 case $Y in ''|run/*) ;; *)
   keyfile=$Y.ai-launcher.key
+  chmod 600 "$keyfile" 2>/dev/null
   [ "$(cat "$Y.ai-launcher.key" 2>/dev/null)" = "$mk" ] ||
     { (umask 077; printf '%s\n' "$mk" > "$Y.ai-launcher.key.$$") 2>/dev/null && mv "$Y.ai-launcher.key.$$" "$Y.ai-launcher.key"; } ||
     { rm -f "$Y.ai-launcher.key.$$"; keyfile=; echo "  could not keep the management key in $Y.ai-launcher.key: a new add will ask for it"; } ;;
