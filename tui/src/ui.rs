@@ -3,7 +3,7 @@
 //! one-line usage status; then modal windows (forms, failover notices). `draw` returns where
 //! everything clickable landed, for the mouse.
 
-use crate::app::{App, Item, Modal, Notice, PluginsWin};
+use crate::app::{App, Item, Modal, Notice, PluginsWin, Review, SetupTarget};
 use crate::config::Kind;
 use crate::form::{Confirm, Form, Input};
 use crate::usage;
@@ -961,6 +961,9 @@ fn plugins_screen(f: &mut Frame, app: &App, w: &PluginsWin, area: Rect, hits: &m
     *hits = Hits::default();
     f.render_widget(Clear, area);
     f.render_widget(Block::new().style(Style::new().bg(PANEL)), area);
+    if let Some(r) = &w.review {
+        return review_screen(f, app, r, area, hits);
+    }
     let width = area.width as usize;
     let items = app.plugins_items();
     let sel = w.sel.min(items.len() - 1);
@@ -1218,20 +1221,7 @@ fn plugins_screen(f: &mut Frame, app: &App, w: &PluginsWin, area: Rect, hits: &m
         height: 1,
         ..area
     };
-    if let Some((msg, until)) = &app.flash
-        && Instant::now() < *until
-    {
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                format!("  {}", ellipsize(msg, width.saturating_sub(2))),
-                s(WARN),
-            )),
-            Rect {
-                y: bottom.y.saturating_sub(1),
-                ..bottom
-            },
-        );
-    }
+    flash_above(f, app, bottom);
     let keys = if w.form.is_some() {
         vec![(0, hint("enter", "install")), (0, hint("esc", "cancel"))]
     } else if w.searching {
@@ -1249,6 +1239,224 @@ fn plugins_screen(f: &mut Frame, app: &App, w: &PluginsWin, area: Rect, hits: &m
         ]
     };
     f.render_widget(Paragraph::new(hints(keys, width)), bottom);
+}
+
+/// The flash message on the line above `bottom`, if one is up.
+fn flash_above(f: &mut Frame, app: &App, bottom: Rect) {
+    if let Some((msg, until)) = &app.flash
+        && Instant::now() < *until
+    {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!(
+                    "  {}",
+                    ellipsize(msg, (bottom.width as usize).saturating_sub(2))
+                ),
+                s(WARN),
+            )),
+            Rect {
+                y: bottom.y.saturating_sub(1),
+                ..bottom
+            },
+        );
+    }
+}
+
+/// One script line made safe to draw: control characters as `^X` (C1 as `<M-^X>`), and
+/// invisible or direction-changing marks as `<U+XXXX>`, so the screen can't be steered and
+/// nothing that runs is hidden. Tabs become spaces.
+pub fn escape_line(line: &str) -> String {
+    let mut out = String::new();
+    for c in line.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            '\u{7f}' => out.push_str("^?"),
+            c if (c as u32) < 0x20 => {
+                out.push('^');
+                out.push((c as u8 + 0x40) as char);
+            }
+            '\u{80}'..='\u{9f}' => {
+                out.push_str(&format!("<M-^{}>", (c as u8 - 0x40) as char));
+            }
+            '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{feff}' => out.push_str(&format!("<U+{:04X}>", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `text` cut into pieces of at most `w` display columns (at least one piece).
+fn chunks(text: &str, w: usize) -> Vec<String> {
+    let mut out = vec![String::new()];
+    let mut used = 0;
+    for c in text.chars() {
+        let cw = dw(&c.to_string());
+        if used + cw > w.max(1) && used > 0 {
+            out.push(String::new());
+            used = 0;
+        }
+        if let Some(last) = out.last_mut() {
+            last.push(c);
+        }
+        used += cw;
+    }
+    out
+}
+
+/// The setup review, over the Plugins screen: the whole script, numbered and escaped, long
+/// lines wrapped (nothing past the edge), then what approving does and the two buttons.
+fn review_screen(f: &mut Frame, app: &App, r: &Review, area: Rect, hits: &mut Hits) {
+    let width = area.width as usize;
+    let (verb, button) = match r.target {
+        SetupTarget::Install(_) => ("install", "[ Approve and install ]"),
+        SetupTarget::Rerun(_) => ("setup", "[ Approve and run ]"),
+    };
+    let row = |y: u16| Rect {
+        y: area.y + y.min(area.height.saturating_sub(1)),
+        height: 1,
+        ..area
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ✻ home ", s(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(
+                format!("Plugins › {verb} {}", r.target.name()),
+                s(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        row(0),
+    );
+    // a script ending in a newline has no empty last line
+    let mut src: Vec<&str> = r.text.split('\n').collect();
+    if src.len() > 1 && src.last() == Some(&"") {
+        src.pop();
+    }
+    let head = "  SETUP SCRIPT · review before running";
+    let count = format!("setup · {} lines  ", src.len());
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(head, s(MUTED).add_modifier(Modifier::BOLD)),
+            Span::raw(" ".repeat(width.saturating_sub(dw(head) + dw(&count)))),
+            Span::styled(count, s(MUTED)),
+        ])),
+        row(2),
+    );
+
+    // bottom up: keys, flash, buttons, blank, two notice lines, blank, then the box
+    let bottom = area.bottom().saturating_sub(1);
+    let at = |up: u16| Rect {
+        y: bottom.saturating_sub(up).max(area.y),
+        height: 1,
+        ..area
+    };
+    let boxed = Rect {
+        x: area.x + 2,
+        y: area.y + 4,
+        width: area.width.saturating_sub(4),
+        height: at(7).y.saturating_sub(area.y + 4),
+    };
+    let nw = src.len().to_string().len();
+    let inner_w = (boxed.width as usize).saturating_sub(2 + nw + 4);
+    let inner_h = boxed.height.saturating_sub(2) as usize;
+    // display rows from the first line on: (number or blank, text)
+    let rows_from = |first: usize| {
+        src.iter()
+            .enumerate()
+            .skip(first)
+            .flat_map(|(i, l)| {
+                chunks(&escape_line(l), inner_w)
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(k, c)| {
+                        let n = if k == 0 {
+                            format!("{:>nw$}", i + 1)
+                        } else {
+                            " ".repeat(nw)
+                        };
+                        (n, c)
+                    })
+            })
+            .take(inner_h + 1)
+            .collect::<Vec<_>>()
+    };
+    let top = r.scroll.min(src.len().saturating_sub(1));
+    let rows = rows_from(top);
+    let more = top > 0 || rows.len() > inner_h;
+    let mut block = Block::bordered()
+        .border_type(BorderType::Plain)
+        .border_style(s(FAINT));
+    if more {
+        block = block.title_bottom(Line::styled(" ↑↓ scroll ", s(MUTED)).right_aligned());
+    }
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .take(inner_h)
+        .map(|(n, c)| {
+            Line::from(vec![
+                Span::styled(format!(" {n}  "), s(FAINT)),
+                Span::styled(c, s(Color::White)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines).block(block), boxed);
+
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            "  Runs in a terminal tab as you. The plugin is installed only if setup succeeds.",
+            s(Color::White),
+        )),
+        at(6),
+    );
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            "  The plugin's own code also runs with your permissions: install only plugins you trust.",
+            s(WARN),
+        )),
+        at(5),
+    );
+    let cancel = "[ Cancel ]";
+    let buttons = at(3);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(button, s(GOOD).add_modifier(Modifier::BOLD)),
+            Span::raw("   "),
+            Span::styled(cancel, s(MUTED)),
+        ])),
+        buttons,
+    );
+    let sel = app.plugins_win.as_ref().map_or(0, |w| w.sel);
+    let bx = buttons.x + 2;
+    let cx = bx + dw(button) as u16 + 3;
+    for (x, w, code) in [
+        (bx, dw(button), KeyCode::Enter),
+        (cx, dw(cancel), KeyCode::Esc),
+    ] {
+        if x + w as u16 <= area.right() {
+            hits.plugin_btns.push((
+                Rect {
+                    x,
+                    width: w as u16,
+                    ..buttons
+                },
+                sel,
+                code,
+            ));
+        }
+    }
+    flash_above(f, app, at(0));
+    let keys = vec![
+        (0, hint("enter", "approve")),
+        (0, hint("↑↓ PgUp PgDn", "scroll")),
+        (0, hint("esc", "cancel")),
+    ];
+    f.render_widget(Paragraph::new(hints(keys, width)), at(0));
 }
 
 fn keycap(t: &'static str) -> Span<'static> {
@@ -1340,7 +1548,12 @@ fn notice(f: &mut Frame, app: &App, n: &Notice, area: Rect) {
                 Line::raw(""),
                 Line::from(vec![
                     keycap("enter"),
-                    d(" start again   "),
+                    // a setup tab has nothing to start again: enter closes it
+                    d(if app.tabs[app.current].member.starts_with("setup:") {
+                        " close   "
+                    } else {
+                        " start again   "
+                    }),
                     keycap("x"),
                     d(" close tab"),
                 ]),

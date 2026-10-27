@@ -363,19 +363,15 @@ pub struct Staged {
     pub source: String,
 }
 
-/// Fetches a plugin from `source` into staging `<plugins>/.<name>.install` (a stale one is
-/// removed first): a bundled name (`cliproxy`), a local folder (copied), or a git URL /
-/// `owner/repo` (`git clone --depth 1`, URL saved in `.source`). Never touches an installed
-/// plugin. Any failure removes staging. Same rules as bash `_ai_plugin_add`.
-pub fn stage(paths: &Paths, source: &str) -> Result<Staged, String> {
+/// The name `source` installs as, and its git URL if it is one (else bundled or a folder).
+/// Same order as bash: a bundled name, then an existing folder, then git.
+pub fn source_name(source: &str) -> Result<(String, Option<String>), String> {
     let source = source.trim();
     if source.is_empty() {
         return Err("Give a folder, a git URL, owner/repo, or cliproxy.".into());
     }
-    // bundled name, then an existing folder, then git: the same order as bash
     let bundled = source == "cliproxy";
-    let folder = Path::new(source);
-    let is_dir = !bundled && folder.is_dir();
+    let is_dir = !bundled && Path::new(source).is_dir();
     let git = (!bundled && !is_dir)
         .then(|| git_url(source.trim_end_matches('/')))
         .flatten();
@@ -403,6 +399,18 @@ pub fn stage(paths: &Paths, source: &str) -> Result<Staged, String> {
             "Bad plugin name '{name}': letters, digits, _ or - only."
         ));
     }
+    Ok((name, git))
+}
+
+/// Fetches a plugin from `source` into staging `<plugins>/.<name>.install` (a stale one is
+/// removed first): a bundled name (`cliproxy`), a local folder (copied), or a git URL /
+/// `owner/repo` (`git clone --depth 1`, URL saved in `.source`). Never touches an installed
+/// plugin. Any failure removes staging. Same rules as bash `_ai_plugin_add`.
+pub fn stage(paths: &Paths, source: &str) -> Result<Staged, String> {
+    let source = source.trim();
+    let (name, git) = source_name(source)?;
+    let bundled = source == "cliproxy";
+    let folder = Path::new(source);
     if paths.plugins.join(&name).symlink_metadata().is_ok() {
         return Err(format!("{name} is already installed."));
     }
@@ -468,8 +476,6 @@ pub fn setup_text(dir: &Path) -> Result<Option<String>, String> {
     }
 }
 
-// the setup review (next change) calls this; drop the expect then
-#[cfg_attr(not(test), expect(dead_code))]
 /// Writes the reviewed setup text to a new temp file and returns its path: that copy is what
 /// runs, never `<dir>/setup` again. The caller removes it after the run.
 pub fn setup_copy(text: &str) -> Result<PathBuf, String> {
@@ -515,8 +521,6 @@ pub fn abort(s: &Staged) {
     let _ = config::remove_entry(&s.dir);
 }
 
-// the setup review (next change) calls this; drop the expect then
-#[cfg_attr(not(test), expect(dead_code))]
 /// `config` → `config.bak` before setup runs again, if there is a config.
 pub fn backup_config(dir: &Path) -> std::io::Result<()> {
     let c = dir.join("config");
