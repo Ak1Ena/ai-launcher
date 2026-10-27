@@ -6,6 +6,7 @@
 use crate::app::{App, Item, Modal, Notice, PluginsWin, Review, SetupTarget};
 use crate::config::Kind;
 use crate::form::{Confirm, Form, Input};
+use crate::menu::{Kind as MKind, Menu};
 use crate::usage;
 use crossterm::event::KeyCode;
 use ratatui::Frame;
@@ -130,6 +131,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Hits {
     }
     match &app.modal {
         Some(Modal::Form(form)) => form_window(f, form, f.area(), &mut hits),
+        Some(Modal::Menu(m)) => menu_window(f, m, f.area()),
         Some(Modal::Confirm(c)) => confirm_window(f, app, c, f.area()),
         None => {}
     }
@@ -1586,6 +1588,97 @@ fn notice(f: &mut Frame, app: &App, n: &Notice, area: Rect) {
     let w = lines.iter().map(Line::width).max().unwrap_or(20) as u16 + 6;
     let inner = window(f, area, title, w, lines.len() as u16 + 3);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// A plugin's tabbed menu: the tab bar, a hint for the tab's kind, then its items or rows.
+fn menu_window(f: &mut Frame, m: &Menu, area: Rect) {
+    let tab = &m.tabs[m.tab];
+    let count = tab.items.len() + tab.rows.len();
+    // borders, top padding, tab bar, hint
+    let fit = (area.height.saturating_sub(5) as usize).max(1);
+    let shown = count.min(fit);
+    let inner = window(f, area, &m.plugin, 74, shown as u16 + 5);
+    let line = |f: &mut Frame, y: u16, l: Line| {
+        if y < inner.bottom() {
+            f.render_widget(
+                Paragraph::new(l),
+                Rect {
+                    y,
+                    height: 1,
+                    ..inner
+                },
+            );
+        }
+    };
+    let mut bar: Vec<Span> = Vec::new();
+    for (i, t) in m.tabs.iter().enumerate() {
+        bar.push(if i == m.tab {
+            Span::styled(
+                format!("[ {} ]", t.title),
+                s(ACCENT).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!("  {}  ", t.title), s(MUTED))
+        });
+        bar.push(Span::raw("  "));
+    }
+    let used: usize = bar.iter().map(|sp| dw(&sp.content)).sum();
+    let tip = "←/→ tab";
+    bar.push(Span::raw(
+        " ".repeat((inner.width as usize).saturating_sub(used + dw(tip))),
+    ));
+    bar.push(Span::styled(tip, s(FAINT)));
+    line(f, inner.y, Line::from(bar));
+    let hint = match tab.kind {
+        MKind::List => "enter run · esc close",
+        MKind::Radio => "enter switch · esc close",
+        MKind::Checklist { weight: false } => {
+            "Failover order · space use/don't use · shift-↑↓ move · enter apply"
+        }
+        MKind::Checklist { weight: true } => {
+            "Weights · space use/don't use · +/- weight · enter apply · esc cancel"
+        }
+    };
+    line(f, inner.y + 1, Line::from(Span::styled(hint, s(MUTED))));
+    let sel = m.sel[m.tab];
+    let top = (sel + 1).saturating_sub(shown);
+    let mut place = 0;
+    for i in 0..count {
+        let mark = if i == sel {
+            Span::styled("▌ ", s(ACCENT))
+        } else {
+            Span::raw("  ")
+        };
+        let text = s(if i == sel { Color::White } else { MUTED });
+        let spans = if let Some(it) = tab.items.get(i) {
+            let dot = match tab.kind {
+                MKind::Radio if it.on => "● ",
+                MKind::Radio => "○ ",
+                _ => "",
+            };
+            vec![mark, Span::styled(format!("{dot}{}", it.label), text)]
+        } else {
+            let r = &m.now[m.tab][i - tab.items.len()];
+            let n = match (tab.kind, r.n) {
+                (_, None) => String::new(),
+                (MKind::Checklist { weight: true }, Some(w)) => format!("×{w}"),
+                _ => {
+                    place += 1;
+                    place.to_string()
+                }
+            };
+            let tick = if r.checked { "[x]" } else { "[ ]" };
+            vec![
+                mark,
+                Span::styled(format!("{tick} {} ", pad(&n, 3)), text),
+                Span::styled(pad(&ellipsize(&r.label, 34), 35), text),
+                Span::styled(r.note.clone(), s(FAINT)),
+            ]
+        };
+        if i >= top && i < top + shown {
+            line(f, inner.y + 2 + (i - top) as u16, Line::from(spans));
+        }
+    }
 }
 
 fn form_window(f: &mut Frame, form: &Form, area: Rect, hits: &mut Hits) {

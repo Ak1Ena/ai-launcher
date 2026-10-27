@@ -6,13 +6,13 @@ T=$(cd "$(mktemp -d)" && pwd -P)
 SRV=
 trap '[ -n "$SRV" ] && { kill $SRV; wait $SRV; } 2>/dev/null; for f in "$T/brew.pid" "$T/sp/run/pid"; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done; rm -rf "$T"' EXIT
 export HOME=$T/home; mkdir -p "$HOME" "$T/bin" "$T/sys" "$T/jq" "$T/work"
-unset CLIPROXY_API_KEY CLIPROXY_MGMT_KEY
+unset CLIPROXY_API_KEY CLIPROXY_MGMT_KEY CLA_ROOT AI_PROVIDERS AI_ACCOUNTS CODEX_HOME   # never the real accounts
 export CLIPROXY_PROBE_SECS=5   # a loaded machine must not turn a slow answer into "proxy down"
 PY=$(command -v python3 || true)
 JQ=$(command -v jq || true)
 # sys = /usr/bin + /bin without jq, brew, claude, so each test picks what is on PATH
 for f in /usr/bin/* /bin/*; do
-  b=${f##*/}; case $b in jq|brew|claude|python*|fzf|cliproxyapi) continue ;; esac
+  b=${f##*/}; case $b in jq|brew|claude|python*|fzf|cliproxyapi|security) continue ;; esac   # security: never the real Keychain
   [ -e "$T/sys/$b" ] || ln -s "$f" "$T/sys/$b"
 done
 [ -e "$T/sys/curl" ] || { c=$(command -v curl) && ln -s "$c" "$T/sys/curl"; }
@@ -34,6 +34,7 @@ run() { (cd "$T/work" && PATH=${RP:-$BASEPATH} "$P" "$@"); }   # plugin's cwd = 
 conf() { printf '%s\n' "$@" > "$D/config"; chmod 600 "$D/config"; }
 wait_cache() { local i=0; while [ $i -lt 50 ]; do [ -f "$D/cache/usage" ] && [ "$(head -1 "$D/cache/usage")" != "${1:-}" ] && [ ! -d "$D/cache/lock" ] && return 0; sleep 0.2; i=$((i + 1)); done; return 1; }
 TAB=$(printf '\t')
+fresh() { rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows); }
 
 # fake claude: dumps env and args
 printf '#!/bin/sh\nenv > "%s/claude.env"; printf "%%s\\n" "$@" > "%s/claude.args"\n' "$T" "$T" > "$T/bin/claude"; chmod +x "$T/bin/claude"
@@ -43,7 +44,7 @@ rm -f "$D/config"
 out=$(run rows)
 ok "rows creates the config"           '[ -f "$D/config" ]'
 ok "config is mode 600"                'case $(ls -l "$D/config") in -rw-------*) true;; *) false;; esac'
-ok "first line is the section"         '[ "$(printf "%s\n" "$out" | head -1)" = "section${TAB}CLIPROXY · all accounts · failover" ]'
+ok "first line is the section"         '[ "$(printf "%s\n" "$out" | head -1)" = "section${TAB}CLIPROXY · all accounts" ]'
 ok "no key hint names both options"    'has_line "$out" "all${TAB}Claude Code · all accounts${TAB}no key:" && has_line "$out" CLIPROXY_API_KEY && has_line "$out" "key="'
 
 # ── proxy down ──
@@ -90,9 +91,37 @@ CREDS = {"observed_at": "2026-10-26T10:00:00Z", "files": [
   {"auth_index": "c3", "provider": "claude", "status": "disabled", "disabled": True, "success": 1, "failed": 2},
   {"auth_index": "x1", "provider": "codex", "status": "active", "disabled": False, "success": 7, "failed": 0},
   {"auth_index": "g1", "provider": "gemini", "status": "active", "disabled": False, "success": 5, "failed": 0}]}
+def mks():  # MK, or a plaintext secret-key in proxy.yaml (the real proxy hot-reloads and hashes it)
+    ks = [MK]
+    try:
+        for l in open(T + '/proxy.yaml'):
+            l = l.strip()
+            if l.startswith('secret-key:'):
+                v = l.split(':', 1)[1].strip().strip('"')
+                if v and not v.startswith('$2'): ks.append(v)
+    except Exception: pass
+    return ks
+def upload(ctype, raw):  # multipart auth file: kept in uploads/, added to creds.json and auth/ when they exist
+    import email
+    msg = email.message_from_bytes(b'Content-Type: ' + ctype.encode() + b'\r\n\r\n' + raw)
+    for part in msg.walk():
+        n = part.get_filename()
+        if not n: continue
+        data = part.get_payload(decode=True); os.makedirs(T + '/uploads', exist_ok=True)
+        open(T + '/uploads/' + n, 'wb').write(data); a = json.loads(data)
+        e = {"auth_index": "u" + str(len(os.listdir(T + '/uploads'))), "name": n, "email": a.get("email"), "provider": a.get("type"), "disabled": False, "success": 0, "failed": 0}
+        c = jfile('creds.json')
+        if c is not None: c['files'].append(e); json.dump(c, open(T + '/creds.json', 'w'))
+        if os.path.isdir(T + '/auth'): json.dump(e, open(T + '/auth/' + n, 'w'))
+        return True
+    return False
 def jfile(n):
     try: return json.load(open(T + '/' + n))
     except Exception: return None
+def creds():  # over.json: name -> fields set by the fields / status PATCH, merged into the list
+    c = jfile('creds.json') or json.loads(json.dumps(CREDS)); o = jfile('over.json') or {}
+    for f in c.get('files', []): f.update(o.get(f.get('name'), {}))
+    return c
 def quota(ai):
     now = int(time.time())
     o = (jfile('quota.json') or {}).get(ai)
@@ -116,12 +145,17 @@ class H(BaseHTTPRequestHandler):
             # strict unless mode has anykey: CK, or a key added through the api-keys endpoint
             if 'anykey' not in m and not self.auth(CK) and not any(self.auth(k) for k in (jfile('apikeys.json') or [])):
                 return self.send(401, {"error": "bad key"})
+            if 'nomodels' in m: return self.send(500, {"error": "nope"})
             if jfile('models.json'): return self.send(200, jfile('models.json'))
-            return self.send(200, {"object": "list", "data": [{"id": "claude-sonnet-4-5", "object": "model", "owned_by": "anthropic"}, {"id": "gpt-5", "object": "model", "owned_by": "openai"}]})
+            return self.send(200, {"object": "list", "data": [{"id": "claude-sonnet-4-5", "object": "model", "owned_by": "anthropic"}, {"id": "gpt-5", "object": "model", "owned_by": "openai"},
+                {"id": "gpt-6.1-sol", "object": "model"}, {"id": "gpt-image-1", "object": "model"}, {"id": "gemini-3-pro", "object": "model"}]})
         if '/management/' in p:
             if 'slow' in m and 'credentials' in p: time.sleep(3)
             if 'forbid' in m: return self.send(403, {"error": "remote management key not set"})
-            if 'anykey' not in m and not self.auth(MK): return self.send(401, {"error": "bad mgmt key"})
+            if 'anykey' not in m and not any(self.auth(k) for k in mks()): return self.send(401, {"error": "bad mgmt key"})
+            if p == '/v0/management/auth-files' and self.command == 'POST':
+                if 'upfail' in m: return self.send(500, {"error": "failed to write file: x"})
+                return self.send(200, {"status": "ok"}) if upload(self.headers.get('Content-Type', ''), self.raw) else self.send(400, {"error": "no file"})
             if p == '/v8/management/config/access/api-keys':
                 if self.command == 'GET': return self.send(200, jfile('apikeys.json') or [])
                 if 'keysfail' in m: return self.send(500, {"error": "nope"})
@@ -140,7 +174,11 @@ class H(BaseHTTPRequestHandler):
                 r = json.load(open(T + '/routing.json')) if os.path.exists(T + '/routing.json') else {}
                 r.update(json.loads(body).get('routing', {})); json.dump(r, open(T + '/routing.json', 'w'))
                 return self.send(200, {"status": "ok"})
-            if p in ('/v8/management/credentials', '/v0/management/auth-files'): return self.send(200, jfile('creds.json') or CREDS)
+            if p in ('/v8/management/credentials', '/v0/management/auth-files'): return self.send(200, creds())
+            if p.split('/')[-1] in ('fields', 'status') and p.rsplit('/', 1)[0] in ('/v8/management/credentials', '/v0/management/auth-files') and self.command == 'PATCH':
+                open(T + '/' + p.split('/')[-1] + '.log', 'a').write(p + ' ' + body + '\n'); b = json.loads(body)
+                o = jfile('over.json') or {}; o.setdefault(b.pop('name'), {}).update(b); json.dump(o, open(T + '/over.json', 'w'))
+                return self.send(200, {"status": "ok"})
             if p in ('/v8/management/requests/api-call', '/v0/management/api-call'):
                 req = json.loads(body or '{}'); code, obj = quota(req.get('auth_index'))
                 return self.send(200, {"status_code": code, "header": {}, "body": json.dumps(obj)})
@@ -148,7 +186,7 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self): self.handle_any('')
     def do_PUT(self): self.handle_any(self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode())
     def do_PATCH(self): self.handle_any(self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode())
-    def do_POST(self): self.handle_any(self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode())
+    def do_POST(self): self.raw = self.rfile.read(int(self.headers.get('Content-Length') or 0)); self.handle_any(self.raw.decode('utf-8', 'replace'))
 class S(HTTPServer):  # HTTPServer.server_bind runs getfqdn (reverse DNS) before listen: took 35 s on CI macOS
     def server_bind(self): socketserver.TCPServer.server_bind(self); self.server_name, self.server_port = self.server_address[:2]
 if len(sys.argv) > 4: S(('127.0.0.1', int(sys.argv[4])), H).serve_forever()   # a fake started proxy (setup tests)
@@ -164,10 +202,21 @@ URL=http://127.0.0.1:$(cat "$T/port")
 export MYKEY=env-key-SECRET-789
 conf "url=$URL" key_env=MYKEY
 export CLAUDE_CONFIG_DIR=$HOME/acc/one ANTHROPIC_API_KEY=sk-ant-SHOULD-GO
+echo "[\"$MYKEY\"]" > "$T/apikeys.json"   # the proxy takes this key on /v1/models
 run launch all --foo "a b" >/dev/null 2>&1; rc=$?
 ok "launch execs claude"               '[ $rc = 0 ] && [ -f "$T/claude.env" ]'
-ok "launch passes args"                '[ "$(cat "$T/claude.args")" = "--foo
+ok "launch passes args after --settings and --agents" '[ "$(sed -n "1,3p;5,\$p" "$T/claude.args")" = "--settings
+$D/cache/claude-settings.json
+--agents
+--foo
 a b" ]'
+AG=$(sed -n 4p "$T/claude.args")
+ok "launch: one sub-agent per model, image models left out" '[ "$(printf "%s" "$AG" | jq -r "keys | join(\" \")")" = "claude-sonnet-4-5 gemini-3-pro gpt-5 gpt-6-1-sol" ]'
+ok "launch: agent model, provider in the description" 'printf "%s" "$AG" | jq -e ".[\"gpt-6-1-sol\"] == {description: \"Sub-agent on gpt-6.1-sol (Codex account via cliproxy). Use when a task should run on gpt-6.1-sol.\", prompt: \"You are a sub-agent running on gpt-6.1-sol. Do the task you are given and report the result.\", model: \"gpt-6.1-sol\"} and (.[\"gpt-5\"].description | contains(\"(openai account\")) and (.[\"gemini-3-pro\"].description | contains(\"(Gemini account\"))" >/dev/null'
+ok "launch: agents saved for setup and offline launch" 'jq -e ". == $AG" "$D/cache/agents.json" >/dev/null'
+SJ=$D/cache/claude-settings.json
+ok "launch settings file beats ~/.claude env, 600" 'jq -e ".env == {ANTHROPIC_BASE_URL: \"$URL\", ANTHROPIC_AUTH_TOKEN: \"$MYKEY\"}" "$SJ" >/dev/null && case $(ls -l "$SJ") in -rw-------*) true;; *) false;; esac && ! grep -q -- "$MYKEY" "$T/claude.args"'
+ok "launch settings file has the plugin status line" '[ "$(jq -r ".statusLine.type" "$SJ")" = command ] && [ "$(jq -r ".statusLine.command" "$SJ")" = "$D/plugin statusline" ]'
 ok "launch sets base url"              'grep -qx "ANTHROPIC_BASE_URL=$URL" "$T/claude.env"'
 ok "launch sets gateway discovery"     'grep -qx "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1" "$T/claude.env"'
 ok "launch unsets CLAUDE_CONFIG_DIR"   '! grep -q "^CLAUDE_CONFIG_DIR=" "$T/claude.env"'
@@ -180,6 +229,33 @@ conf "url=$URL/" key_env=MYKEY "key=$CK"
 run launch all >/dev/null 2>&1
 ok "key= wins over key_env="           'grep -qx "ANTHROPIC_AUTH_TOKEN=$CK" "$T/claude.env"'
 ok "trailing slash dropped from url"   'grep -qx "ANTHROPIC_BASE_URL=$URL" "$T/claude.env"'
+run launch all --agents '{}' >/dev/null 2>&1
+ok "launch: the user's --agents wins, ours skipped" '[ "$(cat "$T/claude.args")" = "--settings
+$D/cache/claude-settings.json
+--agents
+{}" ]'
+run launch all --agents='{}' >/dev/null 2>&1
+ok "launch: --agents= form also skips ours" '[ "$(grep -c -- "^--agents" "$T/claude.args")" = 1 ]'
+echo nomodels > "$T/mode"; run launch all >/dev/null 2>&1; rc=$?
+ok "launch: /v1/models fails: the saved agents" '[ $rc = 0 ] && [ "$(sed -n 3p "$T/claude.args")" = --agents ] && [ "$(sed -n 4p "$T/claude.args")" = "$AG" ]'
+rm -f "$D/cache/agents.json"; run launch all >/dev/null 2>&1; rc=$?; : > "$T/mode"
+ok "launch: /v1/models fails, none saved: no --agents" '[ $rc = 0 ] && ! grep -q -- --agents "$T/claude.args"'
+run launch all >/dev/null 2>&1
+ok "launch: Claude models in the proxy: Claude Code keeps its own default" '! grep -q ANTHROPIC_MODEL "$D/cache/claude-settings.json"'
+echo '{"data":[{"id":"gpt-5"},{"id":"gpt-6.1-sol"},{"id":"codex-auto-review"},{"id":"gpt-image-1"}]}' > "$T/models.json"; run launch all >/dev/null 2>&1; rm -f "$T/models.json"
+ok "launch: no Claude model: default and opus/sonnet/haiku/fable point at the newest one" 'jq -e ".env | .ANTHROPIC_MODEL == \"gpt-6.1-sol\" and .ANTHROPIC_DEFAULT_OPUS_MODEL == \"gpt-6.1-sol\" and .ANTHROPIC_DEFAULT_SONNET_MODEL == \"gpt-6.1-sol\" and .ANTHROPIC_DEFAULT_HAIKU_MODEL == \"gpt-6.1-sol\" and .ANTHROPIC_DEFAULT_FABLE_MODEL == \"gpt-6.1-sol\"" "$D/cache/claude-settings.json" >/dev/null'
+echo '{"data":[{"id":"gpt-6.1-sol"}]}' > "$T/models.json"; run launch all >/dev/null 2>&1; rm -f "$T/models.json"
+echo nomodels > "$T/mode"; run launch all >/dev/null 2>&1; : > "$T/mode"
+ok "launch: model list not read just now: no model override from the saved one" '! grep -q ANTHROPIC_MODEL "$D/cache/claude-settings.json"'
+echo '{"data":[{"id":"gpt-6.1-sol"}]}' > "$T/models.json"; run launch all --agents='{}' >/dev/null 2>&1; rm -f "$T/models.json"
+ok "launch: user --agents: model override still from the live list" 'grep -q "\"ANTHROPIC_MODEL\":\"gpt-6.1-sol\"" "$D/cache/claude-settings.json" && [ "$(grep -c -- "^--agents" "$T/claude.args")" = 1 ]'
+run launch all >/dev/null 2>&1
+RP=$NOJQ run launch all >/dev/null 2>&1; rc=$?
+ok "launch: no jq: no --agents" '[ $rc = 0 ] && ! grep -q -- --agents "$T/claude.args"'
+echo '{"data":[{"id":"GPT-5"},{"id":"gpt-5"},{"id":"-x__y-"},{"id":"..."},{"id":"gemini-image-x"}]}' > "$T/models.json"
+run launch all >/dev/null 2>&1
+ok "agents: names lower case, no edge or double -, first model keeps a name, empty skipped" '[ "$(sed -n 4p "$T/claude.args" | jq -c "to_entries | map([.key, .value.model])")" = "[[\"gpt-5\",\"GPT-5\"],[\"x-y\",\"-x__y-\"]]" ]'
+rm -f "$T/models.json"
 unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY
 printf 'url=%s\r\nkey=%s\r\n' "$URL" "$CK" > "$D/config"
 run launch all >/dev/null 2>&1
@@ -212,7 +288,7 @@ ok "claude: avg weekly, soonest reset" 'case $cl in *"wk "*" 45% ↻4d"*) true;;
 ok "claude: accounts and requests"     'case $cl in *"3 accts · 43 req · 3 failed") true;; *) false;; esac'
 ok "codex: windows by seconds"         'case $cx in *"5h "*" 12% ↻2h"*"wk "*" 30% ↻2d"*"1 acct · 7 req · 0 failed") true;; *) false;; esac'
 ok "gemini: counts only"               '[ "$gm" = "  ${TAB}gemini · 1 acct · 5 req · 0 failed" ]'
-ok "model names line"                  'has_line "$out" "  ${TAB}models: claude-sonnet-4-5, gpt-5"'
+ok "model names line"                  'has_line "$out" "  ${TAB}models: claude-sonnet-4-5, gpt-5, gpt-6.1-sol, gpt-image-1, gemini-3-pro"'
 ok "detail lines follow the entry"     '[ "$(printf "%s\n" "$out" | sed -n 2p | cut -f1)" = all ] && [ -z "$(printf "%s\n" "$out" | sed -n "3,\$p" | grep -v "^  ${TAB}")" ]'
 ok "never reads usage/queue"           '! grep -q "usage" "$T/srv.log"'
 ok "v8 credentials used"               'grep -q "GET /v8/management/credentials" "$T/srv.log"'
@@ -247,6 +323,7 @@ ok "refused management API: hint"      'has_line "$out" "  ${TAB}usage: manageme
 : > "$T/mode"
 
 # ── session affinity ──
+conf "url=$URL" "key=$CK" "mgmt_key=$MK"
 AFF='session affinity off'
 rm -f "$T/routing.json" "$T/patch.log"; rm -rf "$D/cache"
 run rows >/dev/null; wait_cache
@@ -260,9 +337,9 @@ ok "affinity off: action listed"       'has_line "$(run actions)" "affinity${TAB
 echo '{"strategy":"round-robin","session-affinity":true,"session-affinity-subagents":false}' > "$T/routing.json"
 rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows)
 ok "subagents off: warning"            'has_line "$out" "⚠ session affinity off"'
-echo '{"strategy":"fill-first","session-affinity":true,"session-affinity-subagents":true,"session-affinity-ttl":"1h"}' > "$T/routing.json"
+echo '{"strategy":"weighted-round-robin","session-affinity":true,"session-affinity-subagents":true,"session-affinity-ttl":"1h"}' > "$T/routing.json"
 rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows)
-ok "affinity on: routing line"         '[ "$(printf "%s\n" "$out" | sed -n 3p)" = "  ${TAB}routing: fill-first · sticky per chat (1h)" ] && ! has_line "$out" "⚠"'
+ok "affinity on: routing line"         '[ "$(printf "%s\n" "$out" | sed -n 3p)" = "  ${TAB}routing: weighted-round-robin · sticky per chat (1h)" ] && ! has_line "$out" "⚠"'
 ok "affinity on: no action"            '! run actions | grep -q affinity'
 echo '{"strategy":"round-robin","session-affinity":false,"session-affinity-ttl":"2h"}' > "$T/routing.json"
 res=$(run do affinity)
@@ -283,50 +360,188 @@ ok "no mgmt key: do affinity refuses"  'has_line "$res" "management key"'
 conf url=http://127.0.0.1:1 "mgmt_key=$MK"
 ok "dead proxy: no answer, not HTTP 000" 'run do affinity | grep -q "not available (no answer;"'
 
-# ── mode: failover (default) / load balance ──
-conf "url=$URL" "key=$CK" "mgmt_key=$MK" "# a comment"
-: > "$T/mode"; rm -f "$T/patch.log" "$T/put.log"
-echo '{"strategy":"round-robin","session-affinity":true,"session-affinity-subagents":true}' > "$T/routing.json"
-rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows)
-MIS="⚠ proxy uses round-robin, plugin mode is failover — apply: TUI a, or ai plugin do cliproxy apply"
-ok "default mode: failover title"      '[ "$(printf "%s\n" "$out" | head -1)" = "section${TAB}CLIPROXY · all accounts · failover" ]'
-ok "mismatch: warning line"            'has_line "$out" "  ${TAB}$MIS"'
-ok "no ttl: plain sticky per chat"     'has_line "$out" "routing: round-robin · sticky per chat" && ! has_line "$out" "sticky per chat ("'
+# ── accounts: always weighted round-robin ──
+acc() { printf '{"auth_index":"%s","name":"%s-%s.json","email":"%s","provider":"%s","status":"active","disabled":false,"success":1,"failed":0%s}' "$1" "$2" "$3" "$3" "$2" "${4:+,$4}"; }
+setc() { grep -v "^$1=" "$D/config" > "$D/c.tmp"; [ -n "$2" ] && echo "$1=$2" >> "$D/c.tmp"; mv "$D/c.tmp" "$D/config"; chmod 600 "$D/config"; }
+alines() { run actions | grep -E '^(on|off|wup|wdown)\.'; }
+dlines() { printf '%s\n' "$out" | grep -E "^  ${TAB}w[a-z]@"; }
+NA=claude-wa@example.com.json NB=claude-wb@example.com.json ND=claude-wd@example.com.json NC=codex-wc@example.com.json
+pr() { printf '/v8/management/credentials/fields {"name":"%s","priority":%s}\n' "$@"; }   # pr name p [name p ...]
+echo "{\"files\":[$(acc c1 claude wa@example.com),$(acc c2 claude wb@example.com),$(acc c3 claude wd@example.com '"disabled":true'),$(acc x1 codex wc@example.com),$(acc g1 gemini wg@example.com)]}" > "$T/creds.json"
+conf "url=$URL" "key=$CK" "mgmt_key=$MK" "# a comment" mode=failover "order=$NC"   # keys of the old failover mode: ignored
+: > "$T/mode"; rm -f "$T/patch.log" "$T/put.log" "$T/fields.log" "$T/status.log" "$T/over.json"
+echo '{"strategy":"fill-first","cooldown":{"disable-cooling":true},"session-affinity":true,"session-affinity-subagents":true}' > "$T/routing.json"
+fresh
+ok "title has no mode, nothing says failover" '[ "$(printf "%s\n" "$out" | head -1)" = "section${TAB}CLIPROXY · all accounts" ] && ! has_line "$out" failover'
+ok "mismatch: warning line"            'has_line "$out" "  ${TAB}⚠ proxy uses fill-first (cooling off), not weighted round-robin — apply: TUI a, or ai plugin do cliproxy apply"'
+ok "rows: ×N by name, off for unused (old order= ignored)" '[ "$(dlines)" = "  ${TAB}wa@example.com  ×1
+  ${TAB}wb@example.com  ×1
+  ${TAB}wd@example.com  off
+  ${TAB}wc@example.com  ×1" ]'
 acts=$(run actions)
-ok "actions: modes, apply on mismatch" 'has_line "$acts" "mode-failover${TAB}Mode: failover (one account until limited)" && has_line "$acts" "mode-balance${TAB}Mode: load balance" && has_line "$acts" "apply${TAB}Apply failover to the proxy"'
-res=$(run do mode-failover); rc=$?
-ok "mode-failover: one PATCH, exact body" '[ $rc = 0 ] && [ "$(cat "$T/patch.log")" = "{\"routing\":{\"strategy\":\"fill-first\",\"cooldown\":{\"disable-cooling\":false}}}" ]'
-ok "mode-failover: says so"            'has_line "$res" "proxy now uses failover"'
-ok "mode written, other lines kept, 600" '[ "$(cat "$D/config")" = "url=$URL
-key=$CK
-mgmt_key=$MK
-# a comment
-mode=failover" ] && case $(ls -l "$D/config") in -rw-------*) true;; *) false;; esac'
-rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows)
-ok "matching proxy: no mismatch, no apply" '! has_line "$out" "proxy uses" && ! run actions | grep -q "^apply"'
-rm -f "$T/patch.log"; res=$(run do mode-balance)
-ok "mode-balance: exact body"          '[ "$(cat "$T/patch.log")" = "{\"routing\":{\"strategy\":\"round-robin\",\"session-affinity\":true,\"session-affinity-subagents\":true,\"session-affinity-ttl\":\"1h\"}}" ]'
-ok "mode-balance: one mode line"       '[ "$(grep -c "^mode=" "$D/config")" = 1 ] && grep -qx mode=balance "$D/config"'
-rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows)
-ok "balance title, no mismatch"        '[ "$(printf "%s\n" "$out" | head -1)" = "section${TAB}CLIPROXY · all accounts · load balance" ] && ! has_line "$out" "proxy uses"'
-echo '{"strategy":"wrr","session-affinity":false,"session-affinity-ttl":"2h"}' > "$T/routing.json"; rm -f "$T/patch.log"
-run do apply >/dev/null
-ok "balance keeps weighted-round-robin" '[ "$(cat "$T/patch.log")" = "{\"routing\":{\"strategy\":\"weighted-round-robin\",\"session-affinity\":true,\"session-affinity-subagents\":true}}" ]'
-conf "url=$URL" "key=$CK" "mgmt_key=$MK" mode=failover
-echo '{"strategy":"fill-first","cooldown":{"disable-cooling":true}}' > "$T/routing.json"
-rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows)
-ok "failover with cooling off: mismatch" 'has_line "$out" "⚠ proxy uses fill-first (cooling off), plugin mode is failover"'
-echo v0 > "$T/mode"; rm -f "$T/patch.log"
-run do mode-failover >/dev/null; r1=$?
-echo '"wrr"' > "$T/v0strategy.json"; run do mode-balance >/dev/null
-ok "v0: strategy PUT only"             '[ $r1 = 0 ] && [ ! -e "$T/patch.log" ] && [ "$(cat "$T/put.log")" = "PUT {\"value\":\"fill-first\"}
-PUT {\"value\":\"weighted-round-robin\"}" ]'
-: > "$T/mode"; rm -f "$T/put.log" "$T/v0strategy.json"
+ok "actions: apply, no mode or move ones" 'has_line "$acts" "apply${TAB}Apply weighted round-robin to the proxy" && ! printf "%s\n" "$acts" | grep -qE "^(mode-|up\.|down\.)" && ! has_line "$acts" failover'
+menu=$(run menu)
+ok "menu: Actions and Accounts tabs, weight rows" '[ "$menu" = "tab${TAB}list${TAB}Actions
+item${TAB}apply${TAB}Apply weighted round-robin to the proxy
+tab${TAB}checklist${TAB}Accounts${TAB}weight
+row${TAB}c1${TAB}wa@example.com${TAB}1${TAB}1${TAB}claude${TAB}on.c1${TAB}off.c1${TAB}wdown.c1${TAB}wup.c1
+row${TAB}c2${TAB}wb@example.com${TAB}1${TAB}1${TAB}claude${TAB}on.c2${TAB}off.c2${TAB}wdown.c2${TAB}wup.c2
+row${TAB}c3${TAB}wd@example.com${TAB}0${TAB}1${TAB}claude${TAB}on.c3${TAB}off.c3${TAB}wdown.c3${TAB}wup.c3
+row${TAB}x1${TAB}wc@example.com${TAB}1${TAB}1${TAB}codex${TAB}on.x1${TAB}off.x1${TAB}wdown.x1${TAB}wup.x1" ]'
+ok "menu ids are action ids"           '[ -z "$(printf "%s\n" "$menu" | cut -f2,7- | tr "\t" "\n" | grep -v "^-$" | grep -v "^[A-Za-z0-9._-]*$")" ] && [ -z "$(for i in apply off.c1 on.c3 wdown.c1 wup.x1; do has_line "$acts" "$i${TAB}" || echo "$i"; done)" ]'
+ok "old mode and move actions refused" '! run do mode-failover >/dev/null && ! run do mode-wrr >/dev/null && ! run do mode-balance >/dev/null && ! run do up.c2 >/dev/null && ! run do down.c1 >/dev/null && [ ! -e "$T/patch.log" ] && [ ! -e "$T/fields.log" ]'
+cp "$D/config" "$T/conf.before"
+res=$(run do apply); rc=$?
+ok "apply: one PATCH, weighted-round-robin + affinity" '[ $rc = 0 ] && [ "$(cat "$T/patch.log")" = "{\"routing\":{\"strategy\":\"weighted-round-robin\",\"session-affinity\":true,\"session-affinity-subagents\":true,\"session-affinity-ttl\":\"1h\"}}" ] && has_line "$res" "proxy now uses weighted round-robin"'
+ok "apply: every priority cleared"     '[ "$(cat "$T/fields.log")" = "$(pr $NA 0 $NB 0 $ND 0 $NC 0)" ]'
+ok "apply: config not written"         'cmp -s "$T/conf.before" "$D/config"'
+fresh
+ok "matching proxy: no warning, no apply" '! has_line "$out" "proxy uses" && ! run actions | grep -q "^apply"'
+echo "{\"$NB\":{\"priority\":20}}" > "$T/over.json"; fresh
+ok "a priority left: warning + apply"  'has_line "$out" "⚠ proxy uses account priorities, so weights count only in the top tier" && run actions | grep -q "^apply"'
+echo "{\"$NB\":{\"weight\":0},\"$NC\":{\"weight\":0,\"disabled\":true}}" > "$T/over.json"; rm -f "$T/fields.log"; run do apply >/dev/null
+ok "apply: account on with weight 0 gets 1, off one keeps 0" 'grep -q "\"name\":\"$NB\".*\"weight\":1" "$T/fields.log" && ! grep -q "\"name\":\"$NC\".*\"weight\"" "$T/fields.log" && ! grep -q "\"name\":\"$NA\".*\"weight\"" "$T/fields.log"'
+rm -f "$T/over.json" "$T/fields.log"
+res=$(run do off.c1); rc=$?
+ok "off: status PATCH, disabled true"  '[ $rc = 0 ] && [ "$(cat "$T/status.log")" = "/v8/management/credentials/status {\"name\":\"$NA\",\"disabled\":true}" ] && has_line "$res" "wa@example.com: not used"'
+out=$(run rows)
+ok "off: rows and actions follow"      'has_line "$out" "wa@example.com  off" && has_line "$(run actions)" "on.c1${TAB}wa@example.com: use"'
+rm -f "$T/status.log"; run do on.c1 >/dev/null
+ok "on: disabled false"                '[ "$(cat "$T/status.log")" = "/v8/management/credentials/status {\"name\":\"$NA\",\"disabled\":false}" ]'
+cp "$T/over.json" "$T/over.keep" 2>/dev/null; echo "{\"$NA\":{\"weight\":0,\"disabled\":true}}" > "$T/over.json"; rm -f "$T/fields.log"; run do on.c1 >/dev/null
+ok "on: an account with weight 0 gets 1" 'grep -q "\"name\":\"$NA\",\"weight\":1" "$T/fields.log"'
+rm -f "$T/fields.log" "$T/over.json"; [ -f "$T/over.keep" ] && mv "$T/over.keep" "$T/over.json"
+echo v0 > "$T/mode"; rm -f "$T/status.log"; run do off.c2 >/dev/null; : > "$T/mode"
+ok "status: v0 fallback"               '[ "$(cat "$T/status.log")" = "/v0/management/auth-files/status {\"name\":\"$NB\",\"disabled\":true}" ]'
+rm -f "$T/over.json" "$T/patch.log" "$T/fields.log" "$T/status.log"
+echo "{\"$NB\":{\"weight\":3},\"$NC\":{\"weight\":0}}" > "$T/over.json"
+fresh
+ok "rows: ×N, off for 0 and unused" '[ "$(dlines)" = "  ${TAB}wa@example.com  ×1
+  ${TAB}wb@example.com  ×3
+  ${TAB}wd@example.com  off
+  ${TAB}wc@example.com  off" ]'
+ok "actions: use, weights"         '[ "$(alines)" = "off.c1${TAB}wa@example.com: don'"'"'t use
+wup.c1${TAB}wa@example.com: weight 1 → 2
+wdown.c1${TAB}wa@example.com: weight 1 → off
+off.c2${TAB}wb@example.com: don'"'"'t use
+wup.c2${TAB}wb@example.com: weight 3 → 4
+wdown.c2${TAB}wb@example.com: weight 3 → 2
+on.c3${TAB}wd@example.com: use
+off.x1${TAB}wc@example.com: don'"'"'t use
+wup.x1${TAB}wc@example.com: weight off → 1" ]'
+ok "menu: weight rows (×N, disabled kept)" '[ "$(run menu | sed -n "/^tab${TAB}checklist/,\$p")" = "tab${TAB}checklist${TAB}Accounts${TAB}weight
+row${TAB}c1${TAB}wa@example.com${TAB}1${TAB}1${TAB}claude${TAB}on.c1${TAB}off.c1${TAB}wdown.c1${TAB}wup.c1
+row${TAB}c2${TAB}wb@example.com${TAB}1${TAB}3${TAB}claude${TAB}on.c2${TAB}off.c2${TAB}wdown.c2${TAB}wup.c2
+row${TAB}c3${TAB}wd@example.com${TAB}0${TAB}1${TAB}claude${TAB}on.c3${TAB}off.c3${TAB}wdown.c3${TAB}wup.c3
+row${TAB}x1${TAB}wc@example.com${TAB}1${TAB}0${TAB}codex${TAB}on.x1${TAB}off.x1${TAB}wdown.x1${TAB}wup.x1" ]'
+ok "action ids fit the charset"        '[ -z "$(run actions | cut -f1 | grep -v "^[A-Za-z0-9._-]*$")" ]'
+rm -f "$T/fields.log"; res=$(run do wup.c2); rc=$?
+ok "raise: fields PATCH, name, integer" '[ $rc = 0 ] && [ "$(cat "$T/fields.log")" = "/v8/management/credentials/fields {\"name\":\"$NB\",\"weight\":4}" ] && has_line "$res" "wb@example.com: weight 4"'
+ok "raise: cache updated at once"      'has_line "$(run actions)" "wup.c2${TAB}wb@example.com: weight 4 → 5" && has_line "$(run rows)" "wb@example.com  ×4"'
+rm -f "$T/fields.log"; res=$(run do wdown.c1)
+ok "lower to 0: off"                   '[ "$(cat "$T/fields.log")" = "/v8/management/credentials/fields {\"name\":\"$NA\",\"weight\":0}" ] && has_line "$res" "off"'
+rm -f "$T/fields.log"
+ok "lower at 0 refused, no PATCH"      '! run do wdown.c1 >/dev/null && [ ! -e "$T/fields.log" ]'
+echo "{\"$NB\":{\"weight\":99}}" > "$T/over.json"; fresh
+ok "raise capped at 99"                '! has_line "$(run actions)" "wup.c2" && ! run do wup.c2 >/dev/null && [ ! -e "$T/fields.log" ]'
+for wv in 150 '"2.5"'; do
+  echo "{\"$NB\":{\"weight\":$wv}}" > "$T/over.json"; fresh; rm -f "$T/fields.log"
+  exp=99; [ "$wv" = 150 ] || exp=2
+  ok "weight $wv: labels clamped"      'has_line "$(run actions)" "wdown.c2${TAB}wb@example.com: weight $exp → $((exp - 1))"'
+  run do wdown.c2 >/dev/null; lo=$(cat "$T/fields.log" 2>/dev/null); rm -f "$T/fields.log"
+  echo "{\"$NB\":{\"weight\":$wv}}" > "$T/over.json"; fresh; run do wup.c2 >/dev/null; hi=$(cat "$T/fields.log" 2>/dev/null); rm -f "$T/fields.log"
+  ok "weight $wv: lower is cur-1"      '[ "$lo" = "/v8/management/credentials/fields {\"name\":\"$NB\",\"weight\":$((exp - 1))}" ]'
+  if [ $exp = 99 ]; then ok "weight $wv: raise refused"  '[ -z "$hi" ]'
+  else ok "weight $wv: raise is cur+1" '[ "$hi" = "/v8/management/credentials/fields {\"name\":\"$NB\",\"weight\":3}" ]'; fi
+done
+echo "{\"$NB\":{\"weight\":99}}" > "$T/over.json"; fresh; rm -f "$T/fields.log"
+ok "unknown or bad id refused"         '! run do wup.zz >/dev/null && ! run do "off.c1;x" >/dev/null && [ ! -e "$T/fields.log" ] && [ ! -e "$T/status.log" ]'
+echo v0 > "$T/mode"; run do wdown.c2 >/dev/null
+ok "weight: v0 fallback"               '[ "$(cat "$T/fields.log")" = "/v0/management/auth-files/fields {\"name\":\"$NB\",\"weight\":98}" ]'
+rm -f "$T/patch.log" "$T/put.log" "$T/fields.log"; run do apply >/dev/null; r1=$?
+ok "v0: apply is a strategy PUT, v0 priorities" '[ $r1 = 0 ] && [ ! -e "$T/patch.log" ] && [ "$(cat "$T/put.log")" = "PUT {\"value\":\"weighted-round-robin\"}" ] && grep -q "^/v0/management/auth-files/fields .*\"priority\":0" "$T/fields.log"'
+: > "$T/mode"; rm -f "$T/put.log" "$T/patch.log" "$T/fields.log" "$T/status.log"
 conf "url=$URL" "key=$CK"
-res=$(run do mode-balance); rc=$?
-ok "no mgmt key: config only"          '[ $rc = 0 ] && grep -qx mode=balance "$D/config" && has_line "$res" "proxy not changed (no management key)" && [ ! -e "$T/patch.log" ] && [ ! -e "$T/put.log" ]'
-ok "no mgmt key: no apply action"      '! run actions | grep -q "^apply"'
-ok "no mgmt key: do apply refuses"     '! run do apply >/dev/null'
+res=$(run do apply); rc=$?
+ok "no mgmt key: do apply refuses"     '[ $rc != 0 ] && has_line "$res" "proxy not changed (no management key)" && [ ! -e "$T/patch.log" ] && [ ! -e "$T/put.log" ] && [ ! -e "$T/fields.log" ]'
+ok "no mgmt key: no apply, no account actions" '! run actions | grep -q "^apply" && [ -z "$(alines)" ]'
+ok "no mgmt key: menu has only the Actions tab" '[ "$(run menu)" = "tab${TAB}list${TAB}Actions" ]'
+nk=; for a in on.c1 off.c1 wup.c1 wdown.c1; do res=$(run do $a); rc=$?; [ $rc != 0 ] && [ "$res" = "needs the management key" ] || nk="$nk $a"; done
+ok "no mgmt key: every account action refuses" '[ -z "$nk" ] && [ ! -e "$T/fields.log" ] && [ ! -e "$T/status.log" ]'
+conf "url=$URL" "key=$CK" "mgmt_key=$MK"
+wall=$(run rows; run actions; run do off.c1; run do on.c1; run do apply; run do wup.c1; run do wdown.c1; cat "$D"/cache/* "$T"/*.log 2>/dev/null)
+ok "accounts: keys never printed"      '! printf "%s" "$wall" | grep -qe "$CK" -e "$MK"'
+rm -f "$T/creds.json" "$T/routing.json" "$T/over.json" "$T"/fields.log "$T/status.log" "$T/patch.log"; rm -rf "$D/cache"
+conf "url=$URL" "key=$CK" "mgmt_key=$MK"
+
+# ── link launcher accounts: fake Keychain (security), fake cla / codex logins, curl argv logged ──
+L=$T/link; mkdir -p "$L/cla/k1" "$L/cla/k2" "$L/cla/k3" "$L/cla/k4" "$L/acc/codex/cw" "$T/kc" "$T/argv"
+for a in k1:k1@example.com k2:K2@Example.com k3:K3@Example.com k4:k4@example.com; do echo "{\"oauthAccount\":{\"emailAddress\":\"${a#*:}\"}}" > "$L/cla/${a%%:*}/.claude.json"; done
+svc="Claude Code-credentials-$("$PY" -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:8])' "$L/cla/k1")"
+echo '{"claudeAiOauth":{"accessToken":"TOK-K1-ACCESS","refreshToken":"TOK-K1-REFRESH","expiresAt":1893456000000,"scopes":["user:inference"]}}' > "$T/kc/$svc"
+echo '{"claudeAiOauth":{"accessToken":"TOK-K2-ACCESS","refreshToken":"TOK-K2-REFRESH","expiresAt":1893456000000}}' > "$L/cla/k2/.credentials.json"
+b64() { printf '%s' "$1" | base64 | tr '+/' '-_' | tr -d '=\n'; }
+CXID="h.$(b64 '{"email":"cx@example.com"}').TOK-CX-IDSIG" CXAT="h.$(b64 '{"exp":1893456000}').TOK-CX-ATSIG"
+echo "{\"tokens\":{\"id_token\":\"$CXID\",\"access_token\":\"$CXAT\",\"refresh_token\":\"TOK-CX-REFRESH\",\"account_id\":\"acct-1\"}}" > "$L/acc/codex/cw/auth.json"
+printf 'cw\tcodex --x\tCodex cw\nother\tgemini\tGemini\n' > "$L/providers"
+printf '#!/bin/sh\necho "$*" >> "%s/security.argv"\ns=; p=; for a; do [ "$p" = -s ] && s=$a; p=$a; done\n[ -f "%s/kc/$s" ] || exit 44\ncat "%s/kc/$s"\n' "$T" "$T" "$T" > "$T/kc/security"
+printf '#!/bin/sh\necho "$*" >> "%s/curl.argv"\nfor a; do case $a in file=@*) f=${a#file=@}; ls -l "${f%%%%;*}" | cut -c1-10 >> "%s/upload.mode" ;; esac; done\nexec "%s" "$@"\n' "$T" "$T" "$(command -v curl)" > "$T/argv/curl"; chmod +x "$T/kc/security" "$T/argv/curl"
+lrun() { CLA_ROOT=$L/cla AI_PROVIDERS=$L/providers AI_ACCOUNTS=$L/acc RP=$T/argv:$T/kc:$BASEPATH run "$@"; }
+echo "{\"files\":[$(acc c1 claude k3@example.com)]}" > "$T/creds.json"; rm -rf "$T/uploads"
+conf "url=$URL" "key=$CK" "mgmt_key=$MK"; rm -rf "$D/cache"; lrun rows >/dev/null; wait_cache; out=$(lrun rows)
+ok "link: not-linked accounts listed, no number, case-insensitive match" '[ "$(printf "%s\n" "$out" | grep "^  ${TAB}.*not linked$")" = "  ${TAB}k1@example.com  not linked
+  ${TAB}K2@Example.com  not linked
+  ${TAB}k4@example.com  not linked
+  ${TAB}cx@example.com  not linked" ] && has_line "$out" "  ${TAB}k3@example.com  ×1"'
+ok "link: launch row with the count"   '[ "$(printf "%s\n" "$out" | tail -1)" = "link${TAB}+ Link launcher accounts${TAB}4 not linked" ]'
+acts=$(lrun actions)
+ok "link: one action per account, then link all" '[ "$(printf "%s\n" "$acts" | grep "^link")" = "link.claude-k1${TAB}k1@example.com: link to proxy
+link.claude-k2${TAB}K2@Example.com: link to proxy
+link.claude-k4${TAB}k4@example.com: link to proxy
+link.codex-cw${TAB}cx@example.com: link to proxy
+link${TAB}Link all launcher accounts" ]'
+menu=$(lrun menu)
+ok "link: menu has link all, not-linked rows last, tick = link" 'has_line "$menu" "item${TAB}link${TAB}Link all launcher accounts" && [ "$(printf "%s\n" "$menu" | sed -n "/^tab${TAB}checklist/,\$p")" = "tab${TAB}checklist${TAB}Accounts${TAB}weight
+row${TAB}c1${TAB}k3@example.com${TAB}1${TAB}1${TAB}claude${TAB}on.c1${TAB}off.c1${TAB}wdown.c1${TAB}wup.c1
+row${TAB}claude-k1${TAB}k1@example.com${TAB}0${TAB}-${TAB}claude · not linked${TAB}link.claude-k1${TAB}-${TAB}-${TAB}-
+row${TAB}claude-k2${TAB}K2@Example.com${TAB}0${TAB}-${TAB}claude · not linked${TAB}link.claude-k2${TAB}-${TAB}-${TAB}-
+row${TAB}claude-k4${TAB}k4@example.com${TAB}0${TAB}-${TAB}claude · not linked${TAB}link.claude-k4${TAB}-${TAB}-${TAB}-
+row${TAB}codex-cw${TAB}cx@example.com${TAB}0${TAB}-${TAB}codex · not linked${TAB}link.codex-cw${TAB}-${TAB}-${TAB}-" ]'
+ok "link: a not-linked account has no weight" 'has_line "$out" "  ${TAB}k1@example.com  not linked" && ! has_line "$out" "k1@example.com  ×"'
+: > "$T/curl.argv"; : > "$T/security.argv"; : > "$T/srv.log"
+res=$(lrun do link 2>&1); rc=$?
+ok "link: per-account result, rc 1 when one is skipped" '[ $rc = 1 ] && [ "$res" = "linked k1@example.com
+linked K2@Example.com
+skipped k4@example.com: no saved login found
+linked cx@example.com" ]'
+ok "link: Keychain service from the config dir hash, account \$USER" 'grep -qxF -- "find-generic-password -a $(USER=${USER:-} sh -c "echo \${USER:-claude-code-user}") -w -s $svc" "$T/security.argv"'
+ok "link: claude auth file (Keychain)" 'jq -e ".type == \"claude\" and .access_token == \"TOK-K1-ACCESS\" and .refresh_token == \"TOK-K1-REFRESH\" and .id_token == \"\" and .email == \"k1@example.com\" and .expired == \"2030-01-01T00:00:00Z\" and (.last_refresh | test(\"^20[0-9][0-9]-[0-9-]+T[0-9:]+Z$\"))" "$T/uploads/claude-k1@example.com.json" >/dev/null'
+ok "link: claude auth file (.credentials.json)" 'jq -e ".access_token == \"TOK-K2-ACCESS\" and .refresh_token == \"TOK-K2-REFRESH\" and .email == \"K2@Example.com\"" "$T/uploads/claude-K2@Example.com.json" >/dev/null'
+ok "link: codex auth file"             'jq -e ".type == \"codex\" and .id_token == \"$CXID\" and .access_token == \"$CXAT\" and .refresh_token == \"TOK-CX-REFRESH\" and .account_id == \"acct-1\" and .email == \"cx@example.com\" and .expired == \"2030-01-01T00:00:00Z\" and (.last_refresh | length > 0)" "$T/uploads/codex-cx@example.com.json" >/dev/null'
+ok "link: account already in proxy not uploaded" '[ "$(ls "$T/uploads" | grep -ic k3)" = 0 ] && [ "$(ls "$T/uploads" | grep -c .)" = 3 ] && grep -q "POST /v0/management/auth-files" "$T/srv.log"'
+ok "link: no token in output, argv, log or leftover files" '! printf "%s" "$res" | grep -q TOK- && ! grep -q TOK- "$T/curl.argv" "$T/security.argv" "$T/srv.log" && [ -z "$(grep -rl TOK- "$D" "$T/work")" ] && grep -q "file=@" "$T/curl.argv"'
+out=$(lrun rows)
+ok "link: rows follow at once"         '[ "$(printf "%s\n" "$out" | grep "^  ${TAB}.*not linked$")" = "  ${TAB}k4@example.com  not linked" ] && has_line "$out" "k1@example.com  ×1"'
+res=$(lrun do link.claude-k4); rc=$?; res2=$(lrun do link.claude-k1); rc2=$?
+ok "link.<id>: one account, unknown refused" '[ $rc = 1 ] && [ "$res" = "skipped k4@example.com: no saved login found" ] && [ $rc2 = 1 ] && has_line "$res2" "already linked"'
+res=$(lrun launch link </dev/null); rc=$?
+ok "launch link runs the same link"    '[ $rc = 1 ] && [ "$res" = "skipped k4@example.com: no saved login found" ]'
+rm -rf "$L/cla/k4"; res=$(lrun do link); rc=$?
+ok "link: nothing left says so, no launch row" '[ $rc = 0 ] && has_line "$res" "nothing to link" && ! lrun rows | grep -q "^link${TAB}"'
+conf "url=$URL" "key=$CK"; res=$(lrun do link); rc=$?
+ok "link: needs the management key"    '[ $rc = 1 ] && [ "$res" = "needs the management key" ] && ! lrun actions | grep -q "^link"'
+# a proxy file with no email but the target name (any case) is never uploaded over; one email twice: one upload
+conf "url=$URL" "key=$CK" "mgmt_key=$MK"
+echo '{"files":[{"auth_index":"c9","name":"Claude-K1@Example.com.json","provider":"claude","disabled":false}]}' > "$T/creds.json"
+mkdir -p "$L/cla/k6"; echo '{"oauthAccount":{"emailAddress":"K2@EXAMPLE.com"}}' > "$L/cla/k6/.claude.json"; cp "$L/cla/k2/.credentials.json" "$L/cla/k6/"
+rm -rf "$D/cache" "$T/uploads"; : > "$T/upload.mode"; echo upfail > "$T/mode"
+res=$(lrun do link); rc=$?; : > "$T/mode"
+ok "link: failed upload shows the proxy's error, no token" 'has_line "$res" "skipped cx@example.com: the proxy refused it (HTTP 500): failed to write file: x" && ! printf "%s\n" "$res" | grep -q TOK-'
+ok "link: failed upload: temp file was 600, nothing left" '[ $rc = 1 ] && has_line "$res" "skipped cx@example.com: the proxy refused it (HTTP 500)" && [ -s "$T/upload.mode" ] && [ -z "$(grep -v "^-rw-------" "$T/upload.mode")" ] && [ -z "$(ls "$D/cache" | grep "^link")" ] && [ -z "$(grep -rl TOK- "$D")" ]'
+res=$(lrun do link); rc=$?
+ok "link: a same-name proxy file is never overwritten" 'has_line "$res" "skipped k1@example.com: a proxy file named claude-k1@example.com.json already exists" && [ ! -e "$T/uploads/claude-k1@example.com.json" ] && grep -q "Claude-K1@Example.com.json" "$T/creds.json" && [ "$(ls "$T/uploads" | grep -ic "^claude-k1")" = 0 ]'
+ok "link: one upload per email (any case)" '[ "$(ls "$T/uploads" | grep -ic "k2@example.com")" = 1 ] && [ "$(printf "%s\n" "$res" | grep -ic "k2@example.com")" = 1 ] && has_line "$res" "linked cx@example.com"'
+rm -f "$T/creds.json"; rm -rf "$D/cache" "$T/uploads"
 
 # ── proxy text cannot inject control chars ──
 conf "url=$URL" "key=$CK" "mgmt_key=$MK"
@@ -341,7 +556,6 @@ conf "url=$URL" "key=$CK" "mgmt_key=$MK"
 # ── all accounts limited ──
 LIM='{"five_hour":{"utilization":100,"resets_at":"RESET"},"seven_day":{"utilization":10,"resets_at":null}}'
 FREE='{"five_hour":{"utilization":5,"resets_at":null},"seven_day":{"utilization":5,"resets_at":null}}'
-fresh() { rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows); }
 cred() { printf '{"auth_index":"%s","provider":"%s","status":"active","disabled":false,"success":1,"failed":0%s}' "$1" "$2" "${3:+,$3}"; }
 rst() { python3 -c "import datetime,sys;print((datetime.datetime.utcnow()+datetime.timedelta(seconds=int(sys.argv[1]))).strftime('%Y-%m-%dT%H:%M:%S+00:00'))" "$1"; }
 r1=$(rst 7500); r2=$(rst 3900)
@@ -365,8 +579,55 @@ fresh
 ok "cooldown/unavailable alone counts"    'has_line "$out" "⚠ all Claude accounts limited · next reset ↻1h" && has_line "$out" "proxy up · Claude limited"'
 rm -f "$T/creds.json" "$T/quota.json"; rm -rf "$D/cache"
 
+# ── account in use (recent_requests) and the status line ──
+hmr() { "$PY" -c 'import datetime,sys; print((datetime.datetime.now()+datetime.timedelta(minutes=int(sys.argv[1]))).strftime("%H:%M"))' "$1"; }
+isor() { "$PY" -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(minutes=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"; }
+B1="$(hmr -50)-$(hmr -40)" B2="$(hmr -25)-$(hmr -15)" B3="$(hmr -5)-$(hmr 5)"   # ended 40 min ago, ended 15 min ago, running
+rrs() { printf '"[3]{failed:int,success:int,time:string}\\n  0,%s,%s\\n  1,%s,%s\\n  0,%s,%s\\n"' "$1" "$B1" "$2" "$B2" "$3" "$B3"; }   # oldest first
+rra() { printf '[{"time":"%s","success":%s,"failed":0},{"time":"%s","success":%s,"failed":0}]' "$(isor "$1")" "$2" "$(isor "$3")" "$4"; }   # ISO bucket starts
+iu() {  # iu <x1 success 25 min ago> <c1 success in the running bucket>
+  echo "{\"files\":[$(cred c1 claude "\"email\":\"ia@example.com\",\"recent_requests\":$(rrs 9 2 "$2")"),$(cred c2 claude "\"email\":\"ib@example.com\",\"recent_requests\":$(rrs 0 5 0)"),$(cred c3 claude "\"email\":\"ic@example.com\",\"disabled\":true,\"recent_requests\":$(rrs 0 0 7)"),$(cred x1 codex "\"email\":\"ix@example.com\",\"recent_requests\":$(rra -25 "$1" -5 0)"),$(cred x2 codex "\"email\":\"iy@example.com\",\"recent_requests\":$(rra -200 5 -190 0)"),$(cred g1 gemini "\"email\":\"ig@example.com\",\"recent_requests\":$(rrs 0 0 9)")]}" > "$T/creds.json"
+}
+iu 1 0; fresh
+ok "in use: newest recent bucket, most successes, disabled skipped" 'has_line "$out" "  ${TAB}in use: claude ib@example.com · codex ix@example.com · gemini ig@example.com"'
+iu 0 1; fresh
+ok "in use: the newest bucket wins over more successes" 'has_line "$out" "in use: claude ia@example.com"'
+ok "in use: a success over 20 min old does not count" '! has_line "$out" "codex i"'
+JQD=$(sed -n "/^JQDEF='/,/;'\$/p" "$P" | sed "1s/^JQDEF='//;\$s/'\$//")
+ok "in use: bucket age across midnight" '[ "$(jq -nc "$JQD"'"'"'["23:50-00:00", "00:00-00:10", "12:00-12:10", "23:40"] | map(bage(0; 5))'"'"')" = "[5,-5,715,15]" ]'
+iu 1 0; fresh
+SIN='{"model":{"id":"claude-sonnet-4-5","display_name":"Sonnet"},"session_id":"s1"}'
+sl() { printf '%s' "$1" | run statusline; }
+rm -rf "$HOME/.claude"
+ok "statusline: no own status line: the account only" '[ "$(sl "$SIN")" = "proxy: claude ib@example.com" ]'
+ok "statusline: provider from the model id" '[ "$(sl "{\"model\":{\"id\":\"gpt-5\"}}")" = "proxy: codex ix@example.com" ] && [ "$(sl "{\"model\":{\"id\":\"gemini-3-pro\"}}")" = "proxy: gemini ig@example.com" ]'
+mkdir -p "$HOME/.claude"; printf '{"statusLine":{"type":"command","command":"cat > %s/sl.in; echo ORIG"}}' "$T" > "$HOME/.claude/settings.json"
+ok "statusline: own status line first, fed the same stdin" '[ "$(sl "$SIN")" = "ORIG · proxy: claude ib@example.com" ] && [ "$(cat "$T/sl.in")" = "$SIN" ]'
+PJ=$T/proj; mkdir -p "$PJ/.claude"
+printf '{"statusLine":{"type":"command","command":"echo PROJ"}}' > "$PJ/.claude/settings.json"
+printf '{"statusLine":{"type":"command","command":"echo LOCAL; pwd"}}' > "$PJ/.claude/settings.local.json"
+SPJ="{\"model\":{\"id\":\"claude-x\"},\"workspace\":{\"current_dir\":\"$PJ\"}}"
+o1=$(sl "$SPJ"); rm "$PJ/.claude/settings.local.json"; o2=$(sl "$SPJ"); rm "$PJ/.claude/settings.json"; o3=$(sl "$SPJ")
+ok "statusline: project local, then project, then user, run in the session folder" '[ "$o1" = "LOCAL
+$PJ · proxy: claude ib@example.com" ] && [ "$o2" = "PROJ · proxy: claude ib@example.com" ] && [ "$o3" = "ORIG · proxy: claude ib@example.com" ]'
+ok "statusline: .cwd also names the session folder" 'printf "{\"statusLine\":{\"command\":\"echo CWD\"}}" > "$PJ/.claude/settings.json" && [ "$(sl "{\"cwd\":\"$PJ\"}")" = "CWD · proxy: claude ib@example.com" ] && rm "$PJ/.claude/settings.json"'
+printf '{"statusLine":{"type":"command","command":"sleep 37 & sleep 38; echo LATE"}}' > "$HOME/.claude/settings.json"
+t0=$(date +%s); o=$(sl "$SIN"); t1=$(date +%s)
+i=0; while [ $i -lt 30 ] && ps -A -o command= | grep -q "^sleep 3[78]$"; do sleep 0.2; i=$((i + 1)); done   # a busy CI runner reaps late
+ok "statusline: a slow own status line is cut at 2 s, children too" '[ "$o" = "proxy: claude ib@example.com" ] && [ $((t1 - t0)) -lt 6 ] && [ "$(ps -A -o command= | grep -c "^sleep 3[78]$")" = 0 ]'
+printf '{"statusLine":{"type":"command","command":"echo ORIG"}}' > "$HOME/.claude/settings.json"
+run launch all >/dev/null 2>&1
+o=$(printf '%s' "$SIN" | (cd "$T/work" && PATH=$BASEPATH bash -c "$(jq -r .statusLine.command "$D/cache/claude-settings.json")"))
+ok "statusline: the launch settings command runs it" '[ "$o" = "ORIG · proxy: claude ib@example.com" ] && ! printf "%s" "$o" | grep -qe "$CK" -e "$MK"'
+rm -rf "$HOME/.claude"
+iu 0 0; old=$(( $(date +%s) - 120 )); { echo "$old"; tail -n +2 "$D/cache/usage"; } > "$D/cache/u.tmp"; mv "$D/cache/u.tmp" "$D/cache/usage"
+t0=$(date +%s); o=$(sl "{\"model\":{\"id\":\"gpt-5\"}}"); t1=$(date +%s)
+ok "statusline: stale cache answers at once, from the cache" '[ "$o" = "proxy: codex ix@example.com" ] && [ $((t1 - t0)) -lt 2 ]'
+ok "statusline: stale cache refreshed in the background" 'wait_cache "$old" && [ -z "$(sl "{\"model\":{\"id\":\"gpt-5\"}}")" ]'
+rm -rf "$HOME/.claude" "$PJ" "$T/creds.json" "$T/sl.in"; rm -rf "$D/cache"
+
 # ── key safety ──
-all=$(run rows; run actions; run launch nope 2>&1; run do apply; run do mode-failover; cat "$D"/cache/* "$T"/*.log 2>/dev/null)
+all=$(run rows; run actions; run launch nope 2>&1; run do apply; cat "$D"/cache/* "$T"/*.log 2>/dev/null)
 ok "keys never printed or cached"      '! printf "%s" "$all" | grep -qe "$CK" -e "$MK" -e "$MYKEY"'
 ok "cache is private"                  'case $(ls -ld "$D/cache") in drwx------*) true;; *) false;; esac'
 
@@ -416,34 +677,57 @@ Y0='management:\n  secret-key: ""\naccess:\n  api-keys: []\n'
 newsp "proxy_config=$T/proxy.yaml"; printf "$Y0" > "$T/proxy.yaml"; cp "$T/proxy.yaml" "$T/proxy.orig"
 out=$(RP=$FK/cpa:$FK/brew:$T/jq:$T/sys st </dev/null); rc=$?
 ok "setup: uses an existing cliproxyapi" '[ $rc = 0 ] && has_line "$out" "found $FK/cpa/cliproxyapi" && has_line "$out" "use it" && ! grep -q "^install" "$T/brew.log" && has_line "$out" "Done. \"Claude Code · all accounts\" is ready."'
+ok "setup: model sub-agents saved for launch" 'printf "%s\n" "$out" | grep "\[5/5\] Agents" | grep -q "4 model sub-agents.* ready$" && [ "$(jq -r "keys | join(\" \")" "$SP/cache/agents.json")" = "claude-sonnet-4-5 gemini-3-pro gpt-5 gpt-6-1-sol" ]'
 k1=$(sed -n 's/^key=//p' "$SP/config"); m1=$(sed -n 's/^mgmt_key=//p' "$SP/config"); cp "$T/proxy.yaml" "$T/proxy.run1"
 out=$(st </dev/null); rc=$?
-ok "setup: keys created once, kept on rerun" '[ $rc = 0 ] && [ ${#k1} = 64 ] && [ ${#m1} = 64 ] && [ "$k1" != "$m1" ] && [ "$(sed -n "s/^key=//p" "$SP/config")" = "$k1" ] && [ "$(sed -n "s/^mgmt_key=//p" "$SP/config")" = "$m1" ] && case $(ls -l "$SP/config") in -rw-------*) true;; *) false;; esac && cmp -s "$T/proxy.orig" "$T/proxy.yaml.ai-launcher.bak" && [ "$(ls "$T" | grep -c "^proxy.yaml.ai-launcher")" = 1 ] && grep -qx "  secret-key: \"$m1\"" "$T/proxy.yaml" && grep -qx "    - \"$k1\"" "$T/proxy.yaml" && cmp -s "$T/proxy.run1" "$T/proxy.yaml" && printf "%s\n" "$out" | grep "\[2/4\] Keys" | grep -q " kept$"'
+ok "setup: keys created once, kept on rerun" '[ $rc = 0 ] && [ ${#k1} = 64 ] && [ ${#m1} = 64 ] && [ "$k1" != "$m1" ] && [ "$(sed -n "s/^key=//p" "$SP/config")" = "$k1" ] && [ "$(sed -n "s/^mgmt_key=//p" "$SP/config")" = "$m1" ] && case $(ls -l "$SP/config") in -rw-------*) true;; *) false;; esac && cmp -s "$T/proxy.orig" "$T/proxy.yaml.ai-launcher.bak" && [ "$(ls "$T" | grep -c "^proxy.yaml.ai-launcher.bak")" = 1 ] && [ "$(cat "$T/proxy.yaml.ai-launcher.key")" = "$m1" ] && case $(ls -l "$T/proxy.yaml.ai-launcher.key") in -rw-------*) true;; *) false;; esac && grep -qx "  secret-key: \"$m1\"" "$T/proxy.yaml" && grep -qx "    - \"$k1\"" "$T/proxy.yaml" && cmp -s "$T/proxy.run1" "$T/proxy.yaml" && printf "%s\n" "$out" | grep "\[2/5\] Keys" | grep -q " kept$"'
+n0=$(diff "$T/proxy.orig" "$T/proxy.run1" | grep -c "^[<>]")
+newsp "proxy_config=$T/proxy.yaml"; { printf 'server:\n  auth-dir: "~/.cli-proxy-api"\n'; printf "$Y0"; } > "$T/proxy.yaml"; cp "$T/proxy.yaml" "$T/proxy.orig"
+out=$(RP=$FK/cpa:$FK/brew:$T/jq:$T/sys st </dev/null); rc=$?
+ok "setup: auth-dir ~/ becomes \$HOME/, nothing else of the file changes" '[ $rc = 0 ] && grep -qx "  auth-dir: \"$HOME/.cli-proxy-api\"" "$T/proxy.yaml" && [ "$(diff "$T/proxy.orig" "$T/proxy.yaml" | grep -c "^[<>]")" = $((n0 + 2)) ] && head -1 "$T/proxy.yaml" | grep -qx "server:"'
 
 # a config you already had (secret set, sample key, host ""): never edited; strict proxy checks every key
 : > "$T/mode"
 userconf() {
-  newsp "proxy_config=$T/proxy.yaml"
+  newsp "proxy_config=$T/proxy.yaml"; rm -f "$T/proxy.yaml.ai-launcher.key"
   printf '%s\n' 'server:' '  host: ""' 'management:' '  secret-key: "$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012"' 'access:' '  api-keys:' '    - "your-api-key-1"' '    - "old-key"' > "$T/proxy.yaml"
   cp "$T/proxy.yaml" "$T/proxy.orig"; echo '["old-key"]' > "$T/apikeys.json"
 }
-userconf; out=$(printf 'pasted-mgmt-SECRET\n%s\n' "$MK" | st); rc=$?
+userconf; out=$(printf 'n\np\npasted-mgmt-SECRET\n%s\n' "$MK" | st); rc=$?
 ok "setup: existing secret-key is never replaced" '[ $rc = 0 ] && cmp -s "$T/proxy.orig" "$T/proxy.yaml" && [ ! -e "$T/proxy.yaml.ai-launcher.bak" ] && grep -qx "mgmt_key=$MK" "$SP/config"'
 ok "setup: a pasted management key is checked, asked again" '[ "$(printf "%s\n" "$out" | grep -c "paste the management key:")" = 2 ] && has_line "$out" "the proxy refused that key (HTTP 401)"'
 ok "setup: client key appended through the API" '[ "$(cat "$T/apikeys.json")" = "[\"old-key\",\"$(sed -n "s/^key=//p" "$SP/config")\"]" ] && has_line "$out" "Done."'
 userconf; out=$(CLIPROXY_MGMT_KEY=$MK st </dev/null); rc=$?
 ok "setup: management key from the env, checked, no prompt" '[ $rc = 0 ] && ! has_line "$out" "paste the" && grep -qx "mgmt_key=$MK" "$SP/config"'
-userconf; out=$(printf 'bad1\nbad2\nbad3\n' | st); rc=$?
+userconf; out=$(printf 'n\np\nbad1\nbad2\nbad3\n' | st); rc=$?
 ok "setup: 3 wrong management keys stop, nothing saved" '[ $rc != 0 ] && ! grep -q "^mgmt_key=" "$SP/config" && ! has_line "$out" "Done." && [ "$(printf "%s\n" "$out" | grep -c "refused that key (HTTP 401)")" = 3 ]'
-userconf; echo 'anykey keysfail' > "$T/mode"; out=$(printf '%s\n' "$MK" | st); rc=$?
+userconf; echo 'anykey keysfail' > "$T/mode"; out=$(printf 'n\np\n%s\n' "$MK" | st); rc=$?
 ok "setup: client key not added: fails, not ready" '[ $rc != 0 ] && has_line "$out" "could not add the client key" && ! has_line "$out" "Done."'
+
+# lost management key (plugin removed and added again): reset it in the proxy config, or reuse the client key there
+: > "$T/mode"
+userconf; out=$(printf 'n\nr\n' | st); rc=$?; nk=$(sed -n 's/^mgmt_key=//p' "$SP/config")
+ok "setup: reset rewrites only secret-key, backs up, saves the key" '[ $rc = 0 ] && [ ${#nk} = 64 ] && has_line "$out" "  management key: $nk" && [ "$(printf "%s\n" "$out" | grep -cF -- "$nk")" = 1 ] && grep -qx "  secret-key: \"$nk\"" "$T/proxy.yaml" && [ "$(diff "$T/proxy.orig" "$T/proxy.yaml" | grep -c "^[<>]")" = 2 ] && cmp -s "$T/proxy.orig" "$T/proxy.yaml.ai-launcher.bak" && has_line "$out" "Done."'
+userconf; echo old-backup > "$T/proxy.yaml.ai-launcher.bak"; chmod 640 "$T/proxy.yaml"
+out=$(printf 'n\nr\n' | st); rc=$?; nk=$(sed -n 's/^mgmt_key=//p' "$SP/config"); b=$(ls "$T" | grep '^proxy\.yaml\.ai-launcher\.bak\.[0-9]*$')
+ok "setup: reset with an older .bak: new timestamped backup, perms kept, atomic" '[ $rc = 0 ] && [ "$(printf "%s\n" "$b" | grep -c .)" = 1 ] && cmp -s "$T/proxy.orig" "$T/$b" && [ "$(cat "$T/proxy.yaml.ai-launcher.bak")" = old-backup ] && has_line "$out" "(the old file is in $T/$b)" && case $(ls -l "$T/proxy.yaml") in -rw-r-----*) true;; *) false;; esac && [ -z "$(ls "$T" | grep "^proxy\.yaml\.[0-9]")" ] && grep -qx "  secret-key: \"$nk\"" "$T/proxy.yaml" && has_line "$out" "  management key: $nk" && [ "$(printf "%s\n" "$out" | grep -cF -- "$nk")" = 1 ]'
+userconf; printf 'n\nr\n' | st >/dev/null; nk=$(sed -n 's/^mgmt_key=//p' "$SP/config")
+stop2; rm -rf "$SP"; cp -R "$REPO/plugins-extra/cliproxy" "$SP"; printf 'url=%s\nproxy_config=%s\n' "$URL" "$T/proxy.yaml" > "$SP/config"; chmod 600 "$SP/config"
+out=$(printf 'n\n' | st); rc=$?
+ok "setup: plugin removed and added again: kept management key, no prompt" '[ $rc = 0 ] && grep -qx "mgmt_key=$nk" "$SP/config" && has_line "$out" "using the management key kept in $T/proxy.yaml.ai-launcher.key" && ! has_line "$out" "paste" && ! has_line "$out" "[r]eset" && has_line "$out" "  management key: $nk" && [ "$(printf "%s\n" "$out" | grep -cF -- "$nk")" = 1 ]'
+userconf; chmod 444 "$T/proxy.yaml"; out=$(printf 'n\n%s\n' "$MK" | st); rc=$?; chmod 644 "$T/proxy.yaml"
+ok "setup: read-only proxy config: paste only" '[ $rc = 0 ] && ! has_line "$out" "[r]eset" && grep -qx "mgmt_key=$MK" "$SP/config"'
+userconf; out=$(CLIPROXY_MGMT_KEY=$MK st </dev/null); rc=$?
+ok "setup: reuses a working client key from the proxy config" '[ $rc = 0 ] && grep -qx "key=old-key" "$SP/config" && [ "$(cat "$T/apikeys.json")" = "[\"old-key\"]" ] && has_line "$out" "use the client key already in" && cmp -s "$T/proxy.orig" "$T/proxy.yaml"'
+userconf; echo '[]' > "$T/apikeys.json"; out=$(CLIPROXY_MGMT_KEY=$MK st </dev/null); rc=$?
+ok "setup: a client key the proxy refuses is not offered" '[ $rc = 0 ] && ! has_line "$out" "use the client key already in" && ! grep -qx "key=old-key" "$SP/config"'
 
 # a proxy already running with a config setup does not know: never invent keys or a config for it
 : > "$T/mode"; newsp
 out=$(printf 'k\nwrong-client\n%s\n%s\n' "$CK" "$MK" | st); rc=$?
 ok "setup: running unknown proxy: keys asked, checked, saved" '[ $rc = 0 ] && grep -qx "key=$CK" "$SP/config" && grep -qx "mgmt_key=$MK" "$SP/config" && ! grep -q "^proxy_config=" "$SP/config" && ! grep -q "^start_cmd=" "$SP/config" && [ ! -e "$SP/run/config.yaml" ] && has_line "$out" "refused that key (HTTP 401)" && has_line "$out" "Done."'
 out=$(st </dev/null); rc=$?
-ok "setup: running unknown proxy: rerun keeps checked keys" '[ $rc = 0 ] && ! has_line "$out" "paste the" && printf "%s\n" "$out" | grep "\[2/4\] Keys" | grep -q " kept$"'
+ok "setup: running unknown proxy: rerun keeps checked keys" '[ $rc = 0 ] && ! has_line "$out" "paste the" && printf "%s\n" "$out" | grep "\[2/5\] Keys" | grep -q " kept$"'
 newsp; out=$(printf 'k\nx1\nx2\nx3\n' | st); rc=$?
 ok "setup: running unknown proxy: wrong keys stop, nothing saved" '[ $rc != 0 ] && ! grep -q "^key=" "$SP/config" && [ ! -e "$SP/run/config.yaml" ] && ! has_line "$out" "Done."'
 echo anykey > "$T/mode"; newsp; printf "$Y0" > "$T/proxy.yaml"
@@ -459,7 +743,7 @@ ok "setup: a just-installed config loses sample keys and binds localhost" '! gre
 stop2; rm -rf "$SP" "$T/bp" "$T/auth"; newsp "url=http://127.0.0.1:$P2"; mkdir -p "$T/bp/etc"
 printf '%s\n' 'server:' '  host: ""' "  port: $P2" 'management:' '  secret-key: "$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012"' 'access:' '  api-keys:' '    - "your-api-key-1"' '    - "old-key"' > "$T/bp/etc/cliproxyapi.conf"
 cp "$T/bp/etc/cliproxyapi.conf" "$T/bp.orig"; echo '["old-key"]' > "$T/apikeys.json"
-out=$(printf 'i\n%s\n' "$MK" | RP=$FK/brew:$T/jq:$T/sys st); rc=$?
+out=$(printf 'i\n\np\n%s\n' "$MK" | RP=$FK/brew:$T/jq:$T/sys st); rc=$?
 ok "setup: a brew config that existed before install stays byte-identical" '[ $rc = 0 ] && grep -qx "install cliproxyapi" "$T/brew.log" && cmp -s "$T/bp.orig" "$T/bp/etc/cliproxyapi.conf" && [ ! -e "$T/bp/etc/cliproxyapi.conf.ai-launcher.bak" ]'
 
 newsp "url=http://127.0.0.1:$P2"; out=$(echo m | RP=$FK/brew:$T/jq:$T/sys st); rc=$?
@@ -500,11 +784,22 @@ ok "setup: accounts all logs in each launcher account not in proxy" '[ $rc = 0 ]
 ok "setup: codex uses device login"    'grep -qx -- "-config $T/proxy.yaml -codex-device-login" "$T/cpa.log" && has_line "$out" "signed in as c@example.com"'
 n1=$(wc -l < "$T/cpa.log")
 out=$(ACC=all st </dev/null); rc=$?
-ok "setup: rerun is idempotent"        '[ $rc = 0 ] && [ "$(wc -l < "$T/cpa.log")" = "$n1" ] && printf "%s\n" "$out" | grep "\[3/4\] Accounts" | grep -q " kept$" && printf "%s\n" "$out" | grep "\[2/4\] Keys" | grep -q " kept$"'
+ok "setup: rerun is idempotent"        '[ $rc = 0 ] && [ "$(wc -l < "$T/cpa.log")" = "$n1" ] && printf "%s\n" "$out" | grep "\[3/5\] Accounts" | grep -q " kept$" && printf "%s\n" "$out" | grep "\[2/5\] Keys" | grep -q " kept$"'
 rm -f "$T"/auth/claude-*.json; echo '{"provider":"claude","email":"A@example.com"}' > "$T/auth/claude-0.json"
 echo other@example.com > "$T/login-claude"
 out=$(ACC=all st </dev/null)
 ok "setup: another email warns and is kept" 'has_line "$out" "signed in as other@example.com, expected B@Example.com: kept"'
+echo '{"claudeAiOauth":{"accessToken":"TOK-B-ACCESS","refreshToken":"TOK-B-REFRESH","expiresAt":1893456000000}}' > "$T/cla/b/.credentials.json"
+rm -f "$T"/auth/claude-[!0]*.json; c1=$(grep -c -- -claude-login "$T/cpa.log"); rm -rf "$T/uploads"
+out=$(ACC=all st </dev/null); rc=$?
+ok "setup: link is the default, no browser for an account with a login" '[ $rc = 0 ] && has_line "$out" "linked B@Example.com" && [ "$(grep -c -- -claude-login "$T/cpa.log")" = "$c1" ] && [ -f "$T/uploads/claude-B@Example.com.json" ] && ! grep -rq TOK- "$SP" && ! has_line "$out" TOK-'
+rm -f "$T/auth/claude-B@Example.com.json"; c1=$(grep -c -- -claude-login "$T/cpa.log"); echo b@example.com > "$T/login-claude"
+out=$(printf '\ns\n' | ACC= st); rc=$?
+ok "setup: sign in again is still offered" '[ $rc = 0 ] && has_line "$out" "[l]ink existing login (no browser) / [s]ign in again (browser)?" && [ "$(grep -c -- -claude-login "$T/cpa.log")" = $((c1 + 1)) ]'
+rm -f "$T/cla/b/.credentials.json" "$T"/auth/*; echo '{"provider":"claude","email":"A@example.com"}' > "$T/auth/claude-0.json"
+mkdir -p "$T/fzfbin"; printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "%s/fzf.args"\nexit 130\n' "$T" > "$T/fzfbin/fzf"; chmod +x "$T/fzfbin/fzf"
+out=$(RP=$FK/cpa:$T/jq:$T/sys:$T/fzfbin ACC= st </dev/null)
+ok "setup: fzf header lists accounts already in the proxy" 'grep -qx "already in proxy: a@example.com" "$T/fzf.args"'
 rm -rf "$T/auth"; echo a@example.com > "$T/login-claude"; c1=$(grep -c -- -claude-login "$T/cpa.log"); x1=$(grep -c -- -codex "$T/cpa.log")
 out=$(printf 'n\n\n1\n\n' | ACC= st); rc=$?
 ok "setup: numbered list needs one account, then signs in the ticked one" '[ $rc = 0 ] && has_line "$out" "pick at least one account" && [ "$(grep -c -- -claude-login "$T/cpa.log")" = $((c1 + 1)) ] && [ "$(grep -c -- -codex "$T/cpa.log")" = "$x1" ] && has_line "$out" "signed in as a@example.com"'
@@ -518,7 +813,7 @@ out=$(RP=$FK/win:$FK/cpa:$T/jq:$T/sys st </dev/null); rc=$?; sleep 0.3
 ok "setup: Windows staging run stops its proxy at the end" '[ $rc = 0 ] && has_line "$out" "start it with the start action" && [ ! -e "$SP/run/pid" ] && ! curl -s -m 1 -o /dev/null "http://127.0.0.1:$P2/"'
 stop2; SP=$T/sp
 stop2
-leak=; while IFS= read -r k; do [ -n "$k" ] && grep -qF -- "$k" "$T/setup.out" && leak=1; done < "$T/keys.list"
+leak=; while IFS= read -r k; do [ -n "$k" ] && grep -v "^  management key: " "$T/setup.out" | grep -qF -- "$k" && leak=1; done < "$T/keys.list"
 ok "setup: never prints a key"         '[ -z "$leak" ] && [ "$(grep -c . "$T/keys.list")" -gt 4 ] && ! grep -q pasted-mgmt-SECRET "$T/setup.out"'
 : > "$T/mode"
 

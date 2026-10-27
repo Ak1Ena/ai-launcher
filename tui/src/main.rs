@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod failover;
 mod form;
+mod menu;
 mod pane;
 mod plugins;
 mod ui;

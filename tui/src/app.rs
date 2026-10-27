@@ -58,6 +58,8 @@ pub struct Tab {
 
 pub enum Modal {
     Form(Form),
+    /// a plugin's tabbed menu (`plugin menu`)
+    Menu(crate::menu::Menu),
     Confirm(Confirm),
 }
 
@@ -83,7 +85,12 @@ pub struct PluginState {
     pub rows: Option<Option<plugins::Rows>>,
     /// `plugin actions`: (action, label)
     pub actions: Vec<(String, String)>,
+    /// `plugin menu`: empty when the plugin has none, and `a` opens the actions form instead
+    pub menu: Vec<crate::menu::Tab>,
     loading: bool,
+    /// a reload was asked while one ran (e.g. after a `do`): it runs again when that ends,
+    /// since the running one may have read the state from before
+    again: bool,
     /// a `plugin do` runs (one at a time)
     doing: bool,
     /// `rows` ran once this session: later runs get the short timeout
@@ -179,7 +186,7 @@ pub enum Item {
 /// What a plugin thread sends back.
 enum PluginMsg {
     Rows(String, Option<plugins::Rows>),
-    Actions(String, Vec<(String, String)>),
+    Actions(String, Vec<(String, String)>, Vec<crate::menu::Tab>),
     /// a `do` ended: the line for the flash bar
     Done(String, String),
     /// an add or update ended: the line for the flash bar
@@ -359,7 +366,9 @@ impl App {
                     about,
                     rows: None,
                     actions: Vec::new(),
+                    menu: Vec::new(),
                     loading: false,
+                    again: false,
                     doing: false,
                     ran: false,
                 },
@@ -393,11 +402,20 @@ impl App {
     /// Runs `rows` (then `actions`) of every plugin that is on, each on its own thread, unless
     /// one already runs. Results arrive in `tick`.
     pub fn reload_plugins(&mut self) {
+        for s in self.plugins.iter_mut() {
+            s.again = true;
+        }
+        self.load_due();
+    }
+
+    /// Starts the loads asked for: a plugin still loading waits, and `tick` starts it after.
+    fn load_due(&mut self) {
         for s in self
             .plugins
             .iter_mut()
-            .filter(|s| s.plugin.on && !s.loading)
+            .filter(|s| s.plugin.on && s.again && !s.loading)
         {
+            s.again = false;
             s.loading = true;
             let timeout = if s.ran {
                 plugins::ROWS_TIMEOUT
@@ -420,7 +438,10 @@ impl App {
                     let actions = plugins::run(&dir, &["actions"], timeout)
                         .map(|t| plugins::parse_actions(&t))
                         .unwrap_or_default();
-                    let _ = tx.send(PluginMsg::Actions(name, actions));
+                    let menu = plugins::run(&dir, &["menu"], timeout)
+                        .map(|t| crate::menu::parse(&t))
+                        .unwrap_or_default();
+                    let _ = tx.send(PluginMsg::Actions(name, actions, menu));
                 }
             });
         }
@@ -1099,30 +1120,35 @@ impl App {
         if !s.plugin.on {
             return self.say(format!("{name} is off: press o to turn it on."));
         }
+        if !s.menu.is_empty() {
+            let menu = crate::menu::Menu::new(name, s.menu.clone());
+            self.modal = Some(Modal::Menu(menu));
+            return;
+        }
         if s.actions.is_empty() {
             return self.say(format!("{name} has no actions."));
         }
-        let labels = s.actions.iter().map(|(_, l)| l.clone()).collect();
-        self.modal = Some(Modal::Form(Form::actions(name, labels)));
+        let actions = s.actions.clone();
+        self.modal = Some(Modal::Form(Form::actions(name, actions)));
     }
 
-    /// Runs `plugin do <action>` on a thread; its last output line goes to the flash bar, and
-    /// the plugin's rows reload after it.
-    fn run_do(&mut self, name: &str, action: &str) {
+    /// Runs `plugin do <id>` for each id in turn on a thread, then one line for the flash bar:
+    /// a lone action's last output line, else a summary with every failure. The plugin's rows
+    /// (and actions and menu) reload after it.
+    fn run_do(&mut self, name: &str, ids: Vec<String>) {
         let tx = self.plugin_tx.clone();
         let Some(s) = self.plugin(name) else { return };
         if s.doing {
             return self.say(format!("{name} is busy."));
         }
         s.doing = true;
-        let (name, dir, action) = (name.to_string(), s.plugin.dir.clone(), action.to_string());
-        self.say(format!("{name}: {action}…"));
+        let (name, dir) = (name.to_string(), s.plugin.dir.clone());
+        self.say(match ids.as_slice() {
+            [one] => format!("{name}: {one}…"),
+            _ => format!("{name}: applying {} changes…", ids.len()),
+        });
         std::thread::spawn(move || {
-            let line = match plugins::run(&dir, &["do", &action], plugins::DO_TIMEOUT) {
-                Ok(out) => plugins::last_line(&out).unwrap_or_else(|| format!("{action}: done")),
-                Err(e) => format!("{action} failed: {e}"),
-            };
-            let _ = tx.send(PluginMsg::Done(name, line));
+            let _ = tx.send(PluginMsg::Done(name, do_all(&dir, &ids)));
         });
     }
 
@@ -1279,6 +1305,12 @@ impl App {
                 KeyCode::Char('n' | 'N') | KeyCode::Esc => {}
                 _ => self.modal = Some(Modal::Confirm(c)),
             },
+            Some(Modal::Menu(mut m)) => match m.key(key) {
+                crate::menu::Outcome::Open => self.modal = Some(Modal::Menu(m)),
+                crate::menu::Outcome::Cancel => {}
+                // the ids come from the window's own copy, never from a refreshed menu
+                crate::menu::Outcome::Run(ids) => self.run_do(&m.plugin, ids),
+            },
             Some(Modal::Form(mut f)) => match f.key(key) {
                 Outcome::Open => self.modal = Some(Modal::Form(f)),
                 Outcome::Cancel => {}
@@ -1298,15 +1330,10 @@ impl App {
         let (label, command) = (f.get("Label"), f.get("Command"));
         match &f.purpose {
             Purpose::AddPlugin => self.install(plugins::expand_home(&f.get("Source"))),
-            Purpose::Action(name) => {
-                let action = self
-                    .plugins
-                    .iter()
-                    .find(|s| &s.plugin.name == name)
-                    .and_then(|s| s.actions.get(f.index("Action")))
-                    .map(|(a, _)| a.clone());
-                if let Some(a) = action {
-                    self.run_do(&name.clone(), &a);
+            Purpose::Action(name, actions) => {
+                // the id paired with the label shown, never re-read from the refreshed list
+                if let Some((a, _)) = actions.get(f.index("Action")) {
+                    self.run_do(name, vec![a.clone()]);
                 }
             }
             Purpose::Model => {
@@ -1865,16 +1892,21 @@ impl App {
             match m {
                 PluginMsg::Rows(name, rows) => {
                     if let Some(s) = self.plugin(&name) {
-                        s.loading = false;
+                        // good rows: the load ends when its actions arrive
+                        if rows.is_none() {
+                            s.loading = false;
+                        }
                         // a failure after good rows keeps them on screen
                         if rows.is_some() || !matches!(s.rows, Some(Some(_))) {
                             s.rows = Some(rows);
                         }
                     }
                 }
-                PluginMsg::Actions(name, actions) => {
+                PluginMsg::Actions(name, actions, menu) => {
                     if let Some(s) = self.plugin(&name) {
                         s.actions = actions;
+                        s.menu = menu;
+                        s.loading = false;
                     }
                 }
                 PluginMsg::Done(name, line) => {
@@ -1899,6 +1931,7 @@ impl App {
                 PluginMsg::Review(s) => self.open_review(SetupTarget::Install(s)),
             }
         }
+        self.load_due();
         self.finish_setups();
         if changed {
             self.refresh();
@@ -2042,6 +2075,25 @@ impl App {
 
 /// A plugin's home rows: one per entry (`plugin:<name>/<id>`), or one state line
 /// (`plugin:<name>`) when it is off, loading, failed or empty, so its section is always reachable.
+/// Runs `plugin do <id>` for each id in turn (a failure doesn't stop the rest); the line for
+/// the flash bar.
+fn do_all(dir: &std::path::Path, ids: &[String]) -> String {
+    let mut bad = Vec::new();
+    let mut last = String::new();
+    for id in ids {
+        match plugins::run(dir, &["do", id], plugins::DO_TIMEOUT) {
+            Ok(out) => last = plugins::last_line(&out).unwrap_or_else(|| format!("{id}: done")),
+            Err(e) => bad.push(format!("{id} failed: {e}")),
+        }
+    }
+    match (ids.len(), bad.len()) {
+        (1, 0) => last,
+        (n, 0) => format!("applied {n} changes"),
+        (1, _) => bad.join(""),
+        (n, f) => format!("{f} of {n} changes failed: {}", bad.join("; ")),
+    }
+}
+
 fn plugin_rows(s: &PluginState) -> Vec<Row> {
     let name = &s.plugin.name;
     let row = |id: String, label: String, status: String, details: Vec<String>| Row {
@@ -3126,6 +3178,8 @@ esac"#;
                 .any(|p| p.plugin.name == "good" && !p.actions.is_empty())
         });
         select(&mut a, "plugin:good/a");
+        // no `menu` command: the old single action form
+        assert!(a.plugin("good").unwrap().menu.is_empty());
         key(&mut a, KeyCode::Char('a'));
         let Some(Modal::Form(f)) = &a.modal else {
             panic!("no action menu")
@@ -3141,6 +3195,126 @@ esac"#;
         select(&mut a, "plugin:bad");
         key(&mut a, KeyCode::Char('a'));
         assert!(a.modal.is_none());
+    }
+
+    /// A background refresh replaces the plugin's action list while the menu is open: Enter
+    /// must still run the id of the label the user saw, never the new list's item at that index.
+    #[cfg(unix)]
+    #[test]
+    fn action_menu_runs_the_shown_action_after_a_refresh() {
+        let mut a = plugin_app();
+        settle(&mut a, |a| {
+            a.plugins
+                .iter()
+                .any(|p| p.plugin.name == "good" && !p.actions.is_empty())
+        });
+        let set = |a: &mut App, list: &[(&str, &str)]| {
+            a.plugin("good").unwrap().actions = list
+                .iter()
+                .map(|(i, l)| (i.to_string(), l.to_string()))
+                .collect();
+        };
+        set(&mut a, &[("one", "first"), ("two", "second")]);
+        select(&mut a, "plugin:good/a");
+        key(&mut a, KeyCode::Char('a'));
+        key(&mut a, KeyCode::Right);
+        let Some(Modal::Form(f)) = &a.modal else {
+            panic!("no action menu")
+        };
+        assert_eq!(f.get("Action"), "second");
+        // the refresh lands: a new item before it, so index 1 is now "first"
+        set(
+            &mut a,
+            &[("new", "new one"), ("one", "first"), ("two", "second")],
+        );
+        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Enter);
+        assert!(a.modal.is_none());
+        let flash = |a: &App| a.flash.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
+        settle(&mut a, |a| flash(a).contains("started"));
+        assert_eq!(flash(&a), "good: started two");
+    }
+
+    /// A plugin with `menu` gets the tabbed window: Enter on the checklist runs the diff's ids
+    /// in order, from the window's own copy even after a refresh, then one summary line.
+    #[cfg(unix)]
+    #[test]
+    fn menu_window_applies_its_own_copy_and_summarises() {
+        let mut a = app();
+        plugin_script(
+            &a,
+            "tabs",
+            r#"case "$1" in
+rows) printf 'section\tT\na\tAlpha\tready\n' ;;
+actions) printf 'x\tx\n' ;;
+menu) printf 'tab\tchecklist\tAccounts\torder\nrow\tc1\ta@x\t1\t1\t\ton.c1\toff.c1\tup.c1\tdown.c1\nrow\tc2\tb@x\t1\t2\t\ton.c2\toff.c2\tup.c2\tdown.c2\n' ;;
+do) echo "$2" >> "$AI_PLUGIN_DIR/ran"; [ "$2" = off.c1 ] && { echo "nope"; exit 1; }; echo "did $2" ;;
+esac"#,
+        );
+        a.refresh();
+        a.reload_plugins();
+        settle(&mut a, |a| a.plugins.iter().any(|p| !p.menu.is_empty()));
+        select(&mut a, "plugin:tabs/a");
+        key(&mut a, KeyCode::Char('a'));
+        assert!(matches!(a.modal, Some(Modal::Menu(_))));
+        key(&mut a, KeyCode::Char(' ')); // c1 off
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Char('K')); // c2 first
+        let (lines, _) = screen(&a);
+        assert!(line_with(&lines, "[ Accounts ]").contains("←/→ tab"));
+        assert!(line_with(&lines, "b@x").contains("▌ [x] 1"));
+        assert!(line_with(&lines, "a@x").contains("[ ] 2"));
+        // a refresh lands with other ids: what runs must not change
+        a.plugin("tabs").unwrap().menu = crate::menu::parse(
+            "tab\tchecklist\tA\torder\nrow\tc1\tz\t1\t1\t\ton.zz\toff.zz\tup.zz\tdown.zz\n",
+        );
+        key(&mut a, KeyCode::Enter);
+        assert!(a.modal.is_none());
+        let flash = |a: &App| a.flash.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
+        settle(&mut a, |a| flash(a).contains("failed:"));
+        assert_eq!(
+            flash(&a),
+            "tabs: 1 of 2 changes failed: off.c1 failed: nope"
+        );
+        let ran = fs::read_to_string(a.paths.plugins.join("tabs/ran")).unwrap();
+        assert_eq!(ran, "off.c1\nup.c2\n");
+        // Esc closes with nothing run
+        settle(&mut a, |a| a.plugins.iter().all(|p| !p.doing));
+        key(&mut a, KeyCode::Char('a'));
+        key(&mut a, KeyCode::Char(' '));
+        key(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            fs::read_to_string(a.paths.plugins.join("tabs/ran")).unwrap(),
+            ran
+        );
+    }
+
+    /// A `do` that ends while a rows/actions load is in flight still gets a fresh load after
+    /// it, so the next menu shows the state the action left.
+    #[cfg(unix)]
+    #[test]
+    fn a_do_reloads_actions_even_when_a_load_is_in_flight() {
+        let mut a = plugin_app();
+        settle(&mut a, |a| a.plugins.iter().all(|p| !p.loading));
+        let s = a.plugin("good").unwrap();
+        s.loading = true; // a load already running, started before the `do` changed state
+        s.actions.clear();
+        a.plugin_tx
+            .send(PluginMsg::Done("good".into(), "ok".into()))
+            .unwrap();
+        a.tick();
+        // the in-flight load ends with stale (here: none) actions
+        a.plugin_tx
+            .send(PluginMsg::Rows("good".into(), None))
+            .unwrap();
+        settle(&mut a, |a| {
+            a.plugins
+                .iter()
+                .any(|p| p.plugin.name == "good" && !p.actions.is_empty())
+        });
+        assert!(!a.plugin("good").unwrap().actions.is_empty());
     }
 
     #[cfg(unix)]

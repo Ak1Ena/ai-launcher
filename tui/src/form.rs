@@ -70,8 +70,9 @@ pub enum Purpose {
     Model,
     /// install a plugin from a source
     AddPlugin,
-    /// run one of plugin `<name>`'s actions
-    Action(String),
+    /// run one of plugin `<name>`'s actions: the form's own copy of the (id, label) pairs it
+    /// shows, so a background refresh of the plugin's list can't change what Enter runs
+    Action(String, Vec<(String, String)>),
 }
 
 pub struct Form {
@@ -160,12 +161,12 @@ impl Form {
         }
     }
 
-    /// A plugin's action menu: `labels` from `plugin actions`.
-    pub fn actions(name: &str, labels: Vec<String>) -> Form {
-        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+    /// A plugin's action menu: (id, label) pairs from `plugin actions`.
+    pub fn actions(name: &str, actions: Vec<(String, String)>) -> Form {
+        let labels: Vec<&str> = actions.iter().map(|(_, l)| l.as_str()).collect();
         Form {
             title: format!("{name} actions"),
-            purpose: Purpose::Action(name.to_string()),
+            purpose: Purpose::Action(name.to_string(), actions.clone()),
             fields: vec![Field::choice("Action", &labels, "←  → to change")],
             focus: 0,
             error: None,
