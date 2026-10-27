@@ -77,7 +77,7 @@ ok "unknown action fails"              '! run do nope >/dev/null 2>&1'
 # ── launch, keys ──
 if [ -z "$PY" ]; then echo "skip fake-proxy tests: no python3"; [ $fails = 0 ] && echo "all passed" && exit 0; exit 1; fi
 cat > "$T/srv.py" <<'EOF'
-import json, os, sys, time, datetime
+import json, os, socketserver, sys, time, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 T = sys.argv[1]; CK = sys.argv[2]; MK = sys.argv[3]
 def iso(s): return (datetime.datetime.utcnow() + datetime.timedelta(seconds=s)).strftime('%Y-%m-%dT%H:%M:%S.123456+00:00')
@@ -149,8 +149,10 @@ class H(BaseHTTPRequestHandler):
     def do_PUT(self): self.handle_any(self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode())
     def do_PATCH(self): self.handle_any(self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode())
     def do_POST(self): self.handle_any(self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode())
-if len(sys.argv) > 4: HTTPServer(('127.0.0.1', int(sys.argv[4])), H).serve_forever()   # a fake started proxy (setup tests)
-s = HTTPServer(('127.0.0.1', 0), H)
+class S(HTTPServer):  # HTTPServer.server_bind runs getfqdn (reverse DNS) before listen: took 35 s on CI macOS
+    def server_bind(self): socketserver.TCPServer.server_bind(self); self.server_name, self.server_port = self.server_address[:2]
+if len(sys.argv) > 4: S(('127.0.0.1', int(sys.argv[4])), H).serve_forever()   # a fake started proxy (setup tests)
+s = S(('127.0.0.1', 0), H)
 open(T + '/port.tmp', 'w').write(str(s.server_address[1])); os.rename(T + '/port.tmp', T + '/port')
 s.serve_forever()
 EOF
