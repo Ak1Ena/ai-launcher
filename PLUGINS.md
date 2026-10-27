@@ -132,7 +132,7 @@ How the TUI applies a checklist:
 - A failure does not stop the rest. Then the plugin reloads and one line says `applied N changes` or `K of N changes failed: <id> failed: <why>; ...`.
 - The window runs the ids of the menu it opened with, never a list refreshed meanwhile. So every `do` id must keep working for as long as the window is open, and each step must be safe to run on its own.
 
-The bundled `plugins-extra/cliproxy/plugin` (`menu)` branch) is a full worked example with all three tab kinds.
+The bundled `plugins-extra/cliproxy/plugin` (`menu)` branch) is a worked example with a `list` and a `weight` checklist.
 
 ## 5. Setup script
 

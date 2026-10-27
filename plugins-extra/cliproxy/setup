@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cliproxy setup: install CLIProxyAPI, make the keys, sign accounts in, start the proxy.
+# cliproxy setup: install CLIProxyAPI, make the keys, sign accounts in, start the proxy, list the model sub-agents.
 # ai-launcher runs it after you read and approve it (ai plugin add cliproxy / ai plugin setup cliproxy).
 # Safe to run again: each step says use it / kept / done when it is already true.
 # Exit 0 = ready, 2 = you install CLIProxyAPI yourself, 1 = failed. Prints only the management key, at the end, for you to keep.
@@ -61,7 +61,7 @@ kcurl() {
 }
 step() {  # step <n> <name> <detail> <result>
   local l="$3 "; while [ ${#l} -lt 48 ]; do l="$l."; done
-  printf '  [%s/4] %-9s %s %s\n' "$1" "$2" "$l" "$4"
+  printf '  [%s/5] %-9s %s %s\n' "$1" "$2" "$l" "$4"
 }
 ask() { local a; printf '  %s ' "$1"; read -r a || a=; ANS=$(printf '%s' "$a" | cut -c1 | tr 'A-Z' 'a-z'); }
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }  # shell-quote for start_cmd
@@ -382,7 +382,7 @@ else
   pc=$(printf '%s\n' "$P" | grep -c .)
   count() { c=0; i=0; while [ $i -lt $n ]; do [ "${sel[i]}" = 1 ] && c=$((c + 1)); i=$((i + 1)); done; }
   draw() {
-    count; printf '  [3/4] Accounts %46s\n' "$c of $m selected"
+    count; printf '  [3/5] Accounts %46s\n' "$c of $m selected"
     [ $m -gt 0 ] && echo "        FROM AI-LAUNCHER"
     i=0; while [ $i -lt $n ]; do
       if [ "${sel[i]}" != - ]; then
@@ -453,11 +453,14 @@ else
   fi
 fi
 
-# ── 4. start (done above) and mode ──
+# ── 4. start (done above), weighted round-robin and session affinity ──
 step 4 Start "$how" "proxy up"
 AI_PLUGIN_DIR=$D bash ./plugin do apply 2>&1 | sed 's/^/        /'
 AI_PLUGIN_DIR=$D bash ./plugin do affinity 2>&1 | sed 's/^/        /'
 okkey client "$key" || die "the proxy refused the client key (HTTP ${code:-no answer}): not ready"
+# ── 5. one Claude Code sub-agent per proxy model, saved for launch (never fails setup) ──
+na=$(AI_PLUGIN_DIR=$D bash ./plugin agents 2>/dev/null)
+case $na in ''|*[!0-9]*|0) step 5 Agents "model sub-agents" "none" ;; *) step 5 Agents "$na model sub-agents" "ready" ;; esac
 case $(uname -s)/$D in
   MINGW*/*/.*.install|MSYS*/*/.*.install|CYGWIN*/*/.*.install)
     # Windows cannot rename the staging folder while the proxy runs from it

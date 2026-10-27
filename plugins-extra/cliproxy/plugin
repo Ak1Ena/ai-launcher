@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cliproxy plugin for ai-launcher: one "all accounts" Claude Code channel through a local CLIProxyAPI.
-# Protocol: plugin rows | actions | menu | do <start|stop|affinity|apply|mode-failover|mode-wrr|on.<idx>|off.<idx>|up.<idx>|down.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link   (see the README "Plugins")
+# Protocol: plugin rows | actions | menu | do <start|stop|affinity|apply|on.<idx>|off.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link | statusline | agents   (see the README "Plugins")
 # API facts: docs/superpowers/notes/cliproxyapi.md. Never prints a key.
 D=${AI_PLUGIN_DIR:-$(cd "$(dirname "$0")" && pwd)}
 CONF=$D/config CACHE=$D/cache TAB=$(printf '\t')
@@ -9,17 +9,15 @@ has() { command -v "$1" >/dev/null 2>&1; }
 
 # ── config: key=value lines, never sourced ──
 [ -f "$CONF" ] || { (umask 077; cp "$D/config.example" "$CONF" 2>/dev/null || echo 'url=http://127.0.0.1:8317' > "$CONF"); chmod 600 "$CONF"; }
-url= key= key_env=CLIPROXY_API_KEY mgmt_key= mgmt_key_env=CLIPROXY_MGMT_KEY start_cmd= stop_cmd= mode= order=
+url= key= key_env=CLIPROXY_API_KEY mgmt_key= mgmt_key_env=CLIPROXY_MGMT_KEY start_cmd= stop_cmd=
 while IFS= read -r l || [ -n "$l" ]; do
   l=${l%$'\r'}
   case $l in '#'*) continue ;; *=*) ;; *) continue ;; esac
   k=${l%%=*} v=${l#*=}; v=${v%% #*}; v=${v%%"$TAB"#*}
   while case $v in *' '|*"$TAB") true ;; *) false ;; esac; do v=${v%?}; done
-  case $k in url|key|key_env|mgmt_key|mgmt_key_env|start_cmd|stop_cmd|mode|order) eval "$k=\$v" ;; esac
+  case $k in url|key|key_env|mgmt_key|mgmt_key_env|start_cmd|stop_cmd) eval "$k=\$v" ;; esac
 done < "$CONF"
 url=${url:-http://127.0.0.1:8317}; url=${url%/}
-mset=$mode   # empty: never chosen
-case $mode in wrr|balance) mode=wrr ;; *) mode=failover ;; esac   # balance: the old name of wrr
 envname() { case $1 in ''|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;; esac; }   # only a valid name reaches eval
 [ -n "$key" ] || ! envname "$key_env" || eval "key=\${$key_env:-}"
 [ -n "$mgmt_key" ] || ! envname "$mgmt_key_env" || eval "mgmt_key=\${$mgmt_key_env:-}"
@@ -49,11 +47,34 @@ JQDEF='def clean: tostring | gsub("[[:cntrl:]]"; "");
   def aid: .auth_index // "" | clean | gsub("[^A-Za-z0-9._-]"; "");
   def who: .email // .account // .name // .id // "?" | clean;
   def wt: .weight // 1 | (tonumber? // 1) | floor | if . < 0 then 0 elif . > 99 then 99 else . end;
+  def pri: .priority // 0 | (tonumber? // 0);
   def accts: [.files[]? | select((.provider // .type // "") | ascii_downcase | test("^(claude|codex)$"))
-    | {i: aid, n: (.name // .id // "" | clean), e: who, w: wt, d: (.disabled == true), p: (.provider // .type | ascii_downcase)}
-    | select(.i != "" and .n != "")] | sort_by(.n)[] | [.i, .n, .e, .w, .d, .p] | @tsv;
+    | {i: aid, n: (.name // .id // "" | clean), e: who, w: wt, d: (.disabled == true), p: (.provider // .type | ascii_downcase), r: pri}
+    | select(.i != "" and .n != "")] | sort_by(.n)[] | [.i, .n, .e, .w, .d, .p, .r] | @tsv;
   # every proxy file, any provider: lower-case name TAB lower-case email field ("" when none), for link
-  def names: .files[]? | [(.name // .id // "" | clean | ascii_downcase), (.email | if type == "string" then clean | ascii_downcase else "" end)] | @tsv;'
+  def names: .files[]? | [(.name // .id // "" | clean | ascii_downcase), (.email | if type == "string" then clean | ascii_downcase else "" end)] | @tsv;
+  # recent_requests: 10-minute buckets, oldest first; a list of {time, success, failed}, or (v0) a string:
+  # a header "[20]{failed:int,success:int,time:string}" then one "failed,success,HH:MM-HH:MM" line per bucket -> [{s, t}]
+  def rr: if type == "array" then [.[] | {s: (.success? | tonumber? // 0), t: .time?}]
+    elif type == "string" then split("\n") as $l
+      | ($l[0] | (capture("\\{(?<f>[^}]*)\\}").f // "") | split(",") | map(split(":")[0] | gsub("\\s"; ""))) as $h
+      | (($h | index("success")) // 1) as $i | (($h | index("time")) // 2) as $j
+      | [$l[1:][] | gsub("^\\s+|\\s+$"; "") | select(. != "") | split(",") | {s: (.[$i] | tonumber? // 0), t: .[$j]}]
+    else [] end;
+  # minutes since a bucket ended (negative: still running): "HH:MM-HH:MM" / "HH:MM" (local time, across midnight), epoch or ISO start
+  def hm: split(":") | (.[0] | tonumber) * 60 + (.[1] | tonumber);
+  def mago($e; $nowm): ((($nowm - $e) % 1440) + 1440) % 1440 | if . >= 1430 then . - 1440 else . end;
+  def bage($now; $nowm): if type == "number" then ($now - (if . > 1e12 then . / 1000 else . end) - 600) / 60
+    elif type != "string" then null
+    elif test("^[0-9]{1,2}:[0-9]{2}-[0-9]{1,2}:[0-9]{2}$") then mago(split("-")[1] | hm; $nowm)
+    elif test("^[0-9]{1,2}:[0-9]{2}$") then mago((hm + 10) % 1440; $nowm)
+    else (try (sub("\\.[0-9]+"; "") | sub("(\\+00:00|Z)$"; "Z") | fromdateiso8601) catch null) | if . == null then null else ($now - . - 600) / 60 end end;
+  # per provider, the enabled account with a success in the newest bucket that ended at most 20 min ago (ties: most successes): provider TAB email
+  def inuse($now; $nowm): [.files[]? | select(.disabled != true) | {p: (.provider // .type // "" | clean | ascii_downcase), e: who} as $f
+      | (.recent_requests | rr[]) | select(.s > 0) | (.t | bage($now; $nowm)) as $a | select($a != null and $a >= -10 and $a <= 20) | $f + {s, a: $a}]
+    | map(select(.p != "")) | group_by(.p)[] | sort_by([.a, -.s])[0] | [.p, .e] | @tsv;
+  # provider of a model id, as the proxy names its logins: gpt -> codex, else the prefix (claude, gemini, ...)
+  def mprov: split("-")[0] | ascii_downcase | if . == "gpt" then "codex" else . end;'
 
 # ── usage cache: line 1 = fetch time, then detail lines ──
 refresh() {
@@ -81,12 +102,13 @@ refresh() {
       404) line="usage: management API off (set remote-management secret-key in the proxy config)" ;;
       *) line="usage: management API unavailable (${code:-no answer})" ;;
     esac
-    rm -f "$CACHE/accts" "$CACHE/names"
+    rm -f "$CACHE/accts" "$CACHE/names" "$CACHE/inuse"
     { date +%s; printf '  \t%s\n' "$line"; } > "$f"; mv "$f" "$CACHE/usage"; return
   fi
-  # accounts cache: <idx> TAB <name> TAB <email> TAB <weight> TAB <disabled> TAB <provider> per claude / codex account, by name
+  # accounts cache: <idx> TAB <name> TAB <email> TAB <weight> TAB <disabled> TAB <provider> TAB <priority> per claude / codex account, by name
   jq -r "$JQDEF"'accts' "$creds" > "$CACHE/accts.$$" 2>/dev/null && mv "$CACHE/accts.$$" "$CACHE/accts"
   jq -r "$JQDEF"'names' "$creds" > "$CACHE/names.$$" 2>/dev/null && mv "$CACHE/names.$$" "$CACHE/names"
+  jq -r --argjson now "$(date +%s)" --argjson nowm "$(date '+%H %M' | awk '{ print $1 * 60 + $2 }')" "$JQDEF"'inuse($now; $nowm)' "$creds" > "$CACHE/inuse.$$" 2>/dev/null && mv "$CACHE/inuse.$$" "$CACHE/inuse"
   # each enabled claude / codex login: its provider's own usage endpoint through the proxy (as the Management Center does)
   jq -r '.files[] | select((.disabled != true) and ((.provider // .type // "") | ascii_downcase | test("^(claude|codex)$")))
     | [.auth_index, (.provider // .type | ascii_downcase), (.id_token.chatgpt_account_id? // "")] | @tsv' "$creds" 2>/dev/null |
@@ -173,39 +195,21 @@ usage() {
   { refresh; rm -rf "$CACHE/lock" "$CACHE"/*.$$; } </dev/null >/dev/null 2>&1 &
 }
 
-# routing cache -> aff_state: on | off | unknown, r_strategy, r_cool, r_ttl, and mode_ok: yes | no | unknown
+# routing cache -> aff_state: on | off | unknown, r_strategy, r_cool, r_ttl, and wrr_ok: yes | no | unknown
+# wrr_ok no: the proxy is not on weighted-round-robin, or an account has a priority (weights count only in the top tier)
 routing() {
-  aff_state=unknown r_strategy= r_cool= r_ttl= mode_ok=unknown
+  aff_state=unknown r_strategy= r_cool= r_ttl= wrr_ok=unknown
   [ -n "$mgmt_key" ] && [ -f "$CACHE/routing" ] || return 0
   local a s
   IFS="$TAB" read -r r_strategy a s r_cool r_ttl < "$CACHE/routing"
   [ "$a" = true ] && [ "$s" = true ] && aff_state=on || aff_state=off
-  firstwrr "$r_strategy"
-  mode_ok=no
-  case $mode/$r_strategy/$r_cool in
-    failover/fill-first/false) mode_ok=yes ;;
-    wrr/weighted-round-robin/*) [ $aff_state = on ] && mode_ok=yes ;;
-  esac
-}
-# no mode= yet and the proxy already round-robins: the user balances, so wrr (computed only; keepwrr writes it)
-firstwrr() {
-  [ -z "$mset" ] && case $1 in round-robin|weighted-round-robin) mode=wrr mset=wrr mcomp=1 ;; esac
+  wrr_ok=yes
+  [ "$r_strategy" = weighted-round-robin ] || wrr_ok=no
+  [ -f "$CACHE/accts" ] && awk -F "$TAB" '$7 + 0 != 0 { f = 1 } END { exit !f }' "$CACHE/accts" && wrr_ok=no
   return 0
 }
-keepwrr() { [ -z "$mcomp" ] || setkey mode wrr; return 0; }
 wl() { [ "$1" -gt 0 ] && echo "$1" || echo off; }
-modename() { [ "$1" = wrr ] && echo 'weighted round-robin' || echo failover; }
 
-# <key>=<value> into the config: other lines kept, file stays 600
-setkey() {
-  ( umask 077; seen=
-    while IFS= read -r l || [ -n "$l" ]; do
-      case $l in "$1="*) [ -n "$seen" ] && continue; l="$1=$2" seen=1 ;; esac
-      printf '%s\n' "$l"
-    done < "$CONF" > "$CONF.$$"
-    [ -n "$seen" ] || printf '%s=%s\n' "$1" "$2" >> "$CONF.$$"
-  ) && chmod 600 "$CONF.$$" && mv "$CONF.$$" "$CONF"
-}
 # GET the v8 routing config: sets out (body) and code
 getrouting() {
   out=$(kcurl "$mgmt_key" -m 5 "$url/v8/management/config/routing"); code=${out##*$'\n'}
@@ -217,33 +221,19 @@ affkeys() {
   printf '"session-affinity":true,"session-affinity-subagents":true'
   [ -n "$ttl" ] || printf ',"session-affinity-ttl":"1h"'
 }
-# make the proxy match $mode: one v8 config PATCH merge (v8 404 -> v0 strategy PUT only), then the priorities
+# set the proxy to weighted-round-robin: one v8 config PATCH merge (v8 404 -> v0 strategy PUT only), then every priority 0
 apply() {
-  [ -n "$mgmt_key" ] || { echo "mode: $(modename "$mode"); proxy not changed (no management key)"; return 0; }
-  has curl && has jq || { echo "mode: $(modename "$mode"); proxy not changed (needs curl and jq)"; return 1; }
-  local body s=fill-first
+  has curl && has jq || { echo "proxy not changed (needs curl and jq)"; return 1; }
   rm -f "$CACHE/usage" "$CACHE/routing"
   getrouting
   if [ "$code" = 200 ]; then
-    firstwrr "$(printf '%s\n' "$out" | jq -r "$JQDEF"'.strategy | strat' 2>/dev/null)"; keepwrr
-    [ $mode = wrr ] && s=weighted-round-robin
-    if [ $mode = failover ]; then body='{"routing":{"strategy":"fill-first","cooldown":{"disable-cooling":false}}}'
-    else body="{\"routing\":{\"strategy\":\"$s\",$(affkeys)}}"; fi
-    out=$(kcurl "$mgmt_key" -m 10 -X PATCH -H 'Content-Type: application/json' --data-binary "$body" "$url/v8/management/config"); code=${out##*$'\n'}
+    out=$(kcurl "$mgmt_key" -m 10 -X PATCH -H 'Content-Type: application/json' --data-binary "{\"routing\":{\"strategy\":\"weighted-round-robin\",$(affkeys)}}" "$url/v8/management/config"); code=${out##*$'\n'}
   elif [ "$code" = 404 ]; then
-    if [ -z "$mset" ]; then
-      s=$(kcurl "$mgmt_key" -m 5 "$url/v0/management/routing/strategy")
-      firstwrr "$(printf '%s\n' "${s%$'\n'*}" | jq -r "$JQDEF"'.strategy | strat' 2>/dev/null)"; keepwrr
-    fi
-    s=fill-first; [ $mode = wrr ] && s=weighted-round-robin
-    out=$(kcurl "$mgmt_key" -m 10 -X PUT -H 'Content-Type: application/json' --data-binary "{\"value\":\"$s\"}" "$url/v0/management/routing/strategy"); code=${out##*$'\n'}
+    out=$(kcurl "$mgmt_key" -m 10 -X PUT -H 'Content-Type: application/json' --data-binary '{"value":"weighted-round-robin"}' "$url/v0/management/routing/strategy"); code=${out##*$'\n'}
   fi
-  if [ "$code" != 200 ]; then echo "could not apply mode $(modename "$mode") ($(hc "$code"))"; return 1; fi
+  if [ "$code" != 200 ]; then echo "could not apply weighted round-robin ($(hc "$code"))"; return 1; fi
   priorities || return 1
-  case $mode in
-    failover) echo "proxy now uses failover: one account until it is limited, then the next, in your order" ;;
-    wrr) echo "proxy now uses weighted round-robin: chats spread across accounts by weight, each chat stays on one" ;;
-  esac
+  echo "proxy now uses weighted round-robin: chats spread across accounts by weight, each chat stays on one"
 }
 
 # ── per-account changes: always on the live list, through the management API ──
@@ -260,37 +250,28 @@ fetchaccts() {  # the live list into the accounts cache
   printf '%s\n' "${out%$'\n'*}" | jq -r "$JQDEF"'accts' > "$CACHE/accts.$$" 2>/dev/null && mv "$CACHE/accts.$$" "$CACHE/accts"
   printf '%s\n' "${out%$'\n'*}" | jq -r "$JQDEF"'names' > "$CACHE/names.$$" 2>/dev/null && mv "$CACHE/names.$$" "$CACHE/names"
 }
-# accounts cache in failover order: order= names first, the rest by name, gone names dropped
-# shortcut: a comma inside an auth file name breaks order=; file names have none today
-ordered() {
-  awk -F "$TAB" -v o="$order" 'BEGIN { n = split(o, a, ",") } { l[$2] = $0; k[++m] = $2 }
-    END { for (i = 1; i <= n; i++) if ((a[i] in l) && !(a[i] in s)) { print l[a[i]]; s[a[i]] = 1 }
-          for (i = 1; i <= m; i++) if (!(k[i] in s)) print l[k[i]] }' "$CACHE/accts"
-}
-# failover: first account count*10, then down by 10 (higher wins); wrr: all 0, since wrr weights only the top tier
+# every priority 0: weighted-round-robin weights only the top priority tier;
+# weight 0 is never picked, so an account switched on gets at least 1 (off is the on/off toggle)
 priorities() {
   fetchaccts || return 1
-  local n p i nm rest b
-  n=$(ordered | grep -c .); p=$((n * 10))
-  while IFS="$TAB" read -r i nm rest; do
+  local i nm e w d rest
+  while IFS="$TAB" read -r i nm e w d rest; do
     [ -n "$nm" ] || continue
-    [ $mode = wrr ] && p=0
-    b=$(jq -cn --arg n "$nm" --argjson p "$p" '{name: $n, priority: $p}')
-    mpatch fields "$b" || { echo "could not set the account order ($(hc "$code"))"; return 1; }
-    p=$((p - 10))
-  done <<EOF
-$(ordered)
-EOF
+    case $w in ""|*[!0-9]*) w=1 ;; esac; [ "$d" = true ] && w=1
+    mpatch fields "$(jq -cn --arg n "$nm" --argjson w "$w" '{name: $n, priority: 0} + (if $w < 1 then {weight: 1} else {} end)')" ||
+      { echo "could not clear the account priorities ($(hc "$code"))"; return 1; }
+  done < "$CACHE/accts"
+  fetchaccts >/dev/null
 }
-# acct <idx>: needs the key, reads the live list, sets i nm e w d and pos (1-based in order) or fails
+# acct <idx>: needs the key, reads the live list, sets i nm e w d or fails
 acct() {
   [ -n "$mgmt_key" ] || { echo 'needs the management key'; return 1; }
   has curl && has jq || { echo 'needs curl and jq'; return 1; }
   case $1 in ''|*[!A-Za-z0-9._-]*) echo "unknown account: $1"; return 1 ;; esac
   fetchaccts || return 1
-  local l; l=$(ordered | awk -F "$TAB" -v id="$1" '$1 == id { print NR "\t" $0; exit }')
+  local l; l=$(awk -F "$TAB" -v id="$1" '$1 == id { print; exit }' "$CACHE/accts")
   [ -n "$l" ] || { echo "unknown account: $1"; return 1; }
-  IFS="$TAB" read -r pos i nm e w d _ <<EOF
+  IFS="$TAB" read -r i nm e w d _ <<EOF
 $l
 EOF
 }
@@ -308,16 +289,6 @@ setuse() {
     { echo "could not change $e ($(hc "$code"))"; return 1; }
   fetchaccts >/dev/null
   if [ "$1" = on ]; then echo "$e: used"; else echo "$e: not used"; fi
-}
-move() {
-  acct "$2" || return 1
-  local all; all=$(ordered | cut -f2)
-  local to=$((pos - 1)); [ "$1" = down ] && to=$((pos + 1))
-  [ $to -ge 1 ] && [ $to -le "$(printf '%s\n' "$all" | grep -c .)" ] || { echo "$e: already $([ "$1" = up ] && echo first || echo last)"; return 1; }
-  order=$(printf '%s\n' "$all" | awk -v a="$pos" -v b="$to" '{ x[NR] = $0 } END { t = x[a]; x[a] = x[b]; x[b] = t; for (i = 1; i <= NR; i++) printf "%s%s", (i > 1 ? "," : ""), x[i] }')
-  setkey order "$order" || { echo "could not write $CONF"; return 1; }
-  if [ $mode = failover ]; then priorities || return 1; fi
-  echo "$e: now $to"
 }
 
 # ── link: copy a launcher account's own login (cla / Codex) into the proxy, no browser ──
@@ -387,8 +358,6 @@ link() {
   [ -n "$mgmt_key" ] || { echo 'needs the management key'; return 1; }
   has curl && has jq || { echo 'needs curl and jq'; return 1; }
   fetchaccts || return 1
-  # pin the current order: a new account goes after it, never between (the TUI's menu moves count on that)
-  [ ! -s "$CACHE/accts" ] || setkey order "$(ordered | cut -f2 | paste -sd , -)" || { echo "could not write $CONF"; return 1; }
   trap 'rm -f "$CACHE/link.$$"' EXIT; trap 'exit 1' INT TERM HUP
   # shortcut: a Keychain prompt with no tty blocks until answered (do: 30 s limit); the launch row has a tty
   local k id e h n=0 bad=0
@@ -407,12 +376,36 @@ EOF
   return $bad
 }
 
+# model sub-agents for claude --agents (its Agent tool takes only claude model names; an agent definition takes any):
+# every model the proxy lists (no image models), live in 2 s and saved to cache/agents.json, else the saved copy. Prints the JSON or nothing.
+agents() {
+  has jq || return 0
+  local m j
+  if has curl && [ -n "$key" ]; then
+    m=$(kcurl "$key" -m 2 "$url/v1/models")
+    if [ "${m##*$'\n'}" = 200 ]; then
+      j=$(printf '%s\n' "${m%$'\n'*}" | jq -c "$JQDEF"'[.data[]? | select(.id | type == "string" and test("^[A-Za-z0-9._:-]+$") and (test("image") | not))
+          | {id, n: (.id | ascii_downcase | gsub("[^a-z0-9-]"; "-") | gsub("-+"; "-") | gsub("^-|-$"; "")),
+             o: ((.owned_by // "" | clean) as $ob | if $ob != "" then $ob else .id | mprov | {claude: "Claude", codex: "Codex", gemini: "Gemini"}[.] // . end)}
+          | select(.n != "")] | unique_by(.n)   # one agent per name, the first model keeps it
+        | if length == 0 then empty else map(.id as $m | {key: .n, value: {description: "Sub-agent on \($m) (\(.o) account via cliproxy). Use when a task should run on \($m).",
+          prompt: "You are a sub-agent running on \($m). Do the task you are given and report the result.", model: $m}}) | from_entries end' 2>/dev/null)
+      mkdir -p "$CACHE" && chmod 700 "$CACHE"
+      if [ -n "$j" ]; then printf '%s\n' "$j" > "$CACHE/agents.json.$$" && mv "$CACHE/agents.json.$$" "$CACHE/agents.json"
+      else rm -f "$CACHE/agents.json"; fi
+      [ -z "$j" ] || printf '%s\n' "$j"; return 0
+    fi
+  fi
+  [ -f "$CACHE/agents.json" ] && cat "$CACHE/agents.json"
+  return 0
+}
+
 brew_has() { has brew && [ -d "$(brew --prefix 2>/dev/null)/opt/cliproxyapi" ]; }
 
 case ${1:-} in
   rows)
     routing
-    printf 'section\tCLIPROXY · all accounts · %s\n' "$(modename "$mode")"
+    printf 'section\tCLIPROXY · all accounts\n'
     printf 'all\tClaude Code · all accounts\t'
     if [ -z "$key" ]; then nokey; exit 0; fi
     up || { echo "$DOWN"; exit 0; }
@@ -424,11 +417,15 @@ case ${1:-} in
       on) printf '  \trouting: %s · sticky per chat%s\n' "$r_strategy" "$([ "$r_ttl" = - ] || printf ' (%s)' "$r_ttl")" ;;
     esac
     s=$r_strategy; [ "$r_cool" = true ] && s="$s (cooling off)"
-    [ $mode_ok = no ] && printf '  \t⚠ proxy uses %s, plugin mode is %s — apply: TUI a, or ai plugin do cliproxy apply\n' "$s" "$(modename "$mode")"
+    if [ $wrr_ok = no ]; then
+      if [ "$r_strategy" = weighted-round-robin ]; then s='account priorities, so weights count only in the top tier'
+      else s="$s, not weighted round-robin"; fi
+      printf '  \t⚠ proxy uses %s — apply: TUI a, or ai plugin do cliproxy apply\n' "$s"
+    fi
     if [ -n "$mgmt_key" ] && [ -f "$CACHE/accts" ]; then
-      ordered | awk -F "$TAB" -v m="$mode" '{ u = ($5 == "true") ? "off" : "on"
-        if (m == "failover") printf "  \t%d  %s  %s\n", NR, $3, u
-        else if (u == "off" || $4 + 0 <= 0) printf "  \t%s  off\n", $3; else printf "  \t%s  ×%d\n", $3, $4 }'
+      awk -F "$TAB" '{ if ($5 == "true" || $4 + 0 <= 0) printf "  \t%s  off\n", $3; else printf "  \t%s  ×%d\n", $3, $4 }' "$CACHE/accts"
+      iu=$(awk -F "$TAB" '{ printf "%s%s %s", (NR > 1 ? " · " : ""), $1, $2 }' "$CACHE/inuse" 2>/dev/null)
+      [ -z "$iu" ] || printf '  \tin use: %s\n' "$iu"
       nl=$(unlinked | cut -f3)
       [ -z "$nl" ] || printf '%s\n' "$nl" | sed "s/^/  $TAB/; s/\$/  not linked/"
     fi
@@ -440,19 +437,14 @@ case ${1:-} in
     if brew_has || [ -n "$start_cmd" ]; then printf 'item\tstart\tstart proxy\n'; fi
     if brew_has || [ -n "$stop_cmd" ]; then printf 'item\tstop\tstop proxy\n'; fi
     routing
-    [ $mode_ok = no ] && printf 'item\tapply\tApply %s to the proxy\n' "$(modename "$mode")"
+    [ $wrr_ok = no ] && printf 'item\tapply\tApply weighted round-robin to the proxy\n'
     [ -n "$mgmt_key" ] && [ "$aff_state" != on ] && printf 'item\taffinity\tKeep each chat on one account\n'
     nl=; [ -n "$mgmt_key" ] && [ -f "$CACHE/accts" ] && nl=$(unlinked)
     [ -z "$nl" ] || printf 'item\tlink\tLink all launcher accounts\n'
-    printf 'tab\tradio\tMode\n'
-    printf 'item\tmode-failover\tfailover (in your order)%s\n' "$([ $mode = failover ] && printf '\ton')"
-    printf 'item\tmode-wrr\tweighted round-robin%s\n' "$([ $mode = wrr ] && printf '\ton')"
     if [ -n "$mgmt_key" ] && [ -f "$CACHE/accts" ]; then
-      printf 'tab\tchecklist\tAccounts\t%s\n' "$([ $mode = wrr ] && echo weight || echo order)"
+      printf 'tab\tchecklist\tAccounts\tweight\n'
       # row key label checked n note on-id off-id dec-id inc-id
-      ordered | awk -F "$TAB" -v m="$mode" '{ c = ($5 == "true") ? 0 : 1
-        if (m == "failover") printf "row\t%s\t%s\t%d\t%d\t%s\ton.%s\toff.%s\tup.%s\tdown.%s\n", $1, $3, c, NR, $6, $1, $1, $1, $1
-        else printf "row\t%s\t%s\t%d\t%d\t%s\ton.%s\toff.%s\twdown.%s\twup.%s\n", $1, $3, c, $4, $6, $1, $1, $1, $1 }'
+      awk -F "$TAB" '{ printf "row\t%s\t%s\t%d\t%d\t%s\ton.%s\toff.%s\twdown.%s\twup.%s\n", $1, $3, ($5 == "true") ? 0 : 1, $4, $6, $1, $1, $1, $1 }' "$CACHE/accts"
       [ -z "$nl" ] || printf '%s\n' "$nl" | awk -F "$TAB" '{ printf "row\t%s\t%s\t0\t-\t%s · not linked\tlink.%s\t-\t-\t-\n", $2, $3, $1, $2 }'
     fi
     exit 0 ;;
@@ -460,18 +452,13 @@ case ${1:-} in
     if brew_has || [ -n "$start_cmd" ]; then printf 'start\tstart proxy\n'; fi
     if brew_has || [ -n "$stop_cmd" ]; then printf 'stop\tstop proxy\n'; fi
     routing
-    printf 'mode-failover\tMode: failover (in your order)\nmode-wrr\tMode: weighted round-robin\n'
-    [ $mode_ok = no ] && printf 'apply\tApply %s to the proxy\n' "$(modename "$mode")"
+    [ $wrr_ok = no ] && printf 'apply\tApply weighted round-robin to the proxy\n'
     [ -n "$mgmt_key" ] && [ "$aff_state" != on ] && printf 'affinity\tKeep each chat on one account\n'
     if [ -n "$mgmt_key" ] && [ -f "$CACHE/accts" ]; then
-      ordered | awk -F "$TAB" -v m="$mode" '{ x[NR] = $0 } END { for (k = 1; k <= NR; k++) { split(x[k], f, "\t")
-        if (f[5] == "true") printf "on.%s\t%s: use\n", f[1], f[3]; else printf "off.%s\t%s: don'"'"'t use\n", f[1], f[3]
-        if (m == "failover") {
-          if (k > 1) printf "up.%s\t%s: move up (%d → %d)\n", f[1], f[3], k, k - 1
-          if (k < NR) printf "down.%s\t%s: move down (%d → %d)\n", f[1], f[3], k, k + 1
-        } else if (f[5] != "true") { w = f[4] + 0
-          if (w < 99) printf "wup.%s\t%s: weight %s → %s\n", f[1], f[3], (w > 0 ? w : "off"), w + 1
-          if (w > 0) printf "wdown.%s\t%s: weight %s → %s\n", f[1], f[3], w, (w > 1 ? w - 1 : "off") } } }'
+      awk -F "$TAB" '{ if ($5 == "true") { printf "on.%s\t%s: use\n", $1, $3; next }
+        printf "off.%s\t%s: don'"'"'t use\n", $1, $3; w = $4 + 0
+        if (w < 99) printf "wup.%s\t%s: weight %s → %s\n", $1, $3, (w > 0 ? w : "off"), w + 1
+        if (w > 0) printf "wdown.%s\t%s: weight %s → %s\n", $1, $3, w, (w > 1 ? w - 1 : "off") }' "$CACHE/accts"
       unlinked | awk -F "$TAB" '{ printf "link.%s\t%s: link to proxy\n", $2, $3; n++ } END { if (n) print "link\tLink all launcher accounts" }'
     fi
     exit 0 ;;
@@ -489,10 +476,7 @@ case ${1:-} in
     fi
     case ${2:-} in
       apply) [ -n "$mgmt_key" ] || { echo "proxy not changed (no management key)"; exit 1; }; apply; exit ;;
-      mode-failover|mode-wrr|mode-balance) mode=wrr; [ "$2" = mode-failover ] && mode=failover   # mode-balance: old name, not listed
-        mset=$mode; setkey mode "$mode" || { echo "could not write $CONF"; exit 1; }; apply; exit ;;
       on.*|off.*) setuse "${2%%.*}" "${2#*.}"; exit ;;
-      up.*|down.*) move "${2%%.*}" "${2#*.}"; exit ;;
       wup.*) setweight up "${2#wup.}"; exit ;;
       wdown.*) setweight down "${2#wdown.}"; exit ;;
       link) link ""; exit ;;
@@ -516,15 +500,53 @@ case ${1:-} in
     unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY CLIPROXY_MGMT_KEY
     ! envname "$mgmt_key_env" || unset "$mgmt_key_env"
     export ANTHROPIC_BASE_URL=$url ANTHROPIC_AUTH_TOKEN=$key CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+    ag=; for a; do case $a in --agents|--agents=*) ag=user; break ;; esac; done   # the user's own --agents wins
+    if [ -z "$ag" ]; then ag=$(agents); [ -z "$ag" ] || set -- --agents "$ag" "$@"; fi
     # an env block in ~/.claude/settings.json (e.g. another ANTHROPIC_BASE_URL) beats the process env;
     # --settings beats user settings. A file, not an argument, so the key is never on a command line.
     cs=$D/cache/claude-settings.json
     case $url$key in *[\"\\]*) cs= ;; esac
-    if [ -n "$cs" ] && mkdir -p "$D/cache" && (umask 077; printf '{"env":{"ANTHROPIC_BASE_URL":"%s","ANTHROPIC_AUTH_TOKEN":"%s"}}\n' "$url" "$key" > "$cs.$$") && mv "$cs.$$" "$cs"; then
+    # status line: the user's own one, plus the account in use (plugin statusline)
+    sl=; case $D in *[[:cntrl:]]*) ;; *) sl=$(printf '%q statusline' "$D/plugin"); sl=${sl//\\/\\\\}; sl=${sl//\"/\\\"}
+      sl=",\"statusLine\":{\"type\":\"command\",\"command\":\"$sl\"}" ;; esac
+    if [ -n "$cs" ] && mkdir -p "$D/cache" && (umask 077; printf '{"env":{"ANTHROPIC_BASE_URL":"%s","ANTHROPIC_AUTH_TOKEN":"%s"}%s}\n' "$url" "$key" "$sl" > "$cs.$$") && mv "$cs.$$" "$cs"; then
       exec claude --settings "$cs" "$@"
     fi
     [ -z "$cs" ] || rm -f "$cs.$$"
     echo "cliproxy: could not write the claude settings file: an env block in ~/.claude/settings.json may override the proxy" >&2
     exec claude "$@" ;;
-  *) echo "usage: plugin rows | actions | menu | do <start|stop|affinity|apply|mode-failover|mode-wrr|on.<idx>|off.<idx>|up.<idx>|down.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link" >&2; exit 1 ;;
+  agents)   # setup: save cache/agents.json, print how many sub-agents
+    n=$(agents | jq -r length 2>/dev/null); echo "${n:-0}"; exit 0 ;;
+  statusline)   # Claude Code's status line in "all accounts": the user's own one, then the account in use (cache only, no network here)
+    in=$(cat)
+    usage >/dev/null   # a cache older than 60 s: the same background refresh as rows (its lock, never waited for)
+    o= orig= pv=claude
+    if has jq; then
+      # --settings hides every statusLine, so the one Claude Code would have used: project local, project, user
+      cwd=$(printf '%s' "$in" | jq -r '.workspace.current_dir? // .cwd? // "" | strings' 2>/dev/null)
+      [ -n "$cwd" ] && [ -d "$cwd" ] || cwd=$PWD
+      for f in "$cwd/.claude/settings.local.json" "$cwd/.claude/settings.json" "$HOME/.claude/settings.json"; do
+        orig=$(jq -r '.statusLine.command? // empty | strings' "$f" 2>/dev/null); [ -z "$orig" ] || break
+      done
+      pv=$(printf '%s' "$in" | jq -r "$JQDEF"'.model.id? // "" | strings | if . == "" then "claude" else mprov end' 2>/dev/null)
+    fi
+    if [ -n "$orig" ] && mkdir -p "$CACHE" && chmod 700 "$CACHE"; then
+      t=$CACHE/statusline.$$
+      printf '%s\n' "$in" > "$t.in"
+      {
+        set -m   # its own process group, so a timeout also stops what it started
+        (cd "$cwd" 2>/dev/null; exec bash -c "$orig") < "$t.in" > "$t" &
+        p=$!; set +m; i=0
+        while kill -0 $p && [ $i -lt 20 ]; do sleep 0.1; i=$((i + 1)); done   # 2 s cap
+        kill -0 $p && kill -TERM -- -$p
+        wait $p
+      } 2>/dev/null
+      o=$(cat "$t" 2>/dev/null); rm -f "$t" "$t.in"
+    fi
+    e=$(awk -F "$TAB" -v p="$pv" '$1 == p { print $2; exit }' "$CACHE/inuse" 2>/dev/null)
+    px=; [ -z "$e" ] || px="proxy: $pv $e"
+    if [ -n "$o" ] && [ -n "$px" ]; then printf '%s · %s\n' "$o" "$px"
+    elif [ -n "$o$px" ]; then printf '%s\n' "$o$px"; fi
+    exit 0 ;;
+  *) echo "usage: plugin rows | actions | menu | do <start|stop|affinity|apply|on.<idx>|off.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link | statusline | agents" >&2; exit 1 ;;
 esac
