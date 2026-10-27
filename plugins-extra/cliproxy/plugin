@@ -48,7 +48,7 @@ JQDEF='def clean: tostring | gsub("[[:cntrl:]]"; "");
       elif $s == "ff" or $s == "fillfirst" then "fill-first" else $s end;
   def aid: .auth_index // "" | clean | gsub("[^A-Za-z0-9._-]"; "");
   def who: .email // .account // .name // .id // "?" | clean;
-  def wt: .weight // 1 | (tonumber? // 1) | floor | if . < 0 then 0 else . end;
+  def wt: .weight // 1 | (tonumber? // 1) | floor | if . < 0 then 0 elif . > 99 then 99 else . end;
   def accts: [.files[]? | select((.provider // .type // "") | ascii_downcase | test("^(claude|codex)$"))
     | {i: aid, n: (.name // .id // "" | clean), e: who, w: wt, d: (.disabled == true)} | select(.i != "" and .n != "")]
     | sort_by(.n)[] | [.i, .n, .e, .w, .d] | @tsv;'
@@ -184,11 +184,12 @@ routing() {
     wrr/weighted-round-robin/*) [ $aff_state = on ] && mode_ok=yes ;;
   esac
 }
-# no mode= yet and the proxy already round-robins: the user balances, so wrr
+# no mode= yet and the proxy already round-robins: the user balances, so wrr (computed only; keepwrr writes it)
 firstwrr() {
-  [ -z "$mset" ] && case $1 in round-robin|weighted-round-robin) setkey mode wrr && mode=wrr mset=wrr ;; esac
+  [ -z "$mset" ] && case $1 in round-robin|weighted-round-robin) mode=wrr mset=wrr mcomp=1 ;; esac
   return 0
 }
+keepwrr() { [ -z "$mcomp" ] || setkey mode wrr; return 0; }
 wl() { [ "$1" -gt 0 ] && echo "$1" || echo off; }
 modename() { [ "$1" = wrr ] && echo 'weighted round-robin' || echo failover; }
 
@@ -221,7 +222,7 @@ apply() {
   rm -f "$CACHE/usage" "$CACHE/routing"
   getrouting
   if [ "$code" = 200 ]; then
-    firstwrr "$(printf '%s\n' "$out" | jq -r "$JQDEF"'.strategy | strat' 2>/dev/null)"
+    firstwrr "$(printf '%s\n' "$out" | jq -r "$JQDEF"'.strategy | strat' 2>/dev/null)"; keepwrr
     [ $mode = wrr ] && s=weighted-round-robin
     if [ $mode = failover ]; then body='{"routing":{"strategy":"fill-first","cooldown":{"disable-cooling":false}}}'
     else body="{\"routing\":{\"strategy\":\"$s\",$(affkeys)}}"; fi
@@ -229,7 +230,7 @@ apply() {
   elif [ "$code" = 404 ]; then
     if [ -z "$mset" ]; then
       s=$(kcurl "$mgmt_key" -m 5 "$url/v0/management/routing/strategy")
-      firstwrr "$(printf '%s\n' "${s%$'\n'*}" | jq -r "$JQDEF"'.strategy | strat' 2>/dev/null)"
+      firstwrr "$(printf '%s\n' "${s%$'\n'*}" | jq -r "$JQDEF"'.strategy | strat' 2>/dev/null)"; keepwrr
     fi
     s=fill-first; [ $mode = wrr ] && s=weighted-round-robin
     out=$(kcurl "$mgmt_key" -m 10 -X PUT -H 'Content-Type: application/json' --data-binary "{\"value\":\"$s\"}" "$url/v0/management/routing/strategy"); code=${out##*$'\n'}

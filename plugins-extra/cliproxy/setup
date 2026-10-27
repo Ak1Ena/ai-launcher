@@ -337,7 +337,7 @@ else
     local out rc l j
     out=$(i=0; while [ $i -lt $n ]; do [ "${sel[i]}" = - ] || printf '%s\t%-7s %-12s %s\n' $((i + 1)) "${kind[i]}" "${name[i]}" "${mail[i]}"; i=$((i + 1)); done |
       fzf --multi --bind start:select-all --delimiter "$TAB" --with-nth 2.. --prompt 'accounts> ' \
-        --header 'sign these in to the proxy · tab toggle · enter continue · esc cancel'); rc=$?
+        --header "sign these in to the proxy · tab toggle · enter continue · esc cancel$(printf '%s\n' "$P" | while IFS= read -r e; do [ -n "$e" ] && printf '\nalready in proxy: %s' "$e"; done)"); rc=$?
     [ $rc = 130 ] && return 1; [ $rc -ge 2 ] && return 2
     setall 0
     while IFS= read -r l; do j=${l%%"$TAB"*}; case $j in ''|*[!0-9]*) ;; *) sel[j - 1]=1 ;; esac; done <<<"$out"

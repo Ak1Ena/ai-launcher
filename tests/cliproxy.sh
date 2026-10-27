@@ -390,6 +390,17 @@ rm -f "$T/fields.log"
 ok "lower at 0 refused, no PATCH"      '! run do wdown.c1 >/dev/null && [ ! -e "$T/fields.log" ]'
 echo "{\"$NB\":{\"weight\":99}}" > "$T/over.json"; fresh
 ok "raise capped at 99"                '! has_line "$(run actions)" "wup.c2" && ! run do wup.c2 >/dev/null && [ ! -e "$T/fields.log" ]'
+for wv in 150 '"2.5"'; do
+  echo "{\"$NB\":{\"weight\":$wv}}" > "$T/over.json"; fresh; rm -f "$T/fields.log"
+  exp=99; [ "$wv" = 150 ] || exp=2
+  ok "weight $wv: labels clamped"      'has_line "$(run actions)" "wdown.c2${TAB}wb@example.com: weight $exp → $((exp - 1))"'
+  run do wdown.c2 >/dev/null; lo=$(cat "$T/fields.log" 2>/dev/null); rm -f "$T/fields.log"
+  echo "{\"$NB\":{\"weight\":$wv}}" > "$T/over.json"; fresh; run do wup.c2 >/dev/null; hi=$(cat "$T/fields.log" 2>/dev/null); rm -f "$T/fields.log"
+  ok "weight $wv: lower is cur-1"      '[ "$lo" = "/v8/management/credentials/fields {\"name\":\"$NB\",\"weight\":$((exp - 1))}" ]'
+  if [ $exp = 99 ]; then ok "weight $wv: raise refused"  '[ -z "$hi" ]'
+  else ok "weight $wv: raise is cur+1" '[ "$hi" = "/v8/management/credentials/fields {\"name\":\"$NB\",\"weight\":3}" ]'; fi
+done
+echo "{\"$NB\":{\"weight\":99}}" > "$T/over.json"; fresh; rm -f "$T/fields.log"
 ok "unknown or bad id refused"         '! run do wup.zz >/dev/null && ! run do "off.c1;x" >/dev/null && [ ! -e "$T/fields.log" ] && [ ! -e "$T/status.log" ]'
 echo v0 > "$T/mode"; run do wdown.c2 >/dev/null
 ok "weight: v0 fallback"               '[ "$(cat "$T/fields.log")" = "/v0/management/auth-files/fields {\"name\":\"$NB\",\"weight\":98}" ]'
@@ -405,9 +416,12 @@ setc mode failover; run do mode-balance >/dev/null
 ok "mode-balance: hidden alias of mode-wrr" 'grep -qx mode=wrr "$D/config"'
 setc mode ""; setc weights on
 echo '{"strategy":"round-robin","session-affinity":true,"session-affinity-subagents":true}' > "$T/routing.json"; fresh
-ok "no mode=, round-robin proxy: wrr"  'grep -qx mode=wrr "$D/config" && has_line "$out" "weighted round-robin"'
+ok "no mode=, round-robin proxy: reads wrr" 'has_line "$out" "weighted round-robin"'
+ok "rows never write the config (no mode=)" '! grep -q "^mode=" "$D/config" && cp "$D/config" "$T/conf.before" && rm -rf "$D/cache" && run rows >/dev/null && run actions >/dev/null && cmp -s "$T/conf.before" "$D/config"'
+run do apply >/dev/null
+ok "apply writes the computed mode"    'grep -qx mode=wrr "$D/config"'
 setc mode ""; echo '{"strategy":"wrr"}' > "$T/routing.json"; fresh
-ok "no mode=, wrr proxy: wrr; old weights= ignored" 'grep -qx mode=wrr "$D/config"'
+ok "no mode=, wrr proxy: wrr; old weights= ignored" 'has_line "$out" "weighted round-robin" && ! grep -q "^mode=" "$D/config"'
 setc mode ""; echo '{"strategy":"fill-first"}' > "$T/routing.json"; fresh
 ok "no mode=, fill-first proxy: failover, not written" '! grep -q "^mode=" "$D/config" && has_line "$out" "· failover"'
 setc mode ""; echo '{"strategy":"round-robin"}' > "$T/routing.json"; rm -rf "$D/cache"; run do mode-failover >/dev/null
@@ -606,6 +620,9 @@ rm -f "$T"/auth/claude-*.json; echo '{"provider":"claude","email":"A@example.com
 echo other@example.com > "$T/login-claude"
 out=$(ACC=all st </dev/null)
 ok "setup: another email warns and is kept" 'has_line "$out" "signed in as other@example.com, expected B@Example.com: kept"'
+mkdir -p "$T/fzfbin"; printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "%s/fzf.args"\nexit 130\n' "$T" > "$T/fzfbin/fzf"; chmod +x "$T/fzfbin/fzf"
+out=$(RP=$FK/cpa:$T/jq:$T/sys:$T/fzfbin ACC= st </dev/null)
+ok "setup: fzf header lists accounts already in the proxy" 'grep -qx "already in proxy: a@example.com" "$T/fzf.args"'
 rm -rf "$T/auth"; echo a@example.com > "$T/login-claude"; c1=$(grep -c -- -claude-login "$T/cpa.log"); x1=$(grep -c -- -codex "$T/cpa.log")
 out=$(printf 'n\n\n1\n\n' | ACC= st); rc=$?
 ok "setup: numbered list needs one account, then signs in the ticked one" '[ $rc = 0 ] && has_line "$out" "pick at least one account" && [ "$(grep -c -- -claude-login "$T/cpa.log")" = $((c1 + 1)) ] && [ "$(grep -c -- -codex "$T/cpa.log")" = "$x1" ] && has_line "$out" "signed in as a@example.com"'
