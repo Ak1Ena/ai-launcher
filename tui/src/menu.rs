@@ -165,7 +165,11 @@ impl Menu {
         Menu {
             plugin: plugin.to_string(),
             now: tabs.iter().map(|t| t.rows.clone()).collect(),
-            sel: vec![0; tabs.len()],
+            // a radio tab starts on its current choice, so Enter alone changes nothing
+            sel: tabs
+                .iter()
+                .map(|t| t.items.iter().position(|i| i.on).unwrap_or(0))
+                .collect(),
             tab: 0,
             tabs,
         }
@@ -402,6 +406,16 @@ mod tests {
         let w = parse("tab\tchecklist\tA\tweight\nrow\tc\tx\t1\t150\t\t-\t-\t-\t-\n");
         assert_eq!(w[0].rows[0].n, Some(MAX_WEIGHT));
         assert!(parse("").is_empty());
+    }
+
+    #[test]
+    fn radio_starts_on_its_current_choice() {
+        let wrr = ORDER
+            .replace("(in your order)\ton\n", "(in your order)\n")
+            .replace("round-robin\n", "round-robin\ton\n");
+        let mut m = Menu::new("p", parse(&wrr));
+        press(&mut m, KeyCode::Right);
+        assert_eq!(ran(press(&mut m, KeyCode::Enter)), ["mode-wrr"]);
     }
 
     #[test]
