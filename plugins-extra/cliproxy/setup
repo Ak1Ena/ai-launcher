@@ -7,6 +7,7 @@
 # Test hooks: CLIPROXY_RELEASE_BASE (release download folder), CLIPROXY_SETUP_ACCOUNTS=all|none (no checklist).
 D=${AI_PLUGIN_DIR:-$(pwd)}
 cd "$D" || exit 1
+D=$(pwd)   # a / path whatever the env holds (the Windows install check below needs it)
 CONF=config TAB=$(printf '\t') DL= BODY= started=
 has() { command -v "$1" >/dev/null 2>&1; }
 brew_managed() { has brew && brew list cliproxyapi >/dev/null 2>&1; }
@@ -16,7 +17,7 @@ stop_proxy() {  # the proxy this run started
 }
 # a failed or cancelled setup leaves no proxy behind (the installer then removes the staging folder)
 trap 'rc=$?; rm -rf "$DL" "$BODY"; [ $rc != 0 ] && [ -n "$started" ] && stop_proxy; exit $rc' EXIT
-trap 'exit 130' INT TERM
+trap 'exit 130' INT TERM HUP
 die() { echo "  $*"; exit 1; }
 has curl || die "setup needs curl"
 
@@ -44,6 +45,12 @@ cset() {  # rewrite only the <key>= line (or add it); the file stays 600
 }
 url=$(cget url); url=${url:-http://127.0.0.1:8317}; url=${url%/}
 key=$(cget key) mk=$(cget mgmt_key) Y=$(cget proxy_config) start_cmd=$(cget start_cmd)
+# proxy configs that exist before the install step: setup never rewrites these
+NL='
+' pre=
+for f in "$Y" run/config.yaml "$(has brew && brew --prefix 2>/dev/null)/etc/cliproxyapi.conf" "$(has brew && brew --prefix 2>/dev/null)/etc/cliproxyapi/config.yaml"; do
+  [ -n "$f" ] && [ -f "$f" ] && pre=$pre$f$NL
+done
 key_env=$(cget key_env) mgmt_key_env=$(cget mgmt_key_env)
 
 up() { curl -s -m 1 -o /dev/null "$url/"; }
@@ -85,8 +92,9 @@ getkey() {
   done
   die "no working $nm: setup stopped, nothing saved for it"
 }
-# a proxy config this setup just installed: localhost only, no sample client keys (never a config you had)
+# a proxy config this run made or installed: localhost only, no sample client keys (never a config that was there before)
 sanitize() {
+  [ -n "$own" ] || [ -e "$1.ai-launcher.bak" ] || cp -p "$1" "$1.ai-launcher.bak" || die "could not back up $1"
   ( umask 077; sed -e 's/^\(  host: \)""/\1"127.0.0.1"/' -e '/^[[:blank:]]*- "your-api-key-[0-9]*"[[:blank:]]*$/d' "$1" > "$1.$$" ) &&
     cat "$1.$$" > "$1"; local rc=$?
   rm -f "$1.$$"; [ $rc = 0 ] || die "could not edit $1"
@@ -208,7 +216,7 @@ else
     sanitize "$Y"
   fi
   [ -f "$Y" ] || die "proxy config not found: $Y (set proxy_config= in $D/$CONF)"
-  [ -n "$fresh" ] && [ -z "$own" ] && sanitize "$Y"   # the stock config brew just installed
+  case "$NL$pre" in *"$NL$Y$NL"*) ;; *) [ -n "$fresh" ] && [ -z "$own" ] && sanitize "$Y" ;; esac   # only a stock config this run installed
   if [ -n "$bin" ] && [ -z "$start_cmd" ] && ! brew_managed; then
     # no brew services: run it in the background from the plugin folder (the plugin runs these there)
     start_cmd="mkdir -p run; nohup $(q "$bin") -config $(q "$Y") >run/log 2>&1 & echo \$! >run/pid"
@@ -360,11 +368,13 @@ else
         echo "  sign in as ${mail[i]} (${kind[i]} ${name[i]})"
         if [ -z "$bin" ]; then echo "  no cliproxyapi here to sign in with: skipped"; i=$((i + 1)); continue; fi
         f=-claude-login; [ "${kind[i]}" = codex ] && f=-codex-device-login
-        emails; before=$EM
+        emails || { echo "  could not read the proxy's account list: not signing in"; i=$((i + 1)); continue; }
+        before=$EM
         if if [ -n "$Y" ]; then "$bin" -config "$Y" $f; else "$bin" $f; fi; then
-          j=0; new=; while [ $j -lt 6 ]; do emails; new=$(minus "$EM" "$before"); [ -n "$new" ] && break; sleep 0.5; j=$((j + 1)); done
+          j=0; new=; rd=1; while [ $j -lt 6 ]; do if emails; then rd=0; new=$(minus "$EM" "$before"); [ -n "$new" ] && break; else rd=1; fi; sleep 0.5; j=$((j + 1)); done
           new=$(printf '%s' "$new" | head -1)
-          if [ -z "$new" ]; then echo "  no new account showed up in the proxy"
+          if [ -z "$new" ] && [ $rd = 1 ]; then echo "  error: could not read the proxy's account list after sign-in"
+          elif [ -z "$new" ]; then echo "  no new account showed up in the proxy"
           elif [ "${mail[i]}" != '?' ] && [ "$new" != "$(echo "${mail[i]}" | tr 'A-Z' 'a-z')" ]; then echo "  signed in as $new, expected ${mail[i]}: kept"
           else echo "  signed in as $new"; fi
           done_n=$((done_n + 1))

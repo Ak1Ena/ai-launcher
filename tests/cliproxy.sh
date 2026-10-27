@@ -389,7 +389,7 @@ case "\$1" in
   --prefix) if [ -n "\$2" ]; then echo "$T/bp/opt/\$2"; else echo "$T/bp"; fi ;;
   list) [ -x "$T/bp/opt/cliproxyapi/bin/cliproxyapi" ] ;;
   install) mkdir -p "$T/bp/opt/cliproxyapi/bin" "$T/bp/etc" && cp "$FK/cpa/cliproxyapi" "$T/bp/opt/cliproxyapi/bin/" &&
-    printf 'server:\n  host: ""\n  port: $P2\nmanagement:\n  secret-key: ""\naccess:\n  api-keys:\n    - "your-api-key-1"\n    - "your-api-key-2"\n' > "$T/bp/etc/cliproxyapi.conf" ;;
+    { [ -f "$T/bp/etc/cliproxyapi.conf" ] || printf 'server:\n  host: ""\n  port: $P2\nmanagement:\n  secret-key: ""\naccess:\n  api-keys:\n    - "your-api-key-1"\n    - "your-api-key-2"\n' > "$T/bp/etc/cliproxyapi.conf"; } ;;
   services) [ "\$2" = start ] && { "$T/bp/opt/cliproxyapi/bin/cliproxyapi" -config "$T/bp/etc/cliproxyapi.conf" >/dev/null 2>&1 & echo \$! > "$T/brew.pid"; } ;;
 esac
 EOF
@@ -452,6 +452,13 @@ newsp "url=http://127.0.0.1:$P2"
 out=$(echo i | RP=$FK/brew:$T/jq:$T/sys st); rc=$?
 ok "setup: brew install when missing and chosen" '[ $rc = 0 ] && grep -qx "install cliproxyapi" "$T/brew.log" && grep -qx "services start cliproxyapi" "$T/brew.log" && grep -qx "proxy_config=$T/bp/etc/cliproxyapi.conf" "$SP/config" && grep -q "secret-key: \"[0-9a-f]\{64\}\"" "$T/bp/etc/cliproxyapi.conf" && ! grep -q "^start_cmd=" "$SP/config" && has_line "$out" "proxy up"'
 ok "setup: a just-installed config loses sample keys and binds localhost" '! grep -q your-api-key "$T/bp/etc/cliproxyapi.conf" && grep -qx "  host: \"127.0.0.1\"" "$T/bp/etc/cliproxyapi.conf" && grep -qx "    - \"$(sed -n "s/^key=//p" "$SP/config")\"" "$T/bp/etc/cliproxyapi.conf"'
+
+# a brew config that was there before this run's brew install: never edited, never backed up
+stop2; rm -rf "$SP" "$T/bp" "$T/auth"; newsp "url=http://127.0.0.1:$P2"; mkdir -p "$T/bp/etc"
+printf '%s\n' 'server:' '  host: ""' "  port: $P2" 'management:' '  secret-key: "$2a$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012"' 'access:' '  api-keys:' '    - "your-api-key-1"' '    - "old-key"' > "$T/bp/etc/cliproxyapi.conf"
+cp "$T/bp/etc/cliproxyapi.conf" "$T/bp.orig"; echo '["old-key"]' > "$T/apikeys.json"
+out=$(printf 'i\n%s\n' "$MK" | RP=$FK/brew:$T/jq:$T/sys st); rc=$?
+ok "setup: a brew config that existed before install stays byte-identical" '[ $rc = 0 ] && grep -qx "install cliproxyapi" "$T/brew.log" && cmp -s "$T/bp.orig" "$T/bp/etc/cliproxyapi.conf" && [ ! -e "$T/bp/etc/cliproxyapi.conf.ai-launcher.bak" ]'
 
 newsp "url=http://127.0.0.1:$P2"; out=$(echo m | RP=$FK/brew:$T/jq:$T/sys st); rc=$?
 newsp "url=http://127.0.0.1:$P2"; out2=$(echo m | RP=$T/jq:$T/sys st); rc2=$?

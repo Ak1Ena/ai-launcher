@@ -253,6 +253,15 @@ pub struct App {
     setups: Vec<SetupRun>,
 }
 
+/// Windows path with `/` for Git Bash (`C:/…`); other systems keep the path as is.
+fn to_bash_path(p: &str) -> String {
+    if cfg!(windows) {
+        p.replace('\\', "/")
+    } else {
+        p.to_string()
+    }
+}
+
 impl App {
     pub fn new(args: Vec<String>) -> App {
         let paths = Paths::from_env();
@@ -992,19 +1001,13 @@ impl App {
         self.focus = Focus::Pane;
         let d = dir.to_string_lossy();
         // Git Bash takes C:/x for sure; backslashes are left to its path guessing
-        let bash_path = |p: &str| {
-            shell_quote(&if cfg!(windows) {
-                p.replace('\\', "/")
-            } else {
-                p.to_string()
-            })
-        };
+        let bash_path = |p: &str| shell_quote(&to_bash_path(p));
         let command = format!(
             "cd {} && bash {}",
             bash_path(&d),
             bash_path(&copy.to_string_lossy())
         );
-        let env = vec![("AI_PLUGIN_DIR".to_string(), Some(d.into_owned()))];
+        let env = vec![("AI_PLUGIN_DIR".to_string(), Some(to_bash_path(&d)))];
         let (rows, cols) = self.pane_size;
         match Pane::spawn(&command, &[], &env, rows, cols) {
             Ok(p) => self.tabs[self.current].pane = Some(p),
@@ -2125,6 +2128,12 @@ mod tests {
     use ratatui::layout::Rect;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn bash_path_uses_slashes_only_on_windows() {
+        let want = if cfg!(windows) { "C:/a/b" } else { "C:\\a\\b" };
+        assert_eq!(to_bash_path("C:\\a\\b"), want);
+    }
 
     static N: AtomicUsize = AtomicUsize::new(0);
 

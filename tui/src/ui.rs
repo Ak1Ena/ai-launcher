@@ -207,7 +207,7 @@ fn title_bar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
     }
 
     let mode = if app.wrr {
-        " ⚖ mode: round-robin "
+        " mode: round-robin "
     } else {
         " ⇢ mode: failover "
     };

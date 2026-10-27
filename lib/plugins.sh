@@ -241,7 +241,9 @@ _ai_plugin_setup() {
   _ai_plugin_setup_ok "$d" && c=$(_ai_plugin_setup_copy "$d") || return 1
   trap "rm -f $(printf %q "$c"); exit 130" INT TERM
   _ai_plugin_approve "$c" || { rm -f "$c"; trap - INT TERM; return 1; }
-  [ -f "$d/config" ] && cp "$d/config" "$d/config.bak"
+  if [ -f "$d/config" ] && ! cp "$d/config" "$d/config.bak"; then
+    rm -f "$c"; trap - INT TERM; echo "could not back up $d/config: setup not run"; return 1
+  fi
   _ai_plugin_run_setup "$d" "$c"; rc=$?
   trap - INT TERM
   [ $rc = 0 ] || echo "setup failed (exit $rc)"

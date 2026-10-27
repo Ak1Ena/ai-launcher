@@ -459,6 +459,8 @@ ok "setup: plugin setup reruns and keeps config.bak" 'AI_YES=1 AI plugin setup w
 printf 'exit 4\n' > "$PL/withsetup/setup"
 ok "setup: failed rerun keeps the plugin" '[ "$(AI_YES=1 AI plugin setup withsetup 2>&1 | tail -1)" = "setup failed (exit 4)" ] && [ -x "$PL/withsetup/plugin" ]'
 ok "setup: refused rerun runs nothing" 'printf "touch %s/rerun.ran\n" "$T" > "$PL/withsetup/setup" && ! AI plugin setup withsetup <<<n >/dev/null 2>&1 && [ ! -e "$T/rerun.ran" ]'
+printf 'touch %s/bak.ran\n' "$T" > "$PL/withsetup/setup"; rm -f "$PL/withsetup/config.bak"; : > "$PL/withsetup/config.bak"; chmod 400 "$PL/withsetup/config.bak"
+ok "setup: a failed config backup stops before setup" '! AI_YES=1 AI plugin setup withsetup >/dev/null 2>&1 && [ ! -e "$T/bak.ran" ]; r=$?; chmod 600 "$PL/withsetup/config.bak"; rm -f "$PL/withsetup/config.bak"; [ $r = 0 ]'
 ok "setup: plugin setup needs a setup" '! AI plugin setup myp >/dev/null 2>&1 && ! AI plugin setup nope >/dev/null 2>&1'
 mksetup sleepy 'touch "'"$T"'/setup.started"; sleep 30'; mkdir -p "$T/tmpx"
 ( set -m; TMPDIR=$T/tmpx AI_YES=1 "$REPO/bin/ai" plugin add "$T/src/sleepy" >"$T/int.out" 2>&1 & p=$!
