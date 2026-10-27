@@ -344,7 +344,7 @@ case ${1:-} in
     if brew_has || [ -n "$start_cmd" ]; then printf 'start\tstart proxy\n'; fi
     if brew_has || [ -n "$stop_cmd" ]; then printf 'stop\tstop proxy\n'; fi
     routing
-    printf 'mode-failover\tMode: failover (one account until limited, in your order)\nmode-wrr\tMode: weighted round-robin\n'
+    printf 'mode-failover\tMode: failover (in your order)\nmode-wrr\tMode: weighted round-robin\n'
     [ $mode_ok = no ] && printf 'apply\tApply %s to the proxy\n' "$(modename "$mode")"
     [ -n "$mgmt_key" ] && [ "$aff_state" != on ] && printf 'affinity\tKeep each chat on one account\n'
     if [ -n "$mgmt_key" ] && [ -f "$CACHE/accts" ]; then

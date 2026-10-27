@@ -314,7 +314,7 @@ ok "failover rows: n, email, on/off, by name" '[ "$(dlines)" = "  ${TAB}1  wa@ex
   ${TAB}3  wd@example.com  off
   ${TAB}4  wc@example.com  on" ]'
 acts=$(run actions)
-ok "actions: modes, apply, no old ones" 'has_line "$acts" "mode-failover${TAB}Mode: failover (one account until limited, in your order)" && has_line "$acts" "mode-wrr${TAB}Mode: weighted round-robin" && has_line "$acts" "apply${TAB}Apply failover to the proxy" && ! has_line "$acts" "mode-balance" && ! has_line "$acts" "weights-"'
+ok "actions: modes, apply, no old ones" 'has_line "$acts" "mode-failover${TAB}Mode: failover (in your order)" && has_line "$acts" "mode-wrr${TAB}Mode: weighted round-robin" && has_line "$acts" "apply${TAB}Apply failover to the proxy" && ! has_line "$acts" "mode-balance" && ! has_line "$acts" "weights-"'
 ok "failover actions: use, move"       '[ "$(alines)" = "off.c1${TAB}wa@example.com: don'"'"'t use
 down.c1${TAB}wa@example.com: move down (1 → 2)
 off.c2${TAB}wb@example.com: don'"'"'t use
