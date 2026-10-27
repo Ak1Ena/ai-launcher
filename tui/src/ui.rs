@@ -1263,8 +1263,9 @@ fn flash_above(f: &mut Frame, app: &App, bottom: Rect) {
 }
 
 /// One script line made safe to draw: control characters as `^X` (C1 as `<M-^X>`), and
-/// invisible or direction-changing marks as `<U+XXXX>`, so the screen can't be steered and
-/// nothing that runs is hidden. Tabs become spaces.
+/// invisible, blank-looking or direction-changing characters as `<U+XXXX>` (zero-width ones,
+/// fillers, and every whitespace but a plain space: bash reads those as part of a word), so the
+/// screen can't be steered and nothing that runs is hidden. Tabs become spaces.
 pub fn escape_line(line: &str) -> String {
     let mut out = String::new();
     for c in line.chars() {
@@ -1283,7 +1284,17 @@ pub fn escape_line(line: &str) -> String {
             | '\u{200b}'..='\u{200f}'
             | '\u{2028}'..='\u{202e}'
             | '\u{2060}'..='\u{2069}'
-            | '\u{feff}' => out.push_str(&format!("<U+{:04X}>", c as u32)),
+            | '\u{feff}'
+            | '\u{115f}'
+            | '\u{1160}'
+            | '\u{2800}'
+            | '\u{3164}'
+            | '\u{ffa0}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e007f}' => out.push_str(&format!("<U+{:04X}>", c as u32)),
+            c if !c.is_ascii() && (c.is_whitespace() || dw(&c.to_string()) == 0) => {
+                out.push_str(&format!("<U+{:04X}>", c as u32))
+            }
             c => out.push(c),
         }
     }
@@ -1365,29 +1376,27 @@ fn review_screen(f: &mut Frame, app: &App, r: &Review, area: Rect, hits: &mut Hi
     let inner_w = (boxed.width as usize).saturating_sub(2 + nw + 4);
     let inner_h = boxed.height.saturating_sub(2) as usize;
     // display rows from the first line on: (number or blank, text)
-    let rows_from = |first: usize| {
-        src.iter()
-            .enumerate()
-            .skip(first)
-            .flat_map(|(i, l)| {
-                chunks(&escape_line(l), inner_w)
-                    .into_iter()
-                    .enumerate()
-                    .map(move |(k, c)| {
-                        let n = if k == 0 {
-                            format!("{:>nw$}", i + 1)
-                        } else {
-                            " ".repeat(nw)
-                        };
-                        (n, c)
-                    })
-            })
-            .take(inner_h + 1)
-            .collect::<Vec<_>>()
-    };
-    let top = r.scroll.min(src.len().saturating_sub(1));
-    let rows = rows_from(top);
-    let more = top > 0 || rows.len() > inner_h;
+    // every display row of the script: scrolling moves by these, so each byte can be reached
+    let rows: Vec<(String, String)> = src
+        .iter()
+        .enumerate()
+        .flat_map(|(i, l)| {
+            chunks(&escape_line(l), inner_w)
+                .into_iter()
+                .enumerate()
+                .map(move |(k, c)| {
+                    let n = if k == 0 {
+                        format!("{:>nw$}", i + 1)
+                    } else {
+                        " ".repeat(nw)
+                    };
+                    (n, c)
+                })
+        })
+        .collect();
+    r.view.set((rows.len(), inner_h, inner_w));
+    let top = r.scroll.min(rows.len().saturating_sub(inner_h));
+    let more = rows.len() > inner_h;
     let mut block = Block::bordered()
         .border_type(BorderType::Plain)
         .border_style(s(FAINT));
@@ -1396,6 +1405,7 @@ fn review_screen(f: &mut Frame, app: &App, r: &Review, area: Rect, hits: &mut Hi
     }
     let lines: Vec<Line> = rows
         .into_iter()
+        .skip(top)
         .take(inner_h)
         .map(|(n, c)| {
             Line::from(vec![
