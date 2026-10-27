@@ -202,8 +202,11 @@ conf "url=$URL" key_env=MYKEY
 export CLAUDE_CONFIG_DIR=$HOME/acc/one ANTHROPIC_API_KEY=sk-ant-SHOULD-GO
 run launch all --foo "a b" >/dev/null 2>&1; rc=$?
 ok "launch execs claude"               '[ $rc = 0 ] && [ -f "$T/claude.env" ]'
-ok "launch passes args"                '[ "$(cat "$T/claude.args")" = "--foo
+ok "launch passes args after --settings" '[ "$(cat "$T/claude.args")" = "--settings
+$D/cache/claude-settings.json
+--foo
 a b" ]'
+ok "launch settings file beats ~/.claude env, 600" '[ "$(cat "$D/cache/claude-settings.json")" = "{\"env\":{\"ANTHROPIC_BASE_URL\":\"$URL\",\"ANTHROPIC_AUTH_TOKEN\":\"$MYKEY\"}}" ] && case $(ls -l "$D/cache/claude-settings.json") in -rw-------*) true;; *) false;; esac && ! grep -q -- "$MYKEY" "$T/claude.args"'
 ok "launch sets base url"              'grep -qx "ANTHROPIC_BASE_URL=$URL" "$T/claude.env"'
 ok "launch sets gateway discovery"     'grep -qx "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1" "$T/claude.env"'
 ok "launch unsets CLAUDE_CONFIG_DIR"   '! grep -q "^CLAUDE_CONFIG_DIR=" "$T/claude.env"'

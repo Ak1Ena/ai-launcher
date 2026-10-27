@@ -265,6 +265,8 @@ Needs jq. Not used in team mode. Limits: the cooldown is fixed, not the real res
 
 ## Plugins
 
+Writing a plugin? See [PLUGINS.md](PLUGINS.md).
+
 A plugin adds your own launch entries to `ai`, with no change to this repo. It is a folder with an executable file called `plugin`, in any language (a bash script is fine). Each plugin gets its own section in the TUI home list and its own group in the bash picker. Plugin rows are never part of failover: no priority, no limit marks, no handoff. A limit inside a plugin session moves nothing.
 
 This is different from `plugins/<name>.sh` further down, which only adds usage bars for an agent that is already in the providers file.
@@ -358,7 +360,7 @@ row<TAB><key><TAB><label><TAB>1|0<TAB><n|-><TAB><note><TAB><on-id><TAB><off-id><
 
 ### cliproxy
 
-The bundled `cliproxy` plugin starts Claude Code through [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), a local proxy that holds several logins (Claude, Codex, Gemini...) and spreads requests across them. You get one row, "Claude Code · all accounts", that works like one more account for all of them together. The failover section stays as it is.
+The bundled `cliproxy` plugin starts Claude Code through [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), a local proxy that holds several logins (Claude, Codex, Gemini...) and spreads requests across them. You get one row, "Claude Code · all accounts", that works like one more account for all of them together. The failover section stays as it is. It starts `claude` with `--settings <plugin>/cache/claude-settings.json` (mode 600), which holds the proxy URL and client key, because an `env` block in `~/.claude/settings.json` (another `ANTHROPIC_BASE_URL`, such as a local compression proxy) would otherwise win over the environment and send the key to the wrong server ("401 Invalid bearer token", then a login prompt). The proxy picks the account by model: Claude models go to Claude accounts, and GPT models (`gpt-…`, listed in Claude Code's `/model` because the plugin turns on gateway model discovery) go to Codex accounts. Codex accounts do not take over Claude-model requests by themselves; pick a GPT model with `/model` to use them.
 
 `ai plugin add cliproxy` runs its setup after you review it (again later with `ai plugin setup cliproxy`, the way to add accounts):
 

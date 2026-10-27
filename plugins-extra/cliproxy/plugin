@@ -516,6 +516,14 @@ case ${1:-} in
     unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY CLIPROXY_MGMT_KEY
     ! envname "$mgmt_key_env" || unset "$mgmt_key_env"
     export ANTHROPIC_BASE_URL=$url ANTHROPIC_AUTH_TOKEN=$key CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+    # an env block in ~/.claude/settings.json (e.g. another ANTHROPIC_BASE_URL) beats the process env;
+    # --settings beats user settings. A file, not an argument, so the key is never on a command line.
+    cs=$D/cache/claude-settings.json
+    case $url$key in *[\"\\]*) cs= ;; esac
+    if [ -n "$cs" ] && mkdir -p "$D/cache" && (umask 077; printf '{"env":{"ANTHROPIC_BASE_URL":"%s","ANTHROPIC_AUTH_TOKEN":"%s"}}\n' "$url" "$key" > "$cs.$$") && mv "$cs.$$" "$cs"; then
+      exec claude --settings "$cs" "$@"
+    fi
+    rm -f "$cs.$$" 2>/dev/null
     exec claude "$@" ;;
   *) echo "usage: plugin rows | actions | menu | do <start|stop|affinity|apply|mode-failover|mode-wrr|on.<idx>|off.<idx>|up.<idx>|down.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link" >&2; exit 1 ;;
 esac
