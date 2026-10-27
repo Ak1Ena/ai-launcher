@@ -453,9 +453,11 @@ printf 'exit 4\n' > "$PL/withsetup/setup"
 ok "setup: failed rerun keeps the plugin" '[ "$(AI_YES=1 AI plugin setup withsetup 2>&1 | tail -1)" = "setup failed (exit 4)" ] && [ -x "$PL/withsetup/plugin" ]'
 ok "setup: refused rerun runs nothing" 'printf "touch %s/rerun.ran\n" "$T" > "$PL/withsetup/setup" && ! AI plugin setup withsetup <<<n >/dev/null 2>&1 && [ ! -e "$T/rerun.ran" ]'
 ok "setup: plugin setup needs a setup" '! AI plugin setup myp >/dev/null 2>&1 && ! AI plugin setup nope >/dev/null 2>&1'
-mksetup sleepy 'sleep 30'
-( set -m; AI_YES=1 "$REPO/bin/ai" plugin add "$T/src/sleepy" >/dev/null 2>&1 & p=$!; sleep 1; kill -INT -- -$p; wait $p ) 2>/dev/null
-ok "setup: interrupt removes staging" '[ ! -e "$PL/sleepy" ] && [ ! -e "$PL/.sleepy.install" ]'
+mksetup sleepy 'touch "'"$T"'/setup.started"; sleep 30'; mkdir -p "$T/tmpx"
+( set -m; TMPDIR=$T/tmpx AI_YES=1 "$REPO/bin/ai" plugin add "$T/src/sleepy" >"$T/int.out" 2>&1 & p=$!
+  i=0; while [ ! -e "$T/setup.started" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  kill -INT -- -$p; wait $p ) 2>/dev/null
+ok "setup: interrupt removes staging and the temp copy" '[ -e "$T/setup.started" ] && [ ! -e "$PL/sleepy" ] && [ ! -e "$PL/.sleepy.install" ] && grep -qx "setup failed (exit 130): plugin not installed" "$T/int.out" && [ -z "$(ls -A "$T/tmpx")" ]'
 
 # the bundled cliproxy plugin has its own suite (fake proxy, fake HOME)
 ok "cliproxy plugin suite" 'bash "$REPO/tests/cliproxy.sh" >/dev/null 2>&1'

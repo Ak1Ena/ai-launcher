@@ -135,7 +135,7 @@ _ai_plugin_add() {
 # fetch into staging <plugins>/.<n>.install, check it, review and run its setup, then move it in.
 # Any failure, a no, or Ctrl-C removes staging, so nothing half-installed is ever listed.
 _ai_plugin_add_in() {
-  local n=$1 src=$2 url=$3 from=$4 dir st err rc
+  local n=$1 src=$2 url=$3 from=$4 dir st err rc c
   dir=$(_ai_plugins_dir)/$n; st=${dir%/*}/.$n.install
   trap "rm -rf $(printf %q "$st"); exit 130" INT TERM
   rm -rf "$st"  # stale one from a crash; no trailing slash, so a link is removed, never followed
@@ -152,9 +152,10 @@ _ai_plugin_add_in() {
   [ -f "$st/plugin" ] && { is_windows || [ -x "$st/plugin" ]; } ||
     { rm -rf "$st"; echo "no executable 'plugin' in $src"; return 1; }
   if [ -e "$st/setup" ] || [ -L "$st/setup" ]; then
-    _ai_plugin_setup_ok "$st" || { rm -rf "$st"; return 1; }
-    _ai_plugin_approve "$st" || { rm -rf "$st"; echo "cancelled: plugin not installed"; return 1; }
-    _ai_plugin_run_setup "$st"; rc=$?
+    _ai_plugin_setup_ok "$st" && c=$(_ai_plugin_setup_copy "$st") || { rm -rf "$st"; return 1; }
+    trap "rm -rf $(printf %q "$st") $(printf %q "$c"); echo 'setup failed (exit 130): plugin not installed'; exit 130" INT TERM
+    _ai_plugin_approve "$c" || { rm -rf "$st" "$c"; echo "cancelled: plugin not installed"; return 1; }
+    _ai_plugin_run_setup "$st" "$c"; rc=$?
     [ $rc = 0 ] || { rm -rf "$st"; echo "setup failed (exit $rc): plugin not installed"; return 1; }
   fi
   { [ -e "$dir" ] || [ -L "$dir" ]; } && { rm -rf "$st"; echo "plugin '$n' exists. remove it first: ai plugin rm $n"; return 1; }
@@ -176,32 +177,41 @@ _ai_plugin_review() {
     LC_ALL=C sed "$e" "$1" | awk '{ printf "%4d  %s\n", NR, $0 }'
   } | if [ -t 1 ] && has less; then less -R; else cat; fi
 }
-# review, then ask (AI_YES=1 approves, for tests)
+# copy <dir>/setup to a temp file and print its path: that copy is what gets shown and run
+_ai_plugin_setup_copy() {
+  local c
+  c=$(mktemp "${TMPDIR:-/tmp}/ai-setup.XXXXXX") || return 1
+  cp "$1/setup" "$c" || { rm -f "$c"; return 1; }
+  printf '%s\n' "$c"
+}
+# _ai_plugin_approve <copy>: review, then ask (AI_YES=1 approves, for tests)
 _ai_plugin_approve() {
   local ans
-  _ai_plugin_review "$1/setup"
+  _ai_plugin_review "$1"
   [ "${AI_YES:-}" = 1 ] && return 0
   read -r -p "run this setup script? [y/N] " ans
   case $ans in y|Y|yes) ;; *) return 1 ;; esac
 }
-# run a copy of setup (the reviewed bytes) with the user's terminal, no timeout, in the plugin folder
+# _ai_plugin_run_setup <dir> <copy>: run the reviewed copy with the user's terminal, no timeout,
+# in the plugin folder, then remove the copy
 _ai_plugin_run_setup() {
-  local d=$1 c rc
-  c=$(mktemp "${TMPDIR:-/tmp}/ai-setup.XXXXXX") || return 1
-  cp "$d/setup" "$c" || { rm -f "$c"; return 1; }
+  local d=$1 c=$2 rc
   (cd "$d" && AI_PLUGIN_DIR=$d bash "$c"); rc=$?
   rm -f "$c"
   return $rc
 }
 # ai plugin setup <name>: run setup again in the installed folder; a failure keeps the plugin
 _ai_plugin_setup() {
-  local n=${1:-} d rc
+  local n=${1:-} d rc c
   _ai_plugin_arg "$n" x || return 1
   d=$(_ai_plugins_dir)/$n
   { [ -e "$d/setup" ] || [ -L "$d/setup" ]; } || { echo "plugin '$n' has no setup"; return 1; }
-  _ai_plugin_setup_ok "$d" && _ai_plugin_approve "$d" || return 1
+  _ai_plugin_setup_ok "$d" && c=$(_ai_plugin_setup_copy "$d") || return 1
+  trap "rm -f $(printf %q "$c"); exit 130" INT TERM
+  _ai_plugin_approve "$c" || { rm -f "$c"; trap - INT TERM; return 1; }
   [ -f "$d/config" ] && cp "$d/config" "$d/config.bak"
-  _ai_plugin_run_setup "$d"; rc=$?
+  _ai_plugin_run_setup "$d" "$c"; rc=$?
+  trap - INT TERM
   [ $rc = 0 ] || echo "setup failed (exit $rc)"
   return $rc
 }
