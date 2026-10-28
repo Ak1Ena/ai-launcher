@@ -30,6 +30,18 @@ CK=client-key-SECRET-123 MK=mgmt-key-SECRET-456
 fails=0
 ok() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
 has_line() { printf '%s\n' "$1" | grep -qF -- "$2"; }
+TOKS=
+# leakfree <text> [paths...]: no fake token of $TOKS, nor its base64 or hex form, in the text or under the paths
+leakfree() {
+  local x=$1 t f; shift
+  for t in $TOKS; do
+    for f in "$t" "$(printf %s "$t" | base64 | tr -d '\n=')" "$(printf %s "$t" | od -An -tx1 | tr -d ' \n')"; do
+      printf '%s' "$x" | grep -qiF -- "$f" && { echo "leak: $t" >&2; return 1; }
+      [ $# = 0 ] || ! grep -rqiF -- "$f" "$@" 2>/dev/null || { echo "leak: $t" >&2; return 1; }
+    done
+  done
+  return 0
+}
 run() { (cd "$T/work" && PATH=${RP:-$BASEPATH} "$P" "$@"); }   # plugin's cwd = user's folder
 conf() { printf '%s\n' "$@" > "$D/config"; chmod 600 "$D/config"; }
 wait_cache() { local i=0; while [ $i -lt 50 ]; do [ -f "$D/cache/usage" ] && [ "$(head -1 "$D/cache/usage")" != "${1:-}" ] && [ ! -d "$D/cache/lock" ] && return 0; sleep 0.2; i=$((i + 1)); done; return 1; }
@@ -154,7 +166,7 @@ class H(BaseHTTPRequestHandler):
             if 'forbid' in m: return self.send(403, {"error": "remote management key not set"})
             if 'anykey' not in m and not any(self.auth(k) for k in mks()): return self.send(401, {"error": "bad mgmt key"})
             if p == '/v0/management/auth-files' and self.command == 'POST':
-                if 'upfail' in m: return self.send(500, {"error": "failed to write file: x"})
+                if 'upfail' in m: return self.send(500, {"error": "failed to write file: " + self.raw.decode('utf-8', 'replace')})   # echoes what was sent
                 return self.send(200, {"status": "ok"}) if upload(self.headers.get('Content-Type', ''), self.raw) else self.send(400, {"error": "no file"})
             if p == '/v8/management/config/access/api-keys':
                 if self.command == 'GET': return self.send(200, jfile('apikeys.json') or [])
@@ -180,6 +192,7 @@ class H(BaseHTTPRequestHandler):
                 o = jfile('over.json') or {}; o.setdefault(b.pop('name'), {}).update(b); json.dump(o, open(T + '/over.json', 'w'))
                 return self.send(200, {"status": "ok"})
             if p in ('/v8/management/requests/api-call', '/v0/management/api-call'):
+                open(T + '/apicall.log', 'a').write(body + '\n')
                 req = json.loads(body or '{}'); code, obj = quota(req.get('auth_index'))
                 return self.send(200, {"status_code": code, "header": {}, "body": json.dumps(obj)})
         return self.send(404, {"error": "not found"})
@@ -519,7 +532,8 @@ ok "link: claude auth file (Keychain)" 'jq -e ".type == \"claude\" and .access_t
 ok "link: claude auth file (.credentials.json)" 'jq -e ".access_token == \"TOK-K2-ACCESS\" and .refresh_token == \"TOK-K2-REFRESH\" and .email == \"K2@Example.com\"" "$T/uploads/claude-K2@Example.com.json" >/dev/null'
 ok "link: codex auth file"             'jq -e ".type == \"codex\" and .id_token == \"$CXID\" and .access_token == \"$CXAT\" and .refresh_token == \"TOK-CX-REFRESH\" and .account_id == \"acct-1\" and .email == \"cx@example.com\" and .expired == \"2030-01-01T00:00:00Z\" and (.last_refresh | length > 0)" "$T/uploads/codex-cx@example.com.json" >/dev/null'
 ok "link: account already in proxy not uploaded" '[ "$(ls "$T/uploads" | grep -ic k3)" = 0 ] && [ "$(ls "$T/uploads" | grep -c .)" = 3 ] && grep -q "POST /v0/management/auth-files" "$T/srv.log"'
-ok "link: no token in output, argv, log or leftover files" '! printf "%s" "$res" | grep -q TOK- && ! grep -q TOK- "$T/curl.argv" "$T/security.argv" "$T/srv.log" && [ -z "$(grep -rl TOK- "$D" "$T/work")" ] && grep -q "file=@" "$T/curl.argv"'
+TOKS="TOK-K1-ACCESS TOK-K1-REFRESH TOK-K2-ACCESS TOK-K2-REFRESH $CXID $CXAT TOK-CX-REFRESH"
+ok "link: no token in output, argv, log or leftover files" 'leakfree "$res" "$T/curl.argv" "$T/security.argv" "$T/srv.log" "$D" "$T/work" && ! printf "%s" "$res" | grep -q TOK- && ! grep -q TOK- "$T/curl.argv" "$T/security.argv" "$T/srv.log" && [ -z "$(grep -rl TOK- "$D" "$T/work")" ] && grep -q "file=@" "$T/curl.argv"'
 out=$(lrun rows)
 ok "link: rows follow at once"         '[ "$(printf "%s\n" "$out" | grep "^  ${TAB}.*not linked$")" = "  ${TAB}k4@example.com  not linked" ] && has_line "$out" "k1@example.com  ×1"'
 res=$(lrun do link.claude-k4); rc=$?; res2=$(lrun do link.claude-k1); rc2=$?
@@ -534,13 +548,109 @@ ok "link: needs the management key"    '[ $rc = 1 ] && [ "$res" = "needs the man
 conf "url=$URL" "key=$CK" "mgmt_key=$MK"
 echo '{"files":[{"auth_index":"c9","name":"Claude-K1@Example.com.json","provider":"claude","disabled":false}]}' > "$T/creds.json"
 mkdir -p "$L/cla/k6"; echo '{"oauthAccount":{"emailAddress":"K2@EXAMPLE.com"}}' > "$L/cla/k6/.claude.json"; cp "$L/cla/k2/.credentials.json" "$L/cla/k6/"
-rm -rf "$D/cache" "$T/uploads"; : > "$T/upload.mode"; echo upfail > "$T/mode"
+wait_cache; rm -rf "$D/cache" "$T/uploads"; : > "$T/upload.mode"; echo upfail > "$T/mode"
 res=$(lrun do link); rc=$?; : > "$T/mode"
-ok "link: failed upload shows the proxy's error, no token" 'has_line "$res" "skipped cx@example.com: the proxy refused it (HTTP 500): failed to write file: x" && ! printf "%s\n" "$res" | grep -q TOK-'
+ok "link: failed upload shows only the status, never the proxy's text" 'has_line "$res" "skipped cx@example.com: the proxy refused it (HTTP 500)" && ! has_line "$res" "failed to write" && leakfree "$res" "$D" "$T/work" && ! printf "%s\n" "$res" | grep -q TOK-'
 ok "link: failed upload: temp file was 600, nothing left" '[ $rc = 1 ] && has_line "$res" "skipped cx@example.com: the proxy refused it (HTTP 500)" && [ -s "$T/upload.mode" ] && [ -z "$(grep -v "^-rw-------" "$T/upload.mode")" ] && [ -z "$(ls "$D/cache" | grep "^link")" ] && [ -z "$(grep -rl TOK- "$D")" ]'
 res=$(lrun do link); rc=$?
 ok "link: a same-name proxy file is never overwritten" 'has_line "$res" "skipped k1@example.com: a proxy file named claude-k1@example.com.json already exists" && [ ! -e "$T/uploads/claude-k1@example.com.json" ] && grep -q "Claude-K1@Example.com.json" "$T/creds.json" && [ "$(ls "$T/uploads" | grep -ic "^claude-k1")" = 0 ]'
 ok "link: one upload per email (any case)" '[ "$(ls "$T/uploads" | grep -ic "k2@example.com")" = 1 ] && [ "$(printf "%s\n" "$res" | grep -ic "k2@example.com")" = 1 ] && has_line "$res" "linked cx@example.com"'
+# ── agy (Antigravity) login: Keychain gemini/antigravity or its token file, email from agy's log; auto-link at launch ──
+AGH=$HOME/.gemini/antigravity-cli; mkdir -p "$AGH/log" "$L/none"
+printf 'I1022 17:41:34.8 266 server_oauth.go:224] applyAuthResult: email=old@example.com, authMethod=consumer, quotaProject=\n' > "$AGH/log/cli-20261022_174134.log"
+printf 'I1028 10:26:02.6 495 server_oauth.go:224] applyAuthResult: email=ag@example.com, authMethod=consumer, quotaProject=\n' > "$AGH/log/cli-20261028_102540.log"
+printf 'nothing here\n' > "$AGH/log/cli-20261028_200000.log"   # the newest log, without the line
+printf 'agw\tagy --x\tAgy\nagz\tFOO=1 /opt/bin/agy\tAgy 2\n' > "$L/pagy"
+agrun() { CLA_ROOT=$L/none AI_PROVIDERS=$L/pagy AI_ACCOUNTS=$L/acc RP=$T/argv:$T/kc:$BASEPATH run "$@"; }
+AGID="h.$(b64 '{"email":"ag@example.com"}').TOK-AG-IDSIG"
+printf 'go-keyring-base64:%s' "$(printf '{"token":{"access_token":"TOK-AG-ACCESS","refresh_token":"TOK-AG-REFRESH","expiry":"2030-01-01T00:00:00Z","id_token":"%s"}}' "$AGID" | base64 | tr -d '\n')" > "$T/kc/gemini"
+echo '{"files":[]}' > "$T/creds.json"; rm -rf "$D/cache" "$T/uploads"
+agrun rows >/dev/null; wait_cache; out=$(agrun rows)
+ok "agy: one not-linked row for two agy providers, email from the newest log" '[ "$(printf "%s\n" "$out" | grep "^  ${TAB}.*not linked$")" = "  ${TAB}ag@example.com  not linked" ] && has_line "$(agrun actions)" "link.antigravity-agw${TAB}ag@example.com: link to proxy" && ! agrun actions | grep -q agz'
+: > "$T/curl.argv"; : > "$T/security.argv"; : > "$T/srv.log"
+# an old log that never ends (a FIFO): rows must not read old logs once a newer one has the email
+mkfifo "$AGH/log/cli-20200101_000000.log"; (agrun rows > "$T/fifo.out") & fp=$!; i=0
+while kill -0 $fp 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+fk=; kill -0 $fp 2>/dev/null && { fk=1; kill $fp; : > "$AGH/log/cli-20200101_000000.log"; }; wait $fp 2>/dev/null
+ok "agy: only the newest log with the line is read" '[ -z "$fk" ] && has_line "$(cat "$T/fifo.out")" "ag@example.com  not linked"'
+rm -f "$AGH/log/cli-20200101_000000.log" "$T/fifo.out"
+# a claude account with the same email in the proxy does not hide the agy login
+echo '{"files":[{"auth_index":"c7","name":"claude-ag@example.com.json","email":"ag@example.com","provider":"claude"}]}' > "$T/creds.json"; fresh() { rm -rf "$D/cache"; agrun rows >/dev/null; wait_cache; out=$(agrun rows); }; fresh
+ok "agy: matched by provider and email" 'has_line "$out" "  ${TAB}ag@example.com  not linked" && has_line "$out" "  ${TAB}ag@example.com  ×1"'
+echo '{"files":[]}' > "$T/creds.json"; fresh
+res=$(agrun do link 2>&1); rc=$?
+ok "agy: go-keyring-base64 Keychain login linked" '[ $rc = 0 ] && [ "$res" = "linked ag@example.com" ] && grep -qxF -- "find-generic-password -s gemini -a antigravity -w" "$T/security.argv"'
+ok "agy: antigravity auth file, no project_id" 'jq -e "keys == [\"access_token\",\"email\",\"expired\",\"refresh_token\",\"timestamp\",\"type\"] and .type == \"antigravity\" and .access_token == \"TOK-AG-ACCESS\" and .refresh_token == \"TOK-AG-REFRESH\" and .email == \"ag@example.com\" and .expired == \"2030-01-01T00:00:00Z\" and (.timestamp | type == \"number\" and . > 1700000000000)" "$T/uploads/antigravity-ag@example.com.json" >/dev/null'
+TOKS="TOK-AG-ACCESS TOK-AG-REFRESH $AGID $(cat "$T/kc/gemini")"
+ok "agy: no token in output, argv, log or leftover files" 'leakfree "$res" "$T/curl.argv" "$T/security.argv" "$T/srv.log" "$D" "$T/work" && ! printf "%s" "$res" | grep -q TOK- && ! grep -q TOK- "$T/curl.argv" "$T/security.argv" "$T/srv.log" && [ -z "$(grep -rl TOK- "$D" "$T/work")" ]'
+fresh
+ok "agy: antigravity account in the list with a weight" 'has_line "$out" "  ${TAB}ag@example.com  ×1" && ! has_line "$out" "not linked" && [ "$(agrun menu | grep "^row")" = "row${TAB}u1${TAB}ag@example.com${TAB}1${TAB}1${TAB}antigravity${TAB}on.u1${TAB}off.u1${TAB}wdown.u1${TAB}wup.u1" ]'
+rm -f "$T/fields.log" "$T/status.log"; agrun do wup.u1 >/dev/null; agrun do off.u1 >/dev/null
+ok "agy: weight and on/off go to the antigravity file" 'grep -qF "{\"name\":\"antigravity-ag@example.com.json\",\"weight\":2}" "$T/fields.log" && grep -qF "{\"name\":\"antigravity-ag@example.com.json\",\"disabled\":true}" "$T/status.log"'
+rm -f "$T/fields.log" "$T/status.log" "$T/over.json"
+# plain JSON, fields at top level, expiry_date in ms, from the token file (no Keychain item)
+rm -f "$T/kc/gemini"; echo "{\"access_token\":\"TOK-AG2-ACCESS\",\"refresh_token\":\"TOK-AG2-REFRESH\",\"expiry_date\":1893456000000,\"id_token\":\"$AGID\"}" > "$AGH/antigravity-oauth-token"
+echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads"; fresh
+res=$(agrun do link.antigravity-agw 2>&1); rc=$?
+ok "agy: plain JSON token file linked" '[ $rc = 0 ] && [ "$res" = "linked ag@example.com" ] && jq -e ".access_token == \"TOK-AG2-ACCESS\" and .refresh_token == \"TOK-AG2-REFRESH\" and .email == \"ag@example.com\" and .expired == \"2030-01-01T00:00:00Z\"" "$T/uploads/antigravity-ag@example.com.json" >/dev/null && [ -z "$(grep -rl TOK- "$D")" ]'
+# no id_token: the log email is never trusted for the file name
+echo '{"access_token":"TOK-AG5-A","refresh_token":"TOK-AG5-R"}' > "$AGH/antigravity-oauth-token"
+echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads"; fresh
+res=$(agrun do link 2>&1); rc=$?
+ok "agy: login without an id_token email is skipped" '[ $rc = 1 ] && [ "$res" = "skipped ag@example.com: agy'"'"'s saved login names no account — sign the proxy in with: cliproxyapi -antigravity-login" ] && [ ! -e "$T/uploads" ] && [ -z "$(grep -rl TOK- "$D")" ]'
+# signed in as another account than the log says: never uploaded under the log's name
+printf '{"token":{"access_token":"TOK-AG3-A","refresh_token":"TOK-AG3-R","id_token":"h.%s.s"}}' "$(b64 '{"email":"other@example.com"}')" > "$AGH/antigravity-oauth-token"
+echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads"; fresh
+res=$(agrun do link 2>&1); rc=$?
+ok "agy: another signed-in account is skipped" '[ $rc = 1 ] && [ "$res" = "skipped ag@example.com: agy is signed in as other@example.com now" ] && [ ! -e "$T/uploads" ] && [ -z "$(grep -rl TOK- "$D")" ]'
+rm -f "$AGH/antigravity-oauth-token"; rm -rf "$AGH/log"
+out=$(agrun rows)
+wait_cache
+ok "agy: no logged email: not listed"  '! has_line "$out" "not linked"'
+# auto-link at launch: unlinked accounts are linked first, output on stderr; nothing to link: no management call at all
+mkdir -p "$AGH/log"; cp /dev/null "$AGH/log/cli-1.log"; printf 'applyAuthResult: email=ag@example.com, x\n' > "$AGH/log/cli-1.log"
+echo "{\"access_token\":\"TOK-AG4-A\",\"refresh_token\":\"TOK-AG4-R\",\"expiry\":\"2030-01-01T00:00:00Z\",\"id_token\":\"$AGID\"}" > "$AGH/antigravity-oauth-token"
+echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads"; fresh; rm -f "$T/claude.env"
+o=$(agrun launch all 2>"$T/launch.err"); rc=$?
+ok "launch: auto-links, then starts claude" '[ $rc = 0 ] && [ -f "$T/claude.env" ] && [ -f "$T/uploads/antigravity-ag@example.com.json" ] && [ "$(cat "$T/launch.err")" = "linked ag@example.com" ] && [ -z "$o" ] && ! grep -q TOK- "$T/launch.err" && leakfree "$(cat "$T/launch.err")" "$D" "$T/work" "$T/srv.log"'
+fresh; : > "$T/srv.log"; rm -f "$T/claude.env"
+agrun launch all >/dev/null 2>"$T/launch.err"; rc=$?
+ok "launch: all linked: quiet, no link call" '[ $rc = 0 ] && [ -f "$T/claude.env" ] && [ ! -s "$T/launch.err" ] && ! grep -q management "$T/srv.log"'
+echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads" "$D/cache"; rm -f "$T/claude.env"
+agrun launch all >/dev/null 2>"$T/launch.err"; rc=$?
+ok "launch: no cache yet: the live list, then links" '[ $rc = 0 ] && [ -f "$T/claude.env" ] && [ "$(cat "$T/launch.err")" = "linked ag@example.com" ]'
+# a Keychain prompt nobody answers: linking is stopped after the limit, claude still starts
+mkdir -p "$T/kchang"; printf '#!/bin/sh
+sleep 39
+' > "$T/kchang/security"; chmod +x "$T/kchang/security"
+echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads"; fresh; rm -f "$T/claude.env"
+t0=$(date +%s); CLIPROXY_LINK_SECS=1 CLA_ROOT=$L/none AI_PROVIDERS=$L/pagy RP=$T/kchang:$BASEPATH run launch all >/dev/null 2>"$T/launch.err"; rc=$?; t1=$(date +%s)
+i=0; while [ $i -lt 30 ] && ps -A -o command= | grep -q "^sleep 39$"; do sleep 0.2; i=$((i + 1)); done
+ok "launch: a stuck Keychain read is cut, claude starts" '[ $rc = 0 ] && [ -f "$T/claude.env" ] && [ $((t1 - t0)) -lt 6 ] && has_line "$(cat "$T/launch.err")" "linking took too long" && [ "$(ps -A -o command= | grep -c "^sleep 39$")" = 0 ] && [ ! -e "$T/uploads" ] && [ -z "$(ls "$D/cache" | grep "^link")" ]'
+# Ctrl-C / TERM of a launch while linking: the link child (its own process group) is stopped too, nothing uploaded or left
+echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads"; fresh; rm -f "$T/claude.env"
+(cd "$T/work" && CLIPROXY_LINK_SECS=30 CLA_ROOT=$L/none AI_PROVIDERS=$L/pagy PATH=$T/kchang:$BASEPATH exec "$P" launch all >/dev/null 2>"$T/launch.err") & lp=$!
+i=0; while [ $i -lt 50 ] && ! ps -A -o command= | grep -q "^sleep 39$"; do sleep 0.1; i=$((i + 1)); done
+kill -TERM $lp; i=0; while kill -0 $lp 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done; kill -0 $lp 2>/dev/null && kill -9 $lp; wait $lp 2>/dev/null
+i=0; while [ $i -lt 30 ] && ps -A -o command= | grep -q "^sleep 39$"; do sleep 0.2; i=$((i + 1)); done
+TOKS="TOK-AG4-A TOK-AG4-R $AGID"
+ok "launch: cancelled while linking stops the link, no claude, nothing left" '[ "$(ps -A -o command= | grep -c "^sleep 39$")" = 0 ] && [ ! -f "$T/claude.env" ] && [ ! -e "$T/uploads" ] && [ -z "$(ls "$D/cache" | grep "^link")" ] && leakfree "$(cat "$T/launch.err")" "$D" "$T/work" "$T/srv.log"'
+echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads"; fresh; rm -f "$T/claude.env"; echo upfail > "$T/mode"
+agrun launch all >/dev/null 2>"$T/launch.err"; rc=$?; : > "$T/mode"
+ok "launch: a failed link prints one line, launch goes on" '[ $rc = 0 ] && [ -f "$T/claude.env" ] && [ "$(grep -c . "$T/launch.err")" = 1 ] && [ "$(cat "$T/launch.err")" = "skipped ag@example.com: the proxy refused it (HTTP 500)" ] && leakfree "$(cat "$T/launch.err")" "$D" "$T/work"'
+fresh() { rm -rf "$D/cache"; run rows >/dev/null; wait_cache; out=$(run rows); }
+# logins go only over https or to this machine
+: > "$T/curl.argv"; nl=
+for u in "http://127.0.0.2:$(cat "$T/port")" "http://127.0.0.1:1@127.0.0.2:$(cat "$T/port")" "http://localhost.example:1" "ftp://127.0.0.1:1"; do
+  conf "url=$u" "key=$CK" "mgmt_key=$MK"; r=$(agrun do link 2>&1); [ "$r" = "$(printf "not linked: logins go only over https or to this machine (127.0.0.1, ::1, localhost); the proxy url is plain http to another host")" ] || nl="$nl $u"
+  r=$(agrun launch link </dev/null 2>&1); has_line "$r" "not linked: logins go only over https" || nl="$nl launch:$u"
+done
+ok "link: plain http to another host refused, nothing sent" '[ -z "$nl" ] && ! grep -q management "$T/curl.argv"'
+pl=; for u in https://127.0.0.1:1 "http://[::1]:1" http://localhost:1; do conf "url=$u" "key=$CK" "mgmt_key=$MK"; agrun do link 2>&1 | grep -q "not linked: logins" && pl="$pl $u"; done
+ok "link: https and loopback pass the url rule" '[ -z "$pl" ]'
+conf "url=$URL" "key=$CK" "mgmt_key=$MK"
+rm -rf "$HOME/.gemini" "$T/uploads" "$T/launch.err"
+
 rm -f "$T/creds.json"; rm -rf "$D/cache" "$T/uploads"
 
 # ── proxy text cannot inject control chars ──
@@ -625,6 +735,32 @@ t0=$(date +%s); o=$(sl "{\"model\":{\"id\":\"gpt-5\"}}"); t1=$(date +%s)
 ok "statusline: stale cache answers at once, from the cache" '[ "$o" = "proxy: codex ix@example.com" ] && [ $((t1 - t0)) -lt 2 ]'
 ok "statusline: stale cache refreshed in the background" 'wait_cache "$old" && [ -z "$(sl "{\"model\":{\"id\":\"gpt-5\"}}")" ]'
 rm -rf "$HOME/.claude" "$PJ" "$T/creds.json" "$T/sl.in"; rm -rf "$D/cache"
+
+# ── antigravity usage: fetchAvailableModels through the management api-call ──
+r3=$(rst 10900); r4=$(rst 3900)
+echo "{\"files\":[$(cred a1 antigravity "\"name\":\"antigravity-ga@example.com.json\",\"email\":\"ga@example.com\",\"project_id\":\"proj-1\",\"recent_requests\":$(rrs 0 0 3)"),$(cred a2 antigravity '"name":"antigravity-gb@example.com.json","email":"gb@example.com"')]}" > "$T/creds.json"
+echo "{\"a1\":{\"models\":{\"gemini-3-pro-high\":{\"displayName\":\"G\",\"quotaInfo\":{\"remainingFraction\":0.4,\"resetTime\":\"$r3\"}},\"gemini-3-flash\":{\"quotaInfo\":{\"remainingFraction\":1}},\"claude-sonnet-4-6\":{\"quotaInfo\":{\"resetTime\":\"$r4\"}},\"gemini-3.1-flash-image\":{\"quotaInfo\":{\"remainingFraction\":0}},\"chat_20706\":{}}},
+\"a2\":{\"models\":{\"gemini-3-pro-high\":{\"quotaInfo\":{\"remainingFraction\":0.8}},\"claude-sonnet-4-6\":{\"quotaInfo\":{\"remainingFraction\":1,\"resetTime\":\"$r4\"}}}}}" > "$T/quota.json"
+rm -f "$T/apicall.log"; fresh
+ag=$(printf '%s\n' "$out" | grep "^  ${TAB}antigravity ")
+ok "antigravity: gemini and claude bars, worst model per account, averaged" 'case $ag in "  ${TAB}antigravity · gemini ████░░░░░░  40% ↻3h · claude █████░░░░░  50% ↻1h · 2 accts · 2 req · 0 failed") true;; *) false;; esac'
+ok "antigravity: POST fetchAvailableModels with the project, Antigravity User-Agent" '[ "$(jq -sc ".[] | select(.auth_index == \"a1\") | [.method, .url, .data, .header.Authorization, (.header[\"User-Agent\"] | startswith(\"antigravity/hub/\"))]" "$T/apicall.log")" = "[\"POST\",\"https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels\",\"{\\\"project\\\":\\\"proj-1\\\"}\",\"Bearer \$TOKEN\$\",true]" ] && [ "$(jq -sr ".[] | select(.auth_index == \"a2\") | .data" "$T/apicall.log")" = "{}" ]'
+ok "antigravity: in the account list"  'has_line "$out" "  ${TAB}ga@example.com  ×1" && has_line "$out" "  ${TAB}gb@example.com  ×1" && ! has_line "$out" "⚠ all"'
+ok "statusline: a gemini model with no gemini login: the antigravity one" '[ "$(printf "%s" "{\"model\":{\"id\":\"gemini-3-pro\"}}" | run statusline)" = "proxy: antigravity ga@example.com" ]'
+ok "statusline: Claude and GPT models with no own login: the antigravity one" '[ "$(printf "%s" "{\"model\":{\"id\":\"claude-sonnet-4-6\"}}" | run statusline)" = "proxy: antigravity ga@example.com" ] && [ "$(printf "%s" "{\"model\":{\"id\":\"gpt-oss-120b\"}}" | run statusline)" = "proxy: antigravity ga@example.com" ]'
+echo "{\"a1\":{\"models\":{\"gemini-3-pro-high\":{\"quotaInfo\":{\"resetTime\":\"$r3\"}},\"claude-sonnet-4-6\":{\"quotaInfo\":{\"remainingFraction\":0,\"resetTime\":\"$r4\"}}}},
+\"a2\":{\"models\":{\"gemini-3-pro-high\":{\"quotaInfo\":{\"remainingFraction\":0,\"resetTime\":\"$r3\"}},\"claude-sonnet-4-6\":{\"quotaInfo\":{\"remainingFraction\":0.5}}}}}" > "$T/quota.json"
+fresh
+ok "antigravity: one model group left is not limited" '! has_line "$out" "⚠ all"'
+echo "{\"a1\":{\"models\":{\"gemini-3-pro-high\":{\"quotaInfo\":{\"resetTime\":\"$r3\"}},\"gemini-3-flash\":{\"quotaInfo\":{\"remainingFraction\":0.9}},\"claude-sonnet-4-6\":{\"quotaInfo\":{\"remainingFraction\":0,\"resetTime\":\"$r4\"}}}},
+\"a2\":{\"models\":{\"gemini-3-pro-high\":{\"quotaInfo\":{\"remainingFraction\":0,\"resetTime\":\"$r3\"}},\"gemini-3-flash\":{\"quotaInfo\":{\"remainingFraction\":0.5}}}}}" > "$T/quota.json"
+fresh
+ok "antigravity: Gemini Pro out but Flash left is not limited, bar shows the worst" '! has_line "$out" "⚠ all" && printf "%s\n" "$out" | grep "^  ${TAB}antigravity " | grep -q "gemini ██████████ 100%"'
+echo "{\"a1\":{\"models\":{\"gemini-3-pro-high\":{\"quotaInfo\":{\"resetTime\":\"$r3\"}},\"claude-sonnet-4-6\":{\"quotaInfo\":{\"remainingFraction\":0,\"resetTime\":\"$r4\"}}}},
+\"a2\":{\"models\":{\"gemini-3-pro-high\":{\"quotaInfo\":{\"remainingFraction\":0,\"resetTime\":\"$r3\"}}}}}" > "$T/quota.json"
+fresh
+ok "antigravity: every group out on every account: warning" 'has_line "$out" "  ${TAB}⚠ all Antigravity accounts limited · next reset ↻1h" && ! has_line "$out" "Claude limited"'
+rm -f "$T/creds.json" "$T/quota.json" "$T/apicall.log"; rm -rf "$D/cache"
 
 # ── key safety ──
 all=$(run rows; run actions; run launch nope 2>&1; run do apply; cat "$D"/cache/* "$T"/*.log 2>/dev/null)
