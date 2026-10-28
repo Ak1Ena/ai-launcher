@@ -364,7 +364,7 @@ else
     e=$(jq -r '.oauthAccount.emailAddress // empty' "$d/.claude.json" 2>/dev/null | clean)
     add_acct claude "$(printf '%s' "$a" | clean)" "${e:-?}"
   done
-  PF=${AI_PROVIDERS:-$HOME/.config/ai-launcher/providers}
+  PF=${AI_PROVIDERS:-${XDG_CONFIG_HOME:-$HOME/.config}/ai-launcher/providers}
   if [ -f "$PF" ]; then
     while IFS="$TAB" read -r a c _; do
       [ "$(printf '%s\n' "$c" | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {n = split($i, p, "/"); print p[n]; exit}}')" = codex ] || continue

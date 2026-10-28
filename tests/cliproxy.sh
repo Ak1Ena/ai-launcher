@@ -137,6 +137,7 @@ def creds():  # over.json: name -> fields set by the fields / status PATCH, merg
 def quota(ai):
     now = int(time.time())
     o = (jfile('quota.json') or {}).get(ai)
+    if isinstance(o, dict) and '__status' in o: return o['__status'], {"error": "rate limited"}
     if o is not None: return 200, o
     if ai == "c1": return 200, {"five_hour": {"utilization": 1.0, "resets_at": iso(3600 + 600)}, "seven_day": {"utilization": 50.0, "resets_at": iso(4 * 86400 + 600)}}
     if ai == "c2": return 200, {"five_hour": {"utilization": 49.0, "resets_at": iso(3 * 3600)}, "seven_day": {"utilization": 40, "resets_at": None}}
@@ -195,6 +196,10 @@ class H(BaseHTTPRequestHandler):
                 open(T + '/apicall.log', 'a').write(body + '\n')
                 req = json.loads(body or '{}'); code, obj = quota(req.get('auth_index'))
                 return self.send(200, {"status_code": code, "header": {}, "body": json.dumps(obj)})
+        if p == '/userinfo':  # Google's userinfo, reached through the fake curl: userinfo.json = {tok, code, body}
+            u = jfile('userinfo.json') or {}
+            if not self.auth(u.get('tok', '-')): return self.send(401, {"error": "invalid_token " + self.headers.get('Authorization', '')})
+            return self.send(u.get('code', 200), u.get('body', {}))
         return self.send(404, {"error": "not found"})
     def do_GET(self): self.handle_any('')
     def do_PUT(self): self.handle_any(self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode())
@@ -498,7 +503,15 @@ CXID="h.$(b64 '{"email":"cx@example.com"}').TOK-CX-IDSIG" CXAT="h.$(b64 '{"exp":
 echo "{\"tokens\":{\"id_token\":\"$CXID\",\"access_token\":\"$CXAT\",\"refresh_token\":\"TOK-CX-REFRESH\",\"account_id\":\"acct-1\"}}" > "$L/acc/codex/cw/auth.json"
 printf 'cw\tcodex --x\tCodex cw\nother\tgemini\tGemini\n' > "$L/providers"
 printf '#!/bin/sh\necho "$*" >> "%s/security.argv"\ns=; p=; for a; do [ "$p" = -s ] && s=$a; p=$a; done\n[ -f "%s/kc/$s" ] || exit 44\ncat "%s/kc/$s"\n' "$T" "$T" "$T" > "$T/kc/security"
-printf '#!/bin/sh\necho "$*" >> "%s/curl.argv"\nfor a; do case $a in file=@*) f=${a#file=@}; ls -l "${f%%%%;*}" | cut -c1-10 >> "%s/upload.mode" ;; esac; done\nexec "%s" "$@"\n' "$T" "$T" "$(command -v curl)" > "$T/argv/curl"; chmod +x "$T/kc/security" "$T/argv/curl"
+# fake curl: logs argv, upload modes; Google's userinfo goes to the fake proxy, any other https is refused (never the internet)
+cat > "$T/argv/curl" <<EOF
+#!/bin/sh
+echo "\$*" >> "$T/curl.argv"
+for a; do case \$a in file=@*) f=\${a#file=@}; ls -l "\${f%%;*}" | cut -c1-10 >> "$T/upload.mode" ;; esac; done
+for a; do shift; case \$a in https://www.googleapis.com/oauth2/v3/userinfo) a=$URL/userinfo ;; https://*) echo "test: no internet: \$a" >&2; exit 7 ;; esac; set -- "\$@" "\$a"; done
+exec "$(command -v curl)" "\$@"
+EOF
+chmod +x "$T/kc/security" "$T/argv/curl"
 lrun() { CLA_ROOT=$L/cla AI_PROVIDERS=$L/providers AI_ACCOUNTS=$L/acc RP=$T/argv:$T/kc:$BASEPATH run "$@"; }
 echo "{\"files\":[$(acc c1 claude k3@example.com)]}" > "$T/creds.json"; rm -rf "$T/uploads"
 conf "url=$URL" "key=$CK" "mgmt_key=$MK"; rm -rf "$D/cache"; lrun rows >/dev/null; wait_cache; out=$(lrun rows)
@@ -555,6 +568,51 @@ ok "link: failed upload: temp file was 600, nothing left" '[ $rc = 1 ] && has_li
 res=$(lrun do link); rc=$?
 ok "link: a same-name proxy file is never overwritten" 'has_line "$res" "skipped k1@example.com: a proxy file named claude-k1@example.com.json already exists" && [ ! -e "$T/uploads/claude-k1@example.com.json" ] && grep -q "Claude-K1@Example.com.json" "$T/creds.json" && [ "$(ls "$T/uploads" | grep -ic "^claude-k1")" = 0 ]'
 ok "link: one upload per email (any case)" '[ "$(ls "$T/uploads" | grep -ic "k2@example.com")" = 1 ] && [ "$(printf "%s\n" "$res" | grep -ic "k2@example.com")" = 1 ] && has_line "$res" "linked cx@example.com"'
+# ── providers that run claude: default login (~/.claude.json, plain Keychain service) or their CLAUDE_CONFIG_DIR ──
+mkdir -p "$L/cla2/k1" "$HOME/.claude-work"; echo '{"oauthAccount":{"emailAddress":"k1@example.com"}}' > "$L/cla2/k1/.claude.json"
+echo '{"oauthAccount":{"emailAddress":"dflt@example.com"}}' > "$HOME/.claude.json"
+echo '{"oauthAccount":{"emailAddress":"wk@example.com"}}' > "$HOME/.claude-work/.claude.json"
+echo '{"claudeAiOauth":{"accessToken":"TOK-DF-ACCESS","refreshToken":"TOK-DF-REFRESH","expiresAt":1893456000000}}' > "$T/kc/Claude Code-credentials"
+echo '{"claudeAiOauth":{"accessToken":"TOK-WK-ACCESS","refreshToken":"TOK-WK-REFRESH","expiresAt":1893456000000}}' > "$HOME/.claude-work/.credentials.json"
+printf 'claude\tclaude\tClaude\nother_ai\tclaude --x\tOther\nwk\tFOO=1 CLAUDE_CONFIG_DIR="$HOME/.claude-work" /usr/local/bin/claude\tWork\ndup\tCLAUDE_CONFIG_DIR=%s claude\tDup\n' "$L/cla2/k1" > "$L/pcl"
+printf 'q1\tCLAUDE_CONFIG_DIR="~/.claude-work" claude\tQ1\nq2\tCLAUDE_CONFIG_DIR='"'"'$HOME/.claude-work'"'"' claude\tQ2\nq3\tCLAUDE_CONFIG_DIR=$(echo\tQ3\nq4\tCLAUDE_CONFIG_DIR=$HOME/.claude-work$X claude\tQ4\n' >> "$L/pcl"
+crun() { CLA_ROOT=$L/cla2 AI_PROVIDERS=$L/pcl AI_ACCOUNTS=$L/acc RP=$T/argv:$T/kc:$BASEPATH run "$@"; }
+echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads" "$D/cache"; crun rows >/dev/null; wait_cache; out=$(crun rows)
+ok "claude providers: default login and CLAUDE_CONFIG_DIR, each login once" '[ "$(printf "%s\n" "$out" | grep "^  ${TAB}.*not linked$")" = "  ${TAB}k1@example.com  not linked
+  ${TAB}dflt@example.com  not linked
+  ${TAB}wk@example.com  not linked" ] && [ "$(crun actions | grep "^link\." | cut -f1 | tr "\n" " ")" = "link.claude-k1 link.claude-claude link.claude-wk " ]'
+for v in '~/.claude-work' '$HOME/.claude-work' '${HOME}/.claude-work' '"$HOME/.claude-work"' '"${HOME}/.claude-work"'; do
+  printf 'zz\tCLAUDE_CONFIG_DIR=%s claude\tZ\n' "$v" > "$L/pz"
+  CLA_ROOT=$L/none AI_PROVIDERS=$L/pz RP=$BASEPATH run actions | grep -q "^link.claude-zz${TAB}wk@example.com:" || printf '%s\n' "$v" >> "$T/cdir.bad"
+done
+printf 'zz\tCLAUDE_CONFIG_DIR=~ claude\tZ\n' > "$L/pz"; CLA_ROOT=$L/none AI_PROVIDERS=$L/pz RP=$BASEPATH run actions | grep -q "^link.claude-zz${TAB}dflt@example.com:" || echo '~' >> "$T/cdir.bad"
+ok "claude providers: unquoted ~ and \$HOME forms expand, double quotes expand \$HOME only" '[ ! -e "$T/cdir.bad" ]'
+mkdir -p "$L/xdg/ai-launcher"; printf 'wk\tCLAUDE_CONFIG_DIR=~/.claude-work claude\tW\n' > "$L/xdg/ai-launcher/providers"
+ok "providers file: \$XDG_CONFIG_HOME/ai-launcher/providers when AI_PROVIDERS is unset" 'XDG_CONFIG_HOME=$L/xdg CLA_ROOT=$L/none RP=$BASEPATH run actions | grep -q "^link.claude-wk${TAB}wk@example.com:"'
+: > "$T/security.argv"; : > "$T/curl.argv"; : > "$T/srv.log"
+res=$(crun do link.claude-claude 2>&1); rc=$?; res2=$(crun do link.claude-wk 2>&1); rc2=$?
+ok "claude providers: default login from the plain Keychain service" '[ $rc = 0 ] && [ "$res" = "linked dflt@example.com" ] && grep -qx -- "find-generic-password -a .* -w -s Claude Code-credentials" "$T/security.argv" && jq -e ".type == \"claude\" and .access_token == \"TOK-DF-ACCESS\" and .refresh_token == \"TOK-DF-REFRESH\" and .email == \"dflt@example.com\"" "$T/uploads/claude-dflt@example.com.json" >/dev/null'
+ok "claude providers: CLAUDE_CONFIG_DIR login (plaintext fallback)" '[ $rc2 = 0 ] && [ "$res2" = "linked wk@example.com" ] && jq -e ".access_token == \"TOK-WK-ACCESS\" and .email == \"wk@example.com\"" "$T/uploads/claude-wk@example.com.json" >/dev/null'
+TOKS="TOK-DF-ACCESS TOK-DF-REFRESH TOK-WK-ACCESS TOK-WK-REFRESH"
+res3=$(crun do link 2>&1)
+ok "claude providers: a CLAUDE_CONFIG_DIR that is not a plain absolute path: skipped, one line each" '[ "$(printf "%s\n" "$res3" | grep "^skipped claude-q")" = "skipped claude-q1: its CLAUDE_CONFIG_DIR is not a plain absolute path
+skipped claude-q2: its CLAUDE_CONFIG_DIR is not a plain absolute path
+skipped claude-q4: its CLAUDE_CONFIG_DIR is not a plain absolute path" ] && ! crun actions | grep -q "claude-q"'
+# 1: provider claude with no CLAUDE_CONFIG_DIR of its own uses the one it inherits
+mkdir -p "$HOME/.claude-env"; echo '{"oauthAccount":{"emailAddress":"env@example.com"}}' > "$HOME/.claude-env/.claude.json"
+out=$(CLAUDE_CONFIG_DIR=$HOME/.claude-env crun actions)
+ok "claude providers: an inherited CLAUDE_CONFIG_DIR is the provider's home" 'has_line "$out" "link.claude-claude${TAB}env@example.com: link to proxy" && ! has_line "$out" "link.claude-claude${TAB}dflt@example.com"'
+rm -rf "$HOME/.claude-env"
+ok "claude providers: no token in output, argv, log or leftover files" 'leakfree "$res$res2" "$T/curl.argv" "$T/security.argv" "$T/srv.log" "$D" "$T/work" && [ -z "$(grep -rl TOK- "$D" "$T/work")" ]'
+# 0.1.12 names cache (2 columns, no provider): counts as missing — no stale "not linked" rows, launch reads the live list first
+echo "{\"files\":[$(acc c1 claude k1@example.com),$(acc c2 claude dflt@example.com),$(acc c3 claude wk@example.com)]}" > "$T/creds.json"
+rm -rf "$D/cache"; crun rows >/dev/null; wait_cache
+printf 'claude-k1@example.com.json\tk1@example.com\nclaude-dflt@example.com.json\tdflt@example.com\n' > "$D/cache/names"; out=$(crun rows)
+ok "old names cache: no not-linked rows" '! has_line "$out" "not linked" && has_line "$out" "k1@example.com  ×1"'
+printf 'claude-k1@example.com.json\tk1@example.com\n' > "$D/cache/names"; rm -f "$T/claude.env"
+crun launch all >/dev/null 2>"$T/launch.err"; rc=$?
+ok "old names cache: launch refetches, all linked: quiet" '[ $rc = 0 ] && [ -f "$T/claude.env" ] && [ ! -s "$T/launch.err" ] && [ "$(awk -F "$TAB" "{ print NF }" "$D/cache/names" | sort -u)" = 3 ]'
+rm -rf "$L/cla2" "$HOME/.claude-work" "$HOME/.claude.json" "$T/kc/Claude Code-credentials" "$T/uploads"
 # ── agy (Antigravity) login: Keychain gemini/antigravity or its token file, email from agy's log; auto-link at launch ──
 AGH=$HOME/.gemini/antigravity-cli; mkdir -p "$AGH/log" "$L/none"
 printf 'I1022 17:41:34.8 266 server_oauth.go:224] applyAuthResult: email=old@example.com, authMethod=consumer, quotaProject=\n' > "$AGH/log/cli-20261022_174134.log"
@@ -593,11 +651,29 @@ rm -f "$T/kc/gemini"; echo "{\"access_token\":\"TOK-AG2-ACCESS\",\"refresh_token
 echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads"; fresh
 res=$(agrun do link.antigravity-agw 2>&1); rc=$?
 ok "agy: plain JSON token file linked" '[ $rc = 0 ] && [ "$res" = "linked ag@example.com" ] && jq -e ".access_token == \"TOK-AG2-ACCESS\" and .refresh_token == \"TOK-AG2-REFRESH\" and .email == \"ag@example.com\" and .expired == \"2030-01-01T00:00:00Z\"" "$T/uploads/antigravity-ag@example.com.json" >/dev/null && [ -z "$(grep -rl TOK- "$D")" ]'
-# no id_token: the log email is never trusted for the file name
-echo '{"access_token":"TOK-AG5-A","refresh_token":"TOK-AG5-R"}' > "$AGH/antigravity-oauth-token"
-echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads"; fresh
+# no id_token (agy's real Keychain login): the log email is never trusted; Google's userinfo names the account, during link only
+echo '{"access_token":"TOK-AG5-A","refresh_token":"TOK-AG5-R","expiry":"2030-01-01T00:00:00.5+07:00"}' > "$AGH/antigravity-oauth-token"
+echo '{"tok":"TOK-AG5-A","body":{"sub":"1","email":"Ag@Example.com","email_verified":true}}' > "$T/userinfo.json"
+echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads"; fresh; : > "$T/curl.argv"; : > "$T/srv.log"
+agrun rows >/dev/null; agrun actions >/dev/null; agrun menu >/dev/null
+ok "agy userinfo: never called by rows, actions or menu" '! grep -q userinfo "$T/srv.log" "$T/curl.argv"'
 res=$(agrun do link 2>&1); rc=$?
-ok "agy: login without an id_token email is skipped" '[ $rc = 1 ] && [ "$res" = "skipped ag@example.com: agy'"'"'s saved login names no account — sign the proxy in with: cliproxyapi -antigravity-login" ] && [ ! -e "$T/uploads" ] && [ -z "$(grep -rl TOK- "$D")" ]'
+ok "agy userinfo: no id_token: Google's verified email links it" '[ $rc = 0 ] && [ "$res" = "linked ag@example.com" ] && jq -e ".email == \"Ag@Example.com\" and .access_token == \"TOK-AG5-A\" and .refresh_token == \"TOK-AG5-R\"" "$T/uploads/antigravity-ag@example.com.json" >/dev/null && grep -qx "GET /userinfo" "$T/srv.log"'
+TOKS="TOK-AG5-A TOK-AG5-R"
+ok "agy userinfo: token only on curl's stdin, never argv, output or files" 'grep -q "userinfo" "$T/curl.argv" && grep -q -- "-K -" "$T/curl.argv" && leakfree "$res" "$T/curl.argv" "$T/security.argv" "$T/srv.log" "$D" "$T/work" && [ -z "$(grep -rl TOK- "$D" "$T/work")" ]'
+uskip() {  # uskip <name> <expected line> [userinfo.json]: skipped, nothing uploaded, no token anywhere
+  [ -z "${3:-}" ] || printf '%s\n' "$3" > "$T/userinfo.json"
+  echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads"; fresh; res=$(agrun do link 2>&1); rc=$?; want=$2
+  ok "agy userinfo: $1" '[ $rc = 1 ] && [ "$res" = "$want" ] && [ ! -e "$T/uploads" ] && leakfree "$res" "$T/curl.argv" "$T/srv.log" "$D" "$T/work" && [ -z "$(grep -rl TOK- "$D")" ]'
+}
+uskip "another verified account is skipped" "skipped ag@example.com: agy is signed in as other@example.com now" '{"tok":"TOK-AG5-A","body":{"email":"other@example.com","email_verified":true}}'
+uskip "unverified email is skipped" "skipped ag@example.com: Google did not name agy's account (no verified email) — sign the proxy in with: cliproxyapi -antigravity-login" '{"tok":"TOK-AG5-A","body":{"email":"ag@example.com","email_verified":false}}'
+uskip "an error shows the status only" "skipped ag@example.com: Google did not name agy's account (HTTP 500) — sign the proxy in with: cliproxyapi -antigravity-login" '{"tok":"TOK-AG5-A","code":500,"body":{"error":"boom TOK-AG5-A"}}'
+uskip "a rejected token: expired line, body never shown" "skipped ag@example.com: agy's saved login has expired — open agy once, or sign the proxy in with: cliproxyapi -antigravity-login" '{"tok":"other"}'
+echo '{"access_token":"TOK-AG5-A","refresh_token":"TOK-AG5-R","expiry":"2020-01-01T00:00:00Z"}' > "$AGH/antigravity-oauth-token"; : > "$T/srv.log"
+uskip "expired by its expiry: no call" "skipped ag@example.com: agy's saved login has expired — open agy once, or sign the proxy in with: cliproxyapi -antigravity-login" '{"tok":"TOK-AG5-A","body":{"email":"ag@example.com"}}'
+ok "agy userinfo: expired login sends nothing to Google" '! grep -q userinfo "$T/srv.log"'
+rm -f "$T/userinfo.json"
 # signed in as another account than the log says: never uploaded under the log's name
 printf '{"token":{"access_token":"TOK-AG3-A","refresh_token":"TOK-AG3-R","id_token":"h.%s.s"}}' "$(b64 '{"email":"other@example.com"}')" > "$AGH/antigravity-oauth-token"
 echo '{"files":[]}' > "$T/creds.json"; rm -rf "$T/uploads"; fresh
@@ -688,6 +764,70 @@ echo "{\"files\":[$(cred c1 claude '"cooldowns":[{"scope":"auth","reason":"quota
 fresh
 ok "cooldown/unavailable alone counts"    'has_line "$out" "⚠ all Claude accounts limited · next reset ↻1h" && has_line "$out" "proxy up · Claude limited"'
 rm -f "$T/creds.json" "$T/quota.json"; rm -rf "$D/cache"
+
+# ── usage: last good body kept per login, one Anthropic call per claude login per 5 min, the launcher's usage.json ──
+UQ='{"five_hour":{"utilization":42,"resets_at":null},"seven_day":{"utilization":7,"resets_at":null}}'
+XQ='{"rate_limit":{"primary_window":{"used_percent":33,"limit_window_seconds":18000}}}'
+mkdir -p "$T/ucla/u1/usage"; echo '{"oauthAccount":{"emailAddress":"UA@example.com"}}' > "$T/ucla/u1/.claude.json"
+urun() { CLA_ROOT=$T/ucla run "$@"; }
+uref() { rm -f "$D/cache/usage"; urun rows >/dev/null; wait_cache; out=$(urun rows); }
+qset() { jq -c "$1" "$D/cache/quota" > "$T/q.tmp" && mv "$T/q.tmp" "$D/cache/quota"; }
+calls() { jq -sr --arg a "$1" '[.[] | select(.auth_index == $a)] | length' "$T/apicall.log"; }
+cbar() { printf '%s\n' "$out" | grep "^  ${TAB}$1 "; }
+echo "{\"files\":[$(acc c1 claude ua@example.com),$(acc x1 codex xa@example.com)]}" > "$T/creds.json"
+echo "{\"c1\":$UQ,\"x1\":$XQ}" > "$T/quota.json"; rm -f "$T/apicall.log"; rm -rf "$D/cache"; uref
+ok "usage cache: first bodies shown, saved in cache/quota" 'cbar claude | grep -q " 42%" && cbar codex | grep -q " 33%" && [ "$(jq -sc "map(.ai) | sort" "$D/cache/quota")" = "[\"c1\",\"x1\"]" ]'
+echo '{"c1":{"__status":429},"x1":{"__status":429}}' > "$T/quota.json"; uref
+ok "usage cache: second refresh within 5 min: no claude call, codex called" '[ "$(calls c1)" = 1 ] && [ "$(calls x1)" = 2 ]'
+ok "usage cache: a failed codex call keeps its last good bar" 'cbar codex | grep -q " 33%" && cbar claude | grep -q " 42%"'
+qset '.c = 0'; uref
+ok "usage cache: claude 429 after 5 min: last good bar kept" '[ "$(calls c1)" = 2 ] && cbar claude | grep -q " 42%"'
+# the launcher's usage.json (statusline-usage.sh) for the same email: newest of it and the saved body wins
+qset '.t = (now - 200 | floor)'
+echo "{\"saved_at\":$(( $(date +%s) - 10 )),\"rate_limits\":{\"five_hour\":{\"used_percentage\":77,\"resets_at\":$(( $(date +%s) + 3600 ))}}}" > "$T/ucla/u1/usage/usage.json"; uref
+ok "usage.json newer than the saved body wins" 'cbar claude | grep -q " 77%" && [ "$(calls c1)" = 2 ]'
+mv "$T/ucla/u1/usage/usage.json" "$T/u.json"; uref
+ok "usage.json is never saved as the answer: gone, the api answer shows" 'cbar claude | grep -q " 42%" && ! jq -e "select(.ai == \"c1\") | .q.five_hour.utilization == 77" "$D/cache/quota" >/dev/null'
+mv "$T/u.json" "$T/ucla/u1/usage/usage.json"
+echo "{\"saved_at\":$(( $(date +%s) - 1000 )),\"rate_limits\":{\"five_hour\":{\"used_percentage\":66,\"resets_at\":$(( $(date +%s) + 3600 ))}}}" > "$T/ucla/u1/usage/usage.json"
+qset 'if .ai == "c1" then .q = '"$UQ"' | .t = (now - 200 | floor) else . end'; uref
+ok "usage.json older than the saved body loses" 'cbar claude | grep -q " 42%"'
+echo "{\"saved_at\":$(( $(date +%s) - 10 )),\"rate_limits\":{\"five_hour\":{\"used_percentage\":88,\"resets_at\":$(( $(date +%s) - 60 ))},\"seven_day\":{\"used_percentage\":88,\"resets_at\":$(( $(date +%s) - 60 ))}}}" > "$T/ucla/u1/usage/usage.json"
+qset 'if .ai == "c1" then .q = '"$UQ"' | .t = (now - 200 | floor) else . end'; uref
+ok "usage.json with every reset past is ignored" 'cbar claude | grep -q " 42%"'
+# 9: a window with no reset keeps its percent
+qset 'if .ai == "c1" then .t = (now - 200 | floor) else . end'
+echo "{\"saved_at\":$(( $(date +%s) - 10 )),\"rate_limits\":{\"five_hour\":{\"used_percentage\":55,\"resets_at\":null}}}" > "$T/ucla/u1/usage/usage.json"; uref
+ok "usage.json: a window with no reset keeps its percent" 'cbar claude | grep -q " 55%"'
+# 5: the email in two launcher folders: neither usage.json is used
+mkdir -p "$T/ucla/u2/usage"; cp "$T/ucla/u1/.claude.json" "$T/ucla/u2/"; cp "$T/ucla/u1/usage/usage.json" "$T/ucla/u2/usage/"; uref
+ok "usage.json: an email in two launcher folders: not used" 'cbar claude | grep -q " 42%"'
+rm -rf "$T/ucla/u2" "$T/ucla/u1/usage/usage.json"
+# 10: a call time ahead of now does not throttle
+n=$(calls c1); qset 'if .ai == "c1" then .c = (now + 1000 | floor) else . end'; uref
+ok "usage cache: a call time ahead of now does not throttle" '[ "$(calls c1)" = $((n + 1)) ]'
+# 4: same auth index, another login file: no saved answer, no throttle
+n=$(calls c1); echo "{\"files\":[$(acc c1 claude ub@example.com),$(acc x1 codex xa@example.com)]}" > "$T/creds.json"; uref
+ok "usage cache: a replaced login gets no old answer and is called" '[ "$(calls c1)" = $((n + 1)) ] && ! cbar claude | grep -q "%"'
+echo "{\"files\":[$(acc x1 codex xa@example.com)]}" > "$T/creds.json"; uref
+ok "usage cache: a removed account loses its saved body" '[ "$(jq -sc "map(.ai)" "$D/cache/quota")" = "[\"x1\"]" ]'
+# 3: only the fields the bars read are kept
+echo "{\"files\":[$(acc c1 claude ua@example.com),$(acc x1 codex xa@example.com),$(acc a1 antigravity ga@example.com)]}" > "$T/creds.json"
+echo '{"c1":{"five_hour":{"utilization":10,"resets_at":null,"secretX":1},"secretX":2},"x1":{"secretX":3,"rate_limit":{"secretX":4,"primary_window":{"used_percent":20,"limit_window_seconds":18000,"secretX":5}}},"a1":{"secretX":6,"models":{"gemini-3-pro":{"secretX":7,"quotaInfo":{"remainingFraction":0.5,"secretX":8}}}}}' > "$T/quota.json"
+rm -rf "$D/cache"; uref
+ok "usage cache: only the fields the bars read are kept" '[ -s "$D/cache/quota" ] && ! grep -q secretX "$D/cache/quota" && cbar claude | grep -q " 10%" && cbar codex | grep -q " 20%" && cbar antigravity | grep -q " 50%"'
+# 7: the refresh lock belongs to a pid: kept while it lives, reaped when it is gone; a holder never removes a lock it lost
+ago() { "$PY" -c 'import os,sys,time; t=time.time()-int(sys.argv[2]); os.utime(sys.argv[1],(t,t))' "$1" "$2"; }
+rm -f "$D/cache/usage"; mkdir "$D/cache/lock"; sleep 600 & sp=$!; echo $sp > "$D/cache/lock/pid"; ago "$D/cache/lock" 600
+urun rows >/dev/null; sleep 1
+ok "refresh lock: a live holder's lock is kept after 5 min" '[ -d "$D/cache/lock" ] && [ ! -f "$D/cache/usage" ]'
+kill $sp; wait $sp 2>/dev/null
+urun rows >/dev/null; wait_cache
+ok "refresh lock: a dead holder's lock is reaped" '[ -f "$D/cache/usage" ]'
+echo slow > "$T/mode"; rm -f "$D/cache/usage"; urun rows >/dev/null; echo other > "$D/cache/lock/own"
+i=0; while [ ! -f "$D/cache/usage" ] && [ $i -lt 60 ]; do sleep 0.2; i=$((i + 1)); done; sleep 0.5; : > "$T/mode"
+ok "refresh lock: a holder that lost its lock leaves the new one" '[ -f "$D/cache/usage" ] && [ -d "$D/cache/lock" ]'
+rm -rf "$T/ucla" "$D/cache"; rm -f "$T/creds.json" "$T/quota.json" "$T/apicall.log"
 
 # ── account in use (recent_requests) and the status line ──
 hmr() { "$PY" -c 'import datetime,sys; print((datetime.datetime.now()+datetime.timedelta(minutes=int(sys.argv[1]))).strftime("%H:%M"))' "$1"; }
