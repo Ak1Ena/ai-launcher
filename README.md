@@ -530,7 +530,16 @@ This runs every feature against a throwaway home folder and never touches your r
 
 ## Releases
 
-CI runs on branches and PRs. Every merge to main builds all platforms and creates or updates a draft release `v<version>`, where the version is in `tui/Cargo.toml`. Publishing the draft triggers the npm publish (needs the `NPM_TOKEN` secret). Bump the version in `tui/Cargo.toml` before the next release.
+CI runs on branches and PRs. main is protected: every change goes in through a PR. Merging a PR releases by its branch prefix:
+
+| Branch | Release |
+| --- | --- |
+| `major/…`, `breaking/…` | `v1.2.3` → `v2.0.0` |
+| `feature/…` | `v1.2.3` → `v1.3.0` |
+| `enhance/…`, `fix/…` | `v1.2.3` → `v1.2.4` |
+| anything else (`chore/`, `docs/`, `ci/`, …) | no release |
+
+The version counts up from the last published release tag. The release job builds all platforms, publishes the GitHub release (not a draft) and publishes to npm (needs the `NPM_TOKEN` secret). The version is written into the binary at build time, so `tui/Cargo.toml` is not bumped by hand. To release without a merge, run the `release` workflow by hand with a branch name such as `fix/manual`.
 
 ## License
 

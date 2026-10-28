@@ -22,7 +22,8 @@ A bash command-line tool. `bin/ai` shows a picker of coding-agent CLIs with plan
 | `lib/plugins.sh` | User plugins: `ai plugin ls\|add\|new\|update\|setup\|rm\|on\|off\|do`, plugin picker rows and launch. |
 | `plugins-extra/` | Bundled plugins that `ai plugin add <name>` installs (`cliproxy/`). |
 | `tui/` | Rust TUI (`ai-launcher`): `✻ home` tab listing accounts, each CLI in its own full-width tab, failover in place. |
-| `.github/workflows/` | `ci.yml` (branches/PRs), `release.yml` (build all platforms, draft release), `npm-publish.yml` (on publish). |
+| `.github/workflows/` | `ci.yml` (branches/PRs), `release.yml` (on merge to main: version from the PR's branch prefix, build all platforms, publish release + npm), `npm-publish.yml` (called by release). |
+| `scripts/next-version.sh` | Release version from a branch prefix and the last tag (`major/` `breaking/`, `feature/`, `enhance/` `fix/`; others none). |
 | `npm/` | npm package files: `ai-launcher`, one package with every platform's binary in `bin/<platform>-<arch>/`. |
 | `scripts/npm-pack.sh` | Builds the npm packages from release binaries. |
 | `tui/src/plugins.rs` | TUI side of plugins: same folder, protocol and `add` rules in Rust (bundled plugin embedded with `include_str!`). |

@@ -478,6 +478,14 @@ ok "plugin ls: installed bundled leaves available" 'AIcp plugin add cliproxy >/d
 AI_PLUGIN_DIR=$PL/demo "$PL/demo/setup" >/dev/null 2>&1; cp "$PL/demo/config" "$T/demo.cfg"
 ok "template setup is safe to run twice" 'AI_PLUGIN_DIR=$PL/demo "$PL/demo/setup" >/dev/null 2>&1 && cmp -s "$PL/demo/config" "$T/demo.cfg"'
 
+# ── release version from the merged branch's prefix ──
+nv() { bash "$REPO/scripts/next-version.sh" "$@" 2>/dev/null; }
+ok "release: fix/ and enhance/ bump patch" '[ "$(nv fix/x v0.1.14)" = 0.1.15 ] && [ "$(nv enhance/x 0.1.14)" = 0.1.15 ]'
+ok "release: feature/ bumps minor"         '[ "$(nv feature/x v0.1.14)" = 0.2.0 ]'
+ok "release: major/ and breaking/ bump major" '[ "$(nv major/x v0.1.14)" = 1.0.0 ] && [ "$(nv breaking/x v1.2.3)" = 2.0.0 ]'
+ok "release: other branches do not release" '[ -z "$(nv chore/x v0.1.14)" ] && [ -z "$(nv docs/x v0.1.14)" ] && [ -z "$(nv fixes v0.1.14)" ]'
+ok "release: bad last version fails"       '! nv fix/x v1.2 >/dev/null && ! nv fix/x 1.2.3-rc1 >/dev/null && ! nv fix/x "" >/dev/null'
+
 # the bundled cliproxy plugin has its own suite (fake proxy, fake HOME)
 ok "cliproxy plugin suite" 'cpo=$(bash "$REPO/tests/cliproxy.sh" 2>&1) || { echo "$cpo" | grep -A3 "^FAIL" >&2; false; }'
 
