@@ -360,56 +360,129 @@ row<TAB><key><TAB><label><TAB>1|0<TAB><n|-><TAB><note><TAB><on-id><TAB><off-id><
 
 ### cliproxy
 
-The bundled `cliproxy` plugin starts Claude Code through [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), a local proxy that holds several logins (Claude, Codex, Gemini...) and spreads requests across them. You get one row, "Claude Code · all accounts", that works like one more account for all of them together. The failover section stays as it is. It starts `claude` with `--settings <plugin>/cache/claude-settings.json` (mode 600), which holds the proxy URL and client key, because an `env` block in `~/.claude/settings.json` (another `ANTHROPIC_BASE_URL`, such as a local compression proxy) would otherwise win over the environment and send the key to the wrong server ("401 Invalid bearer token", then a login prompt). The proxy picks the account by model: Claude models go to Claude accounts, and GPT models (`gpt-…`, listed in Claude Code's `/model` because the plugin turns on gateway model discovery) go to Codex accounts. Codex accounts do not take over Claude-model requests by themselves; pick a GPT model with `/model` to use them. When the proxy lists no Claude model at all (only other providers' accounts are on), launch starts Claude Code on the newest model the proxy has (`ANTHROPIC_MODEL`) and points its opus, sonnet, haiku and fable names at it too, so the default model, sub-agents and background calls work; `/model` then lists only models the proxy can serve.
+The bundled `cliproxy` plugin runs Claude Code through [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), a local proxy that holds several logins (Claude, Codex, Antigravity) and spreads requests across them. It adds one picker row, "Claude Code · all accounts", that acts like one more account made of all your logins. The failover section stays as it is.
 
-`ai plugin add cliproxy` runs its setup after you review it (again later with `ai plugin setup cliproxy`, the way to add accounts):
+#### Set up
 
-1. **Install.** Uses `cliproxyapi` on `PATH`, brew's, the plugin's own `bin/` copy, or a proxy already answering at `url`. Otherwise it offers `brew install cliproxyapi`, or without brew downloads the latest release for your OS into `plugins/cliproxy/bin/` after checking it against the release's `checksums.txt` (and fills `start_cmd` / `stop_cmd`). Choosing "myself" prints the command and stops. Setup never installs Homebrew.
-2. **Keys.** Makes a client key and a management key once and keeps them in `config` (mode 600). It edits the proxy's `config.yaml` (brew: `$(brew --prefix)/etc/cliproxyapi.conf`, else `plugins/cliproxy/run/config.yaml`) only to fill an empty `secret-key` and to add a client key when there is none; before the first edit of a run it backs the file up to `config.yaml.ai-launcher.bak` (`.ai-launcher.bak.<epoch>` when that exists, so an older backup is never replaced), and each edit replaces the file atomically with its permissions kept. The same edit rewrites an `auth-dir: "~/…"` value to the absolute `$HOME/…` (a launchd or other service has no `~`, and Codex uploads fail with "mkdir /~: read-only file system"). A proxy that already has a management key uses `CLIPROXY_MGMT_KEY` or the copy setup kept in `<proxy config>.ai-launcher.key` (see Remove) when the proxy accepts it; otherwise it asks you to paste it, or, when setup can write its config, to **reset** it: the proxy stores that key only as a hash, so after `ai plugin rm cliproxy` and `add` nobody has it any more. Reset backs the config up first (to `.ai-launcher.bak`, or `.ai-launcher.bak.<epoch>` when that exists), writes a new random `secret-key` (the running proxy reloads and hashes it), waits up to 10 s until the proxy accepts it, and saves it. With no `key=` saved, setup offers a client key already in the config's `api-keys` once the proxy accepts it, instead of making a new one. Existing client keys stay, and the new one is appended through the management API. A proxy that is already running with a config setup does not know asks for that config's path or for its two keys. Every key you give is checked against the proxy before it is saved (3 tries), and setup says ready only when the client key works. A proxy config that setup itself just created or installed (the stock brew config, or `run/config.yaml`) loses its sample `your-api-key-*` keys and listens on 127.0.0.1 only; a config that was already there is never touched except for the key edits above, and is backed up first. If setup fails after starting the proxy, it stops it again.
-3. **Accounts.** A checklist of your `cla` accounts and Codex providers. For each ticked one you choose **link existing login (no browser)**, the default, or **sign in again (browser)** (`-claude-login`, `-codex-device-login`). Link copies the login the account already has into the proxy (see "Link" below); when it finds none, setup signs in instead. Accounts the proxy already has are kept.
-4. **Start.** Starts the proxy if it is down, then sets weighted round-robin and session affinity.
-5. **Agents.** Saves one Claude Code sub-agent per model the proxy lists (see "Sub-agents" below) to `cache/agents.json`. It never fails setup; with no models or no `jq` it says `none`.
+```bash
+ai plugin add cliproxy      # review the setup script, then it runs
+ai plugin setup cliproxy    # run setup again later, e.g. to add accounts
+```
 
-It needs `curl`, and `jq` for accounts and the usage lines. To set it up by hand instead, export `CLIPROXY_API_KEY` (a client key from the proxy's config) and `CLIPROXY_MGMT_KEY` (its management key).
+Setup needs `curl`, and `jq` for accounts and usage lines. It asks you five things, in order:
 
-The first `rows` call creates `plugins/cliproxy/config` (mode 600). It is read as `key=value` lines, never run as a script:
+1. **Install.** It uses a `cliproxyapi` it finds (on `PATH`, brew's, the plugin's `bin/` copy, or a proxy already answering at `url`). Otherwise it offers `brew install cliproxyapi`. Without brew it downloads the latest release into `plugins/cliproxy/bin/` and checks it against the release's `checksums.txt`. "myself" prints the command and stops. It never installs Homebrew.
+2. **Keys.** It makes a client key and a management key once and keeps them in `config` (mode 600). If the proxy already has a management key, setup reuses it when it can (see Details). Otherwise it asks you to paste it, or offers to reset it. Every key is checked against the proxy before it is saved.
+3. **Accounts.** A checklist of your `cla` accounts and Codex providers. For each one you choose **link existing login (no browser)**, the default, or **sign in again (browser)**. Link copies the login the account already has into the proxy. When it finds none, setup signs in instead.
+4. **Start.** It starts the proxy if it is down, then sets weighted round-robin and session affinity.
+5. **Agents.** It saves one Claude Code sub-agent per model the proxy lists. This never fails setup.
 
-| Key | Default | What it does |
+To set up by hand, export `CLIPROXY_API_KEY` (a client key from the proxy's config) and `CLIPROXY_MGMT_KEY` (its management key).
+
+#### Using it
+
+Choose the row to start `claude` through the proxy. The proxy picks the account by model: Claude models go to Claude accounts, and GPT models go to Codex accounts. Pick a GPT model with `/model` to use Codex. Switching provider in the middle of a chat re-sends the whole context, so pick the model at the start. If the proxy lists no Claude model, Claude Code starts on the newest model the proxy has, so the default model and sub-agents still work.
+
+If the proxy is down, launch prints the start hint and does not start it. Nothing in `~/.claude/settings.json` changes, and the key is never printed.
+
+The row shows `proxy up`, `proxy not running`, or `no key`. With a management key it adds these lines:
+
+| Line | Meaning |
+| --- | --- |
+| 5h and weekly bars | Average used % across a provider's accounts, with the soonest reset (Claude, Codex) |
+| `gemini` and `claude` bars | Antigravity quota: per account, the model of that group with the least left |
+| `<email>  ×N` | An account and its weight. `off` means unused, or weight 0 |
+| `in use: claude <email> · codex <email>` | Per provider, the account that served a request in the last 20 minutes |
+| `<email>  not linked` | A launcher account the proxy does not have yet (see Linking) |
+| request and failed counts, model names | What the proxy has served |
+| `⚠ …` | Something to fix: session affinity off, proxy uses another strategy, all accounts limited |
+
+Open the actions with `a` on the row in the TUI, or run them from the shell:
+
+| Action | Command | What it does |
 | --- | --- | --- |
-| `url` | `http://127.0.0.1:8317` | Where the proxy listens |
-| `key_env` / `key` | `CLIPROXY_API_KEY` | Env var holding the client key, or the key itself (`key` wins) |
-| `mgmt_key_env` / `mgmt_key` | `CLIPROXY_MGMT_KEY` | Same, for the management key |
-| `start_cmd` / `stop_cmd` | none | Commands for the start / stop actions when brew has no `cliproxyapi` (run with `bash -c` in the plugin folder) |
-| `proxy_config` | set by setup | The proxy's `config.yaml` that setup edits (a relative path is inside the plugin folder) |
+| Start / stop | `ai plugin do cliproxy start` / `stop` | Runs `brew services` or your `start_cmd` / `stop_cmd` |
+| Keep each chat on one account | `ai plugin do cliproxy affinity` | Turns on session affinity, so each chat keeps its prompt cache |
+| Apply | `ai plugin do cliproxy apply` | Sets weighted round-robin and priority 0 on every account |
+| Link all | `ai plugin do cliproxy link` | Links every launcher account the proxy lacks |
+| Use / don't use | `ai plugin do cliproxy on.<idx>` / `off.<idx>` | Turns one account on or off. It keeps its weight |
+| Weight | `ai plugin do cliproxy wup.<idx>` / `wdown.<idx>` | Weight 0 to 99, default 1. 0 means never picked |
 
-Each line is `key=value`. A ` #` (space then `#`) or tab then `#` starts a comment, and a line starting with `#` is skipped. Quotes are not removed: `key="abc"` gives the key `"abc"` with the quotes.
+`<idx>` is the account's auth index; the TUI `a` window runs these for you. Weights only pick the account for a new chat. Account actions need the management key. The TUI `a` window has two tabs: **Actions**, and **Accounts**, a checklist where tick means use (or link, for a not-linked one), untick means don't use, and `+` / `-` change the weight.
 
-The row says `proxy up`, `proxy not running` with the start hint, or `no key`. With a management key it adds lines per provider: merged 5h and weekly bars (the average used % across that provider's accounts, with the soonest reset) for Claude and Codex, for Antigravity a `gemini` and a `claude` bar (per account the model of that group with the least quota left; Antigravity counts as limited only when every model of every group is out, from `fetchAvailableModels` through the proxy's `api-call`; its Claude/GPT models count as `claude`), the number of accounts, request and failed counts, and the model names the proxy serves. It does not show tokens per model. The numbers are cached for 60 seconds and refresh in the background, so the row stays quick. Without a management key it shows a hint instead.
+The plugin always runs the proxy on `weighted-round-robin`. When the proxy uses another strategy or an account has a priority, the section shows `⚠ proxy uses …`. Choose Apply to fix it. When every Claude account is limited, the section shows `⚠ all Claude accounts limited · next reset ↻…` (same for Codex). The proxy has no fallback model, so Claude Code gets HTTP 429 `model_cooldown`. Pick another model with `/model`, or wait for the reset.
 
-Actions `start` and `stop` run `brew services` or your `start_cmd` / `stop_cmd` (`a` in the TUI, `ai plugin do cliproxy start`). Choosing the row runs `claude` with `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and gateway model discovery set for that session only, using your main `~/.claude`; nothing in `settings.json` changes and the key is never printed (both keys are also removed from claude's environment). If the proxy is down it prints the hint and does not start it. With a management key it first links launcher accounts the proxy lacks (see "Link"; nothing is asked of the proxy when the cache says every one is linked, and the live list is read when there is no cache yet), printing one line per account; a failure never stops the launch, and linking that takes over 60 s (a Keychain prompt left open) is stopped and claude starts anyway. Pick GPT, Gemini or Claude models inside Claude Code with `/model`.
+#### Linking accounts
 
-**Keep the prompt cache.** Every account and every provider has its own prompt cache. If the proxy's load balancer moves a chat to another account, the whole context is read again at full price. Turn on CLIProxyAPI's session affinity so each chat stays on one account: the section shows `⚠ session affinity off` when it is off, and the action **Keep each chat on one account** (`a` in the TUI, `ai plugin do cliproxy affinity`) sets `routing.session-affinity` and `session-affinity-subagents` to true (TTL `1h` if none is set) through the management API. It changes the proxy only when you choose it. Switching `/model` to another provider in the middle of a chat always re-sends the whole context, because caches are not shared between providers, so pick the model at the start of a chat.
+With a management key, the plugin links launcher accounts to the proxy before it starts `claude`. It prints one line per account, `linked <email>` or `skipped <email>: <reason>`. A failure never stops the launch. If linking takes over 60 s (a Keychain prompt left open) it stops and `claude` starts anyway. It skips the step when the cache says every account is linked.
 
-**Weighted round-robin.** The plugin always runs the proxy on `weighted-round-robin`: chats are spread across accounts by weight, and session affinity keeps each chat on one account. Every account's priority stays 0, because the proxy weights only the accounts in the top priority tier. (The home tab's own failover is separate.) When the proxy uses another strategy, or an account has a priority, the section shows `⚠ proxy uses …` and an **Apply** action (`ai plugin do cliproxy apply`): one `PATCH /v8/management/config` that sets `weighted-round-robin` and session affinity (an older proxy without v8 gets only the strategy, through `PUT /v0/management/routing/strategy`), then priority 0 on every account. Old `mode=` and `order=` lines in the config are ignored. The proxy changes only on Apply, the account actions below, and **Keep each chat on one account**. The check needs a management key and a proxy with the v8 management API.
+It links these accounts, once per email:
 
-**Accounts.** With a management key the section lists each Claude, Codex and Antigravity account in the proxy, by file name: `<email>  ×N` (or `off`, for an unused account or weight 0), then `in use: claude <email> · codex <email>`: per provider, the account with a success in the newest of the proxy's 10-minute `recent_requests` buckets that ended at most 20 minutes ago (a provider with none is left out). Actions per account (`<idx>` is the account's auth index):
-- **`<email>: don't use`** (`off.<idx>`) / **`<email>: use`** (`on.<idx>`). They set the account's `disabled` through `PATCH /v8/management/credentials/status` (v0: `/v0/management/auth-files/status`). An unused account keeps its weight.
-- **`<email>: weight N → N+1`** (`wup.<idx>`) / **`weight N → N-1`** (`wdown.<idx>`, only above 0), for accounts in use. Weights go from 0 to 99, default 1; 0 means the account is never picked. Weights only pick the account for a new chat: session affinity still keeps each chat on its account.
+- every `cla` account and every provider that runs `claude`
+- every Codex provider
+- the agy (Antigravity) login of this machine
 
-Weights and priorities go through `PATCH /v8/management/credentials/fields` (v0: `/v0/management/auth-files/fields`), never by editing auth files, and take effect at once. Every account action reads the account list live first, and needs the management key (`needs the management key` otherwise). The section reads only the 60-second cache, so it stays quick.
+No browser is needed. The plugin copies the login the account already has. A Claude login comes from the macOS Keychain or from `.credentials.json`. A Codex login comes from its `auth.json`. The agy login comes from the Keychain, or from `~/.gemini/antigravity-cli/antigravity-oauth-token`.
 
-**Sub-agents.** Claude Code's Agent tool takes only its own model names, so on launch the plugin passes `--agents` with one sub-agent per model the proxy lists on `/v1/models` (Claude, GPT, Gemini…; image models left out), named after the model in lower case (`gpt-6.1-sol` → `gpt-6-1-sol`; the first model keeps a name two would share). It asks the proxy live (2 s), else uses the copy setup saved; with neither, or without `jq`, or when you pass your own `--agents`, it adds none.
+macOS may ask for your Keychain password. Actions have no terminal, so a prompt there can block. Use the entry **+ Link launcher accounts** in a terminal instead.
 
-**Status line.** The settings file also sets Claude Code's status line to `plugin statusline`: the `statusLine` command Claude Code would have used (the session folder's `.claude/settings.local.json`, then `.claude/settings.json`, then `~/.claude/settings.json`; fed the same input, stopped with its children after 2 s), then ` · proxy: <provider> <email>`, the account in use for the session's model (`gpt-…` → codex, else the model's prefix; `gemini-…`, `claude-…` and `gpt-…` fall back to an antigravity login when no login of their own provider is in use). It reads only the cache; when that is over 60 s old it starts the same background refresh as `rows`, so the next render is fresh.
+Logins go only over `https` or to this machine (`127.0.0.1`, `::1`, `localhost`). With plain `http` to another host, linking refuses and launch starts `claude` without it. Tokens are never printed and never on a command line.
 
-**Link.** With a management key, every `cla` account, Codex provider and agy (Antigravity) provider whose email (any case) the proxy does not have yet is listed as `<email>  not linked`, so one added with the launcher's "+ Add" shows up at once. The action **`<email>: link to proxy`** (`link.<kind>-<name>`) or **Link all launcher accounts** (`ai plugin do cliproxy link`) uploads that account's own login as a proxy auth file (`POST /v0/management/auth-files`, `claude-<email>.json` / `codex-<email>.json` / `antigravity-<email>.json`), with no browser. A Claude login comes from the macOS Keychain (item `Claude Code-credentials-<first 8 hex of sha256 of the account folder path>`, read with `security`) or from `<account>/.credentials.json`; a Codex login from its `auth.json`; the one agy login of the machine from the Keychain item `gemini` / `antigravity` (else `~/.gemini/antigravity-cli/antigravity-oauth-token`), listed under the email agy logs at sign-in (`applyAuthResult: email=` in `~/.gemini/antigravity-cli/log/cli-*.log`) (newest log with that line only). The file is named only from the login's own `id_token` email: a login without one, or naming another account, is skipped (sign the proxy in with `cliproxyapi -antigravity-login` instead). Accounts match the proxy by provider and email, so an agy login and a Claude account with the same email are both linked. Tokens are never printed, never on a command line, and only briefly in a mode-600 temp file in the plugin's cache. Actions have no terminal, so a Keychain prompt may block them; the entry **+ Link launcher accounts** does the same in a terminal. Each account reports `linked <email>` or `skipped <email>: <reason>`. Linking sends logins and the management key only over `https` or to this machine (`127.0.0.1`, `::1`, `localhost`); with plain `http` to another host it refuses (`not linked: …`), and a launch then starts claude without linking. A launch cancelled while linking (Ctrl-C) also stops the link. A refused upload reports only the HTTP status, never the proxy's text.
-The trade-off: a linked account shares one login between `cla` (or Codex) and the proxy. Refresh tokens rotate (each refresh replaces the old one), so a token refresh on one side will likely sign the other side out. If that happens, log the `cla` account in again (`cla <name>`), or give the proxy its own login with setup's "sign in again". The proxy keeps the copied tokens in plaintext in its own auth directory, like every login it holds. Link never uploads over a proxy file of the same name, and links each email once.
+If an account is skipped:
 
-**TUI menu.** In the TUI, `a` on the cliproxy row opens its tabs (`plugin menu`): **Actions** (start, stop, apply, keep each chat on one account, link all) and **Accounts**, a checklist of the proxy's Claude and Codex accounts, then the launcher accounts not linked yet. Tick = use (a not-linked one: link it), untick = don't use, `+`/`-` the weight. Enter runs the same `link.` / `on.` / `off.` / `wup.` / `wdown.` actions as `ai plugin do`.
+| Message | What to do |
+| --- | --- |
+| `agy's saved login has expired` | Open agy once, or run `cliproxyapi -antigravity-login` |
+| `Google did not name agy's account` | Run `cliproxyapi -antigravity-login` |
+| `agy is signed in as … now` | The log and the login disagree. Run `cliproxyapi -antigravity-login` |
+| `no saved login found` | Sign that account in first (start it once from `ai`: `cla <name>`, its Codex provider, or `agy`), then link again |
+| `a proxy file named … already exists` | Nothing. The proxy already has it. Link never overwrites |
+| `its CLAUDE_CONFIG_DIR is not a plain absolute path` | Write it as a plain path, `~/…` or `$HOME/…` |
+| `the proxy refused it (HTTP …)` | Check the proxy log and the management key |
 
-**Remove.** `ai plugin rm cliproxy` deletes the plugin folder, and with it the saved client and management keys in `config`. The proxy and its config stay, and so does `<proxy config>.ai-launcher.key` (mode 600), a copy of the management key that setup keeps beside a proxy config outside the plugin folder: the proxy stores that key only as a hash, so a new `add` reuses this copy (once the proxy accepts it) instead of asking you to paste or reset it. Delete that file to forget the key. Setup prints the management key at the end of each run (`management key: …`), with where it is saved, so you have it for the proxy's web panel or another tool; it never prints the client key.
+A linked account shares one login between `cla` (or Codex) and the proxy. Refresh tokens rotate, so a refresh on one side will likely sign the other side out. If that happens, run `cla <name>` to log in again, or give the proxy its own login with setup's "sign in again". The proxy keeps copied tokens in plaintext in its own auth directory, like every login it holds.
 
-**When every account is limited.** The section shows `⚠ all Claude accounts limited · next reset ↻…` (the same for Codex). CLIProxyAPI has no built-in fallback to another model: when every Claude account is limited, Claude Code gets HTTP 429 `model_cooldown` from the proxy. Pick another model yourself with `/model`, or wait for the reset.
+#### Usage bars
+
+The numbers come from each provider's usage endpoint, called through the proxy. They are cached for 60 seconds and refresh in the background. Claude is asked at most once per account every 5 minutes, because Anthropic refuses calls made seconds apart (HTTP 429). When a call fails, the last good value is shown. For a Claude account that matches a `cla` account (same email), the `cla` session's saved usage is shown instead when it is newer. Without a management key the row shows a hint instead.
+
+#### Troubleshooting
+
+**The row says `proxy not running`.** Run `ai plugin do cliproxy start`, or `brew services start cliproxyapi`. Launch never starts the proxy for you.
+
+**The row says `no key` or `needs the management key`.** Run `ai plugin setup cliproxy`. Or export `CLIPROXY_API_KEY` and `CLIPROXY_MGMT_KEY`.
+
+**Accounts show `not linked`.** Choose **Link all launcher accounts**, or launch the row once. If one is skipped, see the table above.
+
+**The Claude bar is blank.** The usage call failed and there is no earlier good value. Wait up to 5 minutes. Check that the account is linked and not expired.
+
+**Claude Code shows "401 Invalid bearer token".** Another `ANTHROPIC_BASE_URL` in `~/.claude/settings.json` can win over the environment. The plugin avoids this with its own `--settings` file, so launch from the row, not by hand.
+
+**I want to remove it.** `ai plugin rm cliproxy` deletes the plugin folder and its saved keys. The proxy and its config stay.
+
+#### Details
+
+- **Files.** `plugins/cliproxy/config` (mode 600) is created by the first `rows` call. It is read as `key=value` lines, never run. A ` #` or tab then `#` starts a comment, a line starting with `#` is skipped, and quotes are kept as part of the value. Cache is in `plugins/cliproxy/cache/` (60 s rows cache, `quota` last good usage per account, `agents.json`, `claude-settings.json` mode 600).
+- **Config keys.**
+
+  | Key | Default | What it does |
+  | --- | --- | --- |
+  | `url` | `http://127.0.0.1:8317` | Where the proxy listens |
+  | `key_env` / `key` | `CLIPROXY_API_KEY` | Env var holding the client key, or the key itself (`key` wins) |
+  | `mgmt_key_env` / `mgmt_key` | `CLIPROXY_MGMT_KEY` | Same, for the management key |
+  | `start_cmd` / `stop_cmd` | none | Commands for start / stop when brew has no `cliproxyapi` (`bash -c`, in the plugin folder) |
+  | `proxy_config` | set by setup | The proxy's `config.yaml` that setup edits |
+
+- **Proxy config edits.** Setup edits `config.yaml` (brew: `$(brew --prefix)/etc/cliproxyapi.conf`, else `plugins/cliproxy/run/config.yaml`) only to fill an empty `secret-key`, add a client key, and rewrite `auth-dir: "~/…"` to `$HOME/…`. It backs the file up first to `config.yaml.ai-launcher.bak` (`.<epoch>` suffix when that exists), and writes atomically. A config setup just created loses its sample `your-api-key-*` keys and listens on 127.0.0.1 only. An existing config is not touched otherwise.
+- **Management key.** The proxy stores it only as a hash. Setup reuses `CLIPROXY_MGMT_KEY`, or the copy in `<proxy config>.ai-launcher.key` (mode 600, kept after `rm`; delete it to forget the key). Reset writes a new `secret-key` and waits up to 10 s for the proxy to accept it. Setup prints the management key at the end, never the client key.
+- **How `claude` starts.** With `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` and gateway model discovery set for that session only, plus `--settings <plugin>/cache/claude-settings.json` (also sets the status line). Both keys are removed from claude's environment.
+- **Sub-agents.** `--agents` adds one per model on `/v1/models` (image models left out), named in lower case (`gpt-6.1-sol` → `gpt-6-1-sol`). It asks the proxy live (2 s), else uses the saved copy. It adds none without `jq` or when you pass your own `--agents`.
+- **Status line.** Runs your usual `statusLine` command (session `.claude/settings.local.json`, then `.claude/settings.json`, then `~/.claude/settings.json`; stopped after 2 s), then ` · proxy: <provider> <email>` from the cache.
+- **API calls.** Account actions use `PATCH /v8/management/credentials/status` and `/fields` (v0: `/v0/management/auth-files/status`, `/fields`). Apply uses `PATCH /v8/management/config` (older proxies: `PUT /v0/management/routing/strategy`). Account actions read the account list live first. Old `mode=` and `order=` lines in `config` are ignored.
+- **Link sources.** Claude Keychain item `Claude Code-credentials-<first 8 hex of sha256 of the account folder path>`. A provider that runs `claude` uses the `CLAUDE_CONFIG_DIR` at the start of its command: an unquoted leading `~`, or `$HOME` / `${HOME}` unquoted or in double quotes. Anything else (a quoted `~`, a command substitution) is skipped. Without it, the launcher's own `CLAUDE_CONFIG_DIR`, then the default login (`~/.claude.json`, Keychain item `Claude Code-credentials`, else `~/.claude/.credentials.json`), listed as `claude-<provider>`. Providers sharing one login, or a `cla` folder, count once.
+- **Link files.** Uploaded with `POST /v0/management/auth-files` as `claude-<email>.json`, `codex-<email>.json`, `antigravity-<email>.json`. The name comes from the login's own `id_token` email. agy's Keychain login has none, so Google's `userinfo` endpoint names it: the only Google call, made only while linking, token on stdin, 10 s limit. An expired agy login is skipped without a call. The agy email in the listing comes from `applyAuthResult: email=` in the newest `~/.gemini/antigravity-cli/log/cli-*.log` that has it. Temp files are mode 600 in the cache. A refused upload shows only the HTTP status.
+- **Usage sources.** Antigravity: `fetchAvailableModels` through the proxy's `api-call`. It counts as limited only when every model of every group is out. `cache/quota` keys are proxy url, auth index and file name; a removed account loses its entry. `cla` usage is `<account>/usage/usage.json` from `scripts/statusline-usage.sh`, used when newer with a reset still ahead, never saved as the answer, and not used when two launcher folders share the email.
+- **Session affinity.** Sets `routing.session-affinity` and `session-affinity-subagents` to true (TTL `1h` if none). It changes the proxy only when you choose it. The prompt cache is per account and per provider.
 
 ## How it works
 
