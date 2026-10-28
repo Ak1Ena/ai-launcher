@@ -48,11 +48,12 @@ JQDEF='def clean: tostring | gsub("[[:cntrl:]]"; "");
   def who: .email // .account // .name // .id // "?" | clean;
   def wt: .weight // 1 | (tonumber? // 1) | floor | if . < 0 then 0 elif . > 99 then 99 else . end;
   def pri: .priority // 0 | (tonumber? // 0);
-  def accts: [.files[]? | select((.provider // .type // "") | ascii_downcase | test("^(claude|codex)$"))
+  def accts: [.files[]? | select((.provider // .type // "") | ascii_downcase | test("^(claude|codex|antigravity)$"))
     | {i: aid, n: (.name // .id // "" | clean), e: who, w: wt, d: (.disabled == true), p: (.provider // .type | ascii_downcase), r: pri}
     | select(.i != "" and .n != "")] | sort_by(.n)[] | [.i, .n, .e, .w, .d, .p, .r] | @tsv;
-  # every proxy file, any provider: lower-case name TAB lower-case email field ("" when none), for link
-  def names: .files[]? | [(.name // .id // "" | clean | ascii_downcase), (.email | if type == "string" then clean | ascii_downcase else "" end)] | @tsv;
+  # every proxy file, any provider: lower-case name TAB lower-case email field ("" when none) TAB lower-case provider, for link
+  def names: .files[]? | [(.name // .id // "" | clean | ascii_downcase), (.email | if type == "string" then clean | ascii_downcase else "" end),
+    (.provider // .type // "" | clean | ascii_downcase)] | @tsv;
   # recent_requests: 10-minute buckets, oldest first; a list of {time, success, failed}, or (v0) a string:
   # a header "[20]{failed:int,success:int,time:string}" then one "failed,success,HH:MM-HH:MM" line per bucket -> [{s, t}]
   def rr: if type == "array" then [.[] | {s: (.success? | tonumber? // 0), t: .time?}]
@@ -109,14 +110,19 @@ refresh() {
   jq -r "$JQDEF"'accts' "$creds" > "$CACHE/accts.$$" 2>/dev/null && mv "$CACHE/accts.$$" "$CACHE/accts"
   jq -r "$JQDEF"'names' "$creds" > "$CACHE/names.$$" 2>/dev/null && mv "$CACHE/names.$$" "$CACHE/names"
   jq -r --argjson now "$(date +%s)" --argjson nowm "$(date '+%H %M' | awk '{ print $1 * 60 + $2 }')" "$JQDEF"'inuse($now; $nowm)' "$creds" > "$CACHE/inuse.$$" 2>/dev/null && mv "$CACHE/inuse.$$" "$CACHE/inuse"
-  # each enabled claude / codex login: its provider's own usage endpoint through the proxy (as the Management Center does)
-  jq -r '.files[] | select((.disabled != true) and ((.provider // .type // "") | ascii_downcase | test("^(claude|codex)$")))
-    | [.auth_index, (.provider // .type | ascii_downcase), (.id_token.chatgpt_account_id? // "")] | @tsv' "$creds" 2>/dev/null |
+  # each enabled claude / codex / antigravity login: its provider's own usage endpoint through the proxy (as the Management Center does)
+  # acct: codex's ChatGPT account id, or antigravity's project id
+  jq -r '.files[] | select((.disabled != true) and ((.provider // .type // "") | ascii_downcase | test("^(claude|codex|antigravity)$")))
+    | [.auth_index, (.provider // .type | ascii_downcase), (.id_token.chatgpt_account_id? // .project_id // "" | tostring)] | @tsv' "$creds" 2>/dev/null |
   while IFS="$TAB" read -r ai prov acct; do
     [ -n "$ai" ] || continue
     jq -n --arg ai "$ai" --arg p "$prov" --arg acct "$acct" '{auth_index: $ai, method: "GET", data: ""} +
       if $p == "claude" then {url: "https://api.anthropic.com/api/oauth/usage", header: {"Authorization": "Bearer $TOKEN$",
         "Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-cli/2.1.280 (external, cli)"}}
+      # per-model quota, as CLIProxyAPI v8.0.40 probes it (sdk/cliproxy/antigravity_models.go, User-Agent from internal/misc/antigravity_version.go)
+      elif $p == "antigravity" then {method: "POST", url: "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+        data: (if $acct != "" then {project: $acct} else {} end | tojson), header: {"Authorization": "Bearer $TOKEN$",
+        "Content-Type": "application/json", "User-Agent": "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000335682)"}}
       else {url: "https://chatgpt.com/backend-api/wham/usage", header: ({"Authorization": "Bearer $TOKEN$",
         "Content-Type": "application/json", "User-Agent": "codex-tui/0.149.1"} + if $acct != "" then {"Chatgpt-Account-Id": $acct} else {} end)} end' > "$CACHE/req.$$"
     out=$(kcurl "$mgmt_key" -m 20 -X POST -H 'Content-Type: application/json' --data-binary "@$CACHE/req.$$" "$url/$base/management/$call")
@@ -153,24 +159,36 @@ refresh() {
         | {w: (if $sec == null then $pos elif $sec < 86400 then "5h" else "wk" end),
            pct: ((.used_percent // .usedPercent | num) // (if ($r.limit_reached // $r.limitReached) == true or $r.allowed == false then 100 else null end)),
            left: (((.reset_at // .resetAt) | left) // (.reset_after_seconds // .resetAfterSeconds | num))};
-      ([$q[] | .p as $p | .ai as $ai | .q | {p: $p, ai: $ai, ws: [if $p == "claude" then claude else codex end]}]) as $quota
+      # antigravity: models{id: {quotaInfo: {remainingFraction, resetTime}}}; per group (gemini, claude = Claude/GPT models) the bar shows
+      # the model with the least left; the group is out only when every model in it is (out: first reset). No fraction but a reset time = none left
+      def agy: [.models // {} | to_entries[] | (.key | ascii_downcase) as $id | (.value.quotaInfo // .value.quota_info // {}) as $qi
+          | ($qi.resetTime // $qi.reset_time) as $r
+          | {w: (if ($id | startswith("gemini")) and ($id | test("image") | not) then "gemini" elif ($id | test("^(claude|gpt)")) then "claude" else null end),
+             f: (($qi.remainingFraction // $qi.remaining_fraction | num) // (if $r then 0 else null end)), r: $r}
+          | select(.w != null and .f != null)]
+        | group_by(.w)[] | (if all(.f <= 0) then {out: (map(.r | left) | map(select(. != null)) | min)} else {} end) + (min_by(.f) | {w, pct: ((1 - .f) * 100 | round), left: (.r | left)});
+      ([$q[] | .p as $p | .ai as $ai | .q | {p: $p, ai: $ai, ws: [if $p == "claude" then claude elif $p == "antigravity" then agy else codex end]}]) as $quota
       # every enabled login of a provider limited (5h/weekly at 100%, or cooling down / unavailable) -> one warning line
       | def allout($p; $label):
           [$c[0].files[] | select((.disabled != true) and ((.provider // .type // "") | ascii_downcase) == $p)] as $fs
           | if ($fs | length) == 0 then empty else
             [$fs[] | . as $f
-              | [$quota[] | select(.p == $p and .ai == ($f.auth_index | tostring)) | .ws[] | select(.pct != null and .pct >= 100) | .left] as $ql
+              | [$quota[] | select(.p == $p and .ai == ($f.auth_index | tostring)) | .ws] as $W
+              # antigravity: limited only when every model group is out (each group has its own quota)
+              | (if $p == "antigravity" then [$W[] | select(length > 0 and all(has("out"))) | map(.out) | min]
+                 else [$W[][] | select(.pct != null and .pct >= 100) | .left] end) as $ql
               | [($f.cooldowns // [])[]? | (.remaining_seconds | num)] as $cl
               | if $f.unavailable == true or ($cl | length) > 0 or ($ql | length) > 0
                 then {r: (($ql + $cl) | map(select(. != null)) | max)} else empty end] as $L
             | if ($L | length) == ($fs | length) then "  \t⚠ all \($label) accounts limited"
                 + ([$L[].r | select(. != null and . > 0)] | min | if . == null then "" else " · next reset " + (in_ | ltrimstr(" ")) end)
               else empty end end;
-      allout("claude"; "Claude"), allout("codex"; "Codex"),
+      allout("claude"; "Claude"), allout("codex"; "Codex"), allout("antigravity"; "Antigravity"),
       ($c[0].files | map(. + {p: ((.provider // .type // "?") | clean | ascii_downcase)}) | group_by(.p)[]
       | .[0].p as $p | length as $n
       | ([$quota[] | select(.p == $p) | .ws[]]) as $ws
-      | [$p] + ([bar("5h"; [$ws[] | select(.w == "5h")]), bar("wk"; [$ws[] | select(.w == "wk")])])
+      | (if $p == "antigravity" then ["gemini", "claude"] else ["5h", "wk"] end) as $wn
+      | [$p] + [$wn[] as $w | bar($w; [$ws[] | select(.w == $w)])]
         + ["\($n) acct\(if $n == 1 then "" else "s" end)",
            "\(map(.success | num // 0) | add) req", "\(map(.failed | num // 0) | add) failed"]
       | "  \t" + join(" · "))' 2>/dev/null
@@ -293,12 +311,12 @@ setuse() {
   if [ "$1" = on ]; then echo "$e: used"; else echo "$e: not used"; fi
 }
 
-# ── link: copy a launcher account's own login (cla / Codex) into the proxy, no browser ──
+# ── link: copy a launcher account's own login (cla / Codex / agy) into the proxy, no browser ──
 okmail() { case $1 in *@*) case $1 in *[!A-Za-z0-9._%+@-]*) return 1 ;; esac ;; *) return 1 ;; esac; }
 # launcher accounts with a known email: kind TAB id TAB email TAB home
 laccts() {
   has jq || return 0
-  local f e h a c pf=${AI_PROVIDERS:-$HOME/.config/ai-launcher/providers}
+  local f e h a c b i ag= pf=${AI_PROVIDERS:-$HOME/.config/ai-launcher/providers}
   set -- "${CLA_ROOT:-$HOME/.claude-accounts}"/*/.claude.json
   [ -f "$1" ] && jq -r '[input_filename, (.oauthAccount.emailAddress // "")] | @tsv' "$@" 2>/dev/null |
     while IFS="$TAB" read -r f e; do
@@ -306,19 +324,32 @@ laccts() {
       okmail "$e" && printf 'claude\tclaude-%s\t%s\t%s\n' "$a" "$e" "$h"
     done
   [ -f "$pf" ] || return 0
-  while IFS="$TAB" read -r a c _; do   # providers that run codex (the same rule as setup)
-    [ "$(printf '%s\n' "$c" | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {n = split($i, p, "/"); print p[n]; exit}}')" = codex ] || continue
+  while IFS="$TAB" read -r a c _; do   # providers that run codex or agy (the same rule as setup)
+    b=$(printf '%s\n' "$c" | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {n = split($i, p, "/"); print p[n]; exit}}')
     case $a in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+    if [ "$b" = agy ]; then   # one agy login per machine: the first such provider stands for it
+      [ -z "$ag" ] || continue; ag=1; h=$HOME/.gemini/antigravity-cli
+      # the email agy logs at each sign-in (the Keychain item would need a prompt here; rows must stay quick)
+      # newest log first (names carry the start time), stop at the first that has the line: old logs are never read
+      set -- "$h"/log/cli-*.log; e=; i=$#
+      while [ $i -gt 0 ] && [ -e "$1" ]; do
+        eval "f=\${$i}"; e=$(grep -h 'applyAuthResult: email=' "$f" 2>/dev/null | tail -n 1); [ -z "$e" ] || break; i=$((i - 1))
+      done
+      e=$(printf '%s\n' "$e" | sed -n 's/.*applyAuthResult: email=\([^ ,]*\).*/\1/p')
+      okmail "$e" && printf 'antigravity\tantigravity-%s\t%s\t%s\n' "$a" "$e" "$h"
+      continue
+    fi
+    [ "$b" = codex ] || continue
     h=${AI_ACCOUNTS:-$HOME/.ai-accounts}/codex/$a; [ "$a" = codex ] && h=${CODEX_HOME:-$HOME/.codex}
     e=$(jq -r "$JWT"'.tokens.id_token // empty | jwt | .email // empty' "$h/auth.json" 2>/dev/null)
     okmail "$e" && printf 'codex\tcodex-%s\t%s\t%s\n' "$a" "$e" "$h"
   done < "$pf"
 }
 JWT='def jwt: split(".")[1] // "" | gsub("-"; "+") | gsub("_"; "/") | . + ([range(0; (4 - length % 4) % 4)] | map("=") | join("")) | @base64d | fromjson;'
-# launcher accounts whose email no proxy file has in its email field (any case); one per email
+# launcher accounts whose provider + email (any case) no proxy file has; one per provider + email
 unlinked() {
   [ -f "$CACHE/names" ] || return 0
-  laccts | awk -F "$TAB" 'FILENAME == ARGV[1] { if ($2 != "") p[$2] = 1; next } { e = tolower($3) } !(e in p) && !s[e]++' "$CACHE/names" -
+  laccts | awk -F "$TAB" 'FILENAME == ARGV[1] { if ($2 != "") p[$3 SUBSEP $2] = 1; next } { e = $1 SUBSEP tolower($3) } !(e in p) && !s[e]++' "$CACHE/names" -
 }
 # Keychain service of a Claude Code config dir: "Claude Code-credentials-" + sha256(CLAUDE_CONFIG_DIR)[0:8],
 # as claude 2.1.311 builds it (kW(): no suffix only when CLAUDE_CONFIG_DIR is unset); account = $USER
@@ -329,7 +360,7 @@ ksvc() {
 kuser() { local u=${USER:-$(id -un 2>/dev/null)}; case $u in ''|*[!A-Za-z0-9._-]*) u=claude-code-user ;; esac; printf '%s' "$u"; }
 # link1 <kind> <email> <home>: upload that login as a proxy auth file. Tokens only pass through pipes and one 600 temp file.
 link1() {
-  local t=$CACHE/link.$$ s=
+  local t=$CACHE/link.$$ s= a
   rm -f "$t"
   if [ "$1" = claude ]; then
     has security && s=$(security find-generic-password -a "$(kuser)" -w -s "$(ksvc "$3")" 2>/dev/null)
@@ -338,6 +369,24 @@ link1() {
     ( umask 077; printf '%s' "$s" | jq -c --arg e "$2" '.claudeAiOauth // empty | select(.accessToken and .refreshToken)
       | {type: "claude", access_token: .accessToken, refresh_token: .refreshToken, id_token: "", email: $e,
          expired: ((.expiresAt // 0) / 1000 | floor | todate), last_refresh: (now | floor | todate)}' > "$t" 2>/dev/null )
+  elif [ "$1" = antigravity ]; then
+    # agy: Keychain item gemini / antigravity, else its token file; "go-keyring-base64:" + base64 of JSON, or JSON (hex from -w)
+    has security && s=$(security find-generic-password -s gemini -a antigravity -w 2>/dev/null)
+    case $s in ''|'{'*|go-keyring-base64:*) ;; *[!0-9a-fA-F]*) s= ;; *) s=$(printf '%s' "$s" | xxd -r -p 2>/dev/null) ;; esac
+    [ -n "$s" ] || s=$(cat "$3/antigravity-oauth-token" 2>/dev/null)
+    ( umask 077; printf '%s' "$s" | jq -Rsc "$JWT"'rtrimstr("\n") | if startswith("go-keyring-base64:") then ltrimstr("go-keyring-base64:") | @base64d else . end
+      | fromjson | (.token // .) | select(.access_token and .refresh_token)
+      | {type: "antigravity", access_token, refresh_token, email: ((try (.id_token | jwt | .email) catch null) // ""),
+         expired: (if (.expiry | type) == "string" then .expiry elif .expiry_date then (.expiry_date | tonumber / 1000 | floor | todate) else "" end),
+         timestamp: (now * 1000 | floor)}' > "$t" 2>/dev/null )
+    # only the login's own id_token names its account: the log email may be another account's (after a switch)
+    a=$(jq -r '.email' "$t" 2>/dev/null)
+    if [ -s "$t" ] && [ -z "$a" ]; then
+      rm -f "$t"; s=; echo "skipped $2: agy's saved login names no account — sign the proxy in with: cliproxyapi -antigravity-login"; return 1
+    fi
+    if [ -s "$t" ] && [ "$(printf '%s' "$a" | tr 'A-Z' 'a-z')" != "$(printf '%s' "$2" | tr 'A-Z' 'a-z')" ]; then
+      rm -f "$t"; s=; echo "skipped $2: agy is signed in as $(printf '%s' "$a" | tr -d '\000-\037\177' | cut -c1-80) now"; return 1
+    fi
   else
     ( umask 077; jq -c --arg e "$2" "$JWT"'.tokens // empty | select(.access_token and .refresh_token)
       | {type: "codex", id_token: (.id_token // ""), access_token, refresh_token, account_id: (.account_id // ""), email: $e,
@@ -351,14 +400,22 @@ link1() {
   fi
   out=$(kcurl "$mgmt_key" -m 10 -F "file=@$t;type=application/json;filename=$1-$2.json" "$url/v0/management/auth-files"); code=${out##*$'\n'}
   rm -f "$t"
-  # the proxy's own error text (never a token: the body is its message), one line, short
-  [ "$code" = 200 ] || { echo "skipped $2: the proxy refused it ($(hc "$code")): $(printf '%s' "${out%$'\n'*}" | jq -r '.error // .message // empty' 2>/dev/null | tr -d '\000-\037\177' | cut -c1-160)"; return 1; }
+  # the status only: the proxy's error text may echo what was sent
+  [ "$code" = 200 ] || { echo "skipped $2: the proxy refused it ($(hc "$code"))"; return 1; }
   echo "linked $2"
 }
+# logins and the management key go only over https or to this machine (no userinfo trick: an @ in the host part never passes)
+linkurl() {
+  local h=${url#*://}; h=${h%%/*}
+  case $url in https://*) case $h in *@*) return 1 ;; esac; return 0 ;; http://*) ;; *) return 1 ;; esac
+  case $h in 127.0.0.1|127.0.0.1:*|localhost|localhost:*|'[::1]'|'[::1]:'*) case $h in *@*) return 1 ;; esac ;; *) return 1 ;; esac
+}
+nolinkurl() { echo 'not linked: logins go only over https or to this machine (127.0.0.1, ::1, localhost); the proxy url is plain http to another host'; }
 # link [id]: every launcher account not in the proxy, or the one with that id
 link() {
   [ -n "$mgmt_key" ] || { echo 'needs the management key'; return 1; }
   has curl && has jq || { echo 'needs curl and jq'; return 1; }
+  linkurl || { nolinkurl; return 1; }
   fetchaccts || return 1
   trap 'rm -f "$CACHE/link.$$"' EXIT; trap 'exit 1' INT TERM HUP
   # shortcut: a Keychain prompt with no tty blocks until answered (do: 30 s limit); the launch row has a tty
@@ -500,6 +557,24 @@ case ${1:-} in
     shift 2
     [ -n "$key" ] || { nokey >&2; exit 1; }
     up || { echo "$DOWN" >&2; exit 1; }
+    # link launcher accounts the proxy lacks (by the cache, else the live list: no call when every one is linked); a failure is one
+    # line, and a Keychain prompt left open stops it after CLIPROXY_LINK_SECS (60 s): the launch always goes on
+    if [ -n "$mgmt_key" ] && has curl && has jq && ! linkurl; then [ -z "$(unlinked)" ] || nolinkurl >&2
+    elif [ -n "$mgmt_key" ] && has curl && has jq && { [ -f "$CACHE/names" ] || fetchaccts >/dev/null; } && [ -n "$(unlinked)" ]; then
+      exec 3>&2
+      {
+        set -m   # its own process group, so the time limit also stops security
+        (link "") >&3 2>&3 &
+        p=$!; set +m; i=0
+        # its own group gets no Ctrl-C from the terminal: a cancelled launch stops it (its EXIT trap removes the temp file)
+        trap 'kill -TERM -- -$p; wait $p; exit 130' INT TERM HUP
+        while kill -0 $p && [ $i -lt $(( ${CLIPROXY_LINK_SECS:-60} * 10 )) ]; do sleep 0.1; i=$((i + 1)); done
+        kill -0 $p && { kill -TERM -- -$p; echo 'cliproxy: linking took too long, stopped' >&3; }
+        wait $p
+        trap - INT TERM HUP
+      } 2>/dev/null
+      exec 3>&-
+    fi
     unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY CLIPROXY_MGMT_KEY
     ! envname "$mgmt_key_env" || unset "$mgmt_key_env"
     export ANTHROPIC_BASE_URL=$url ANTHROPIC_AUTH_TOKEN=$key CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
@@ -563,6 +638,8 @@ case ${1:-} in
       o=$(cat "$t" 2>/dev/null); rm -f "$t" "$t.in"
     fi
     e=$(awk -F "$TAB" -v p="$pv" '$1 == p { print $2; exit }' "$CACHE/inuse" 2>/dev/null)
+    # gemini, Claude and GPT models are also served by antigravity logins
+    [ -n "$e" ] || case $pv in gemini|claude|codex) false ;; *) true ;; esac || { pv=antigravity; e=$(awk -F "$TAB" '$1 == "antigravity" { print $2; exit }' "$CACHE/inuse" 2>/dev/null); }
     px=; [ -z "$e" ] || px="proxy: $pv $e"
     if [ -n "$o" ] && [ -n "$px" ]; then printf '%s · %s\n' "$o" "$px"
     elif [ -n "$o$px" ]; then printf '%s\n' "$o$px"; fi
