@@ -182,6 +182,9 @@ class H(BaseHTTPRequestHandler):
             if p == '/v8/management/config/routing' and self.command == 'GET':
                 try: return self.send(200, json.load(open(T + '/routing.json')))
                 except Exception: return self.send(404, {"error": "not found"})
+            if p == '/v8/management/config/oauth/providers/antigravity/sensitive-words':
+                if self.command == 'PUT': open(T + '/agwords.json', 'w').write(body); return self.send(200, {"status": "ok"})
+                return self.send(200, jfile('agwords.json')) if os.path.exists(T + '/agwords.json') else self.send(404, {"error": "not_found"})
             if p == '/v8/management/config' and self.command == 'PATCH':
                 open(T + '/patch.log', 'a').write(body + '\n')
                 r = json.load(open(T + '/routing.json')) if os.path.exists(T + '/routing.json') else {}
@@ -369,7 +372,20 @@ run do affinity >/dev/null
 ok "empty ttl is set to 1h"            'has_line "$(cat "$T/patch.log")" "\"session-affinity-ttl\":\"1h\""'
 rm -f "$T/routing.json"; echo v0 > "$T/mode"
 ok "do affinity on a v0 proxy: says so" 'run do affinity | grep -q "not available"'
+rm -f "$T/agwords.json"; res=$(run do agwords); rc=$?
+ok "do agwords on a v0 proxy: says so" '[ $rc != 0 ] && has_line "$res" "antigravity sensitive-words not set (HTTP 404; needs CLIProxyAPI v8)" && [ ! -e "$T/agwords.json" ]'
 : > "$T/mode"
+
+# ── antigravity sensitive words (CLIProxyAPI #5751) ──
+rm -f "$T/agwords.json"
+res=$(run do agwords); rc=$?
+ok "agwords: unset list gets the defaults" '[ $rc = 0 ] && [ "$(cat "$T/agwords.json")" = "[\"RFC 2119\",\"system-conventions\",\"system_conventions\",\"system-directive\",\"system_directive\"]" ] && has_line "$res" "antigravity sensitive-words set: no false 429 on prompts with RFC 2119 / <system-conventions>"'
+echo '["mine"]' > "$T/agwords.json"
+res=$(run do agwords)
+ok "agwords: a list of yours is kept"   '[ "$(cat "$T/agwords.json")" = "[\"mine\"]" ] && has_line "$res" "antigravity sensitive-words: kept yours"'
+echo '[]' > "$T/agwords.json"; run do agwords >/dev/null
+ok "agwords: an empty list gets the defaults" 'grep -q "RFC 2119" "$T/agwords.json"'
+rm -f "$T/agwords.json"
 conf "url=$URL" "key=$CK"
 rm -rf "$D/cache"
 out=$(run rows); res=$(run do affinity 2>&1)
