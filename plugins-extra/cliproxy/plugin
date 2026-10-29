@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cliproxy plugin for ai-launcher: one "all accounts" Claude Code channel through a local CLIProxyAPI.
-# Protocol: plugin rows | actions | menu | do <start|stop|affinity|apply|on.<idx>|off.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link | statusline | agents   (see the README "Plugins")
+# Protocol: plugin rows | actions | menu | do <start|stop|affinity|agwords|apply|on.<idx>|off.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link | statusline | agents   (see the README "Plugins")
 # API facts: docs/superpowers/notes/cliproxyapi.md. Never prints a key.
 D=${AI_PLUGIN_DIR:-$(cd "$(dirname "$0")" && pwd)}
 CONF=$D/config CACHE=$D/cache TAB=$(printf '\t')
@@ -636,6 +636,18 @@ case ${1:-} in
       else echo "could not turn on session affinity ($(hc "$code"))"; exit 1; fi
       exit 0
     fi
+    if [ "${2:-}" = agwords ]; then
+      # Google answers a false 429 when systemInstruction holds these (CLIProxyAPI #5751); the proxy hides them with zero-width chars
+      [ -n "$mgmt_key" ] || { echo "no management key: set ${mgmt_key_env:-CLIPROXY_MGMT_KEY} or mgmt_key= in $CONF"; exit 1; }
+      has curl && has jq || { echo "antigravity words need curl and jq"; exit 1; }
+      p=$url/v8/management/config/oauth/providers/antigravity/sensitive-words
+      out=$(kcurl "$mgmt_key" -m 5 "$p"); code=${out##*$'\n'}
+      if [ "$code" = 200 ] && [ "$(printf '%s\n' "${out%$'\n'*}" | jq 'length' 2>/dev/null)" != 0 ]; then echo "antigravity sensitive-words: kept yours"; exit 0; fi
+      out=$(kcurl "$mgmt_key" -m 10 -X PUT -H 'Content-Type: application/json' --data-binary '["RFC 2119","system-conventions","system_conventions","system-directive","system_directive"]' "$p"); code=${out##*$'\n'}
+      if [ "$code" = 200 ]; then echo "antigravity sensitive-words set: no false 429 on prompts with RFC 2119 / <system-conventions>"
+      else echo "antigravity sensitive-words not set ($(hc "$code"); needs CLIProxyAPI v8)"; exit 1; fi
+      exit 0
+    fi
     case ${2:-} in
       apply) [ -n "$mgmt_key" ] || { echo "proxy not changed (no management key)"; exit 1; }; apply; exit ;;
       on.*|off.*) setuse "${2%%.*}" "${2#*.}"; exit ;;
@@ -746,5 +758,5 @@ case ${1:-} in
     if [ -n "$o" ] && [ -n "$px" ]; then printf '%s · %s\n' "$o" "$px"
     elif [ -n "$o$px" ]; then printf '%s\n' "$o$px"; fi
     exit 0 ;;
-  *) echo "usage: plugin rows | actions | menu | do <start|stop|affinity|apply|on.<idx>|off.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link | statusline | agents" >&2; exit 1 ;;
+  *) echo "usage: plugin rows | actions | menu | do <start|stop|affinity|agwords|apply|on.<idx>|off.<idx>|wup.<idx>|wdown.<idx>|link|link.<kind>-<name>> | launch all [args...] | launch link | statusline | agents" >&2; exit 1 ;;
 esac

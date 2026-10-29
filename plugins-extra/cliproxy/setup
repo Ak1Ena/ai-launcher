@@ -453,10 +453,11 @@ else
   fi
 fi
 
-# ── 4. start (done above), weighted round-robin and session affinity ──
+# ── 4. start (done above), weighted round-robin, session affinity, antigravity sensitive words ──
 step 4 Start "$how" "proxy up"
 AI_PLUGIN_DIR=$D bash ./plugin do apply 2>&1 | sed 's/^/        /'
 AI_PLUGIN_DIR=$D bash ./plugin do affinity 2>&1 | sed 's/^/        /'
+AI_PLUGIN_DIR=$D bash ./plugin do agwords 2>&1 | sed 's/^/        /'
 okkey client "$key" || die "the proxy refused the client key (HTTP ${code:-no answer}): not ready"
 # ── 5. one Claude Code sub-agent per proxy model, saved for launch (never fails setup) ──
 na=$(AI_PLUGIN_DIR=$D bash ./plugin agents 2>/dev/null)
