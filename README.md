@@ -40,6 +40,7 @@ It reads and writes the same config as the bash `ai` (providers file, failover o
 | --- | --- |
 | `up` `down` / `k` `j` | move selection |
 | `enter` | open the selected account in a tab |
+| `t` | open the selected Claude account in team mode (teammates stay in the tab, no tmux needed; no failover) |
 | `a` | add an account |
 | `e` | edit the selected account |
 | `d` | delete the selected account |
@@ -285,7 +286,11 @@ ai plugin update [name]                # git pull --ff-only for git plugins (all
 ai plugin off <name>                   # stop it without removing it (on: start again)
 ai plugin rm <name>                    # asks [y/N], deletes the folder (a symlink loses only the link)
 ai plugin do <name> <action>           # run one of the plugin's actions
+ai plugin order [names...]             # show effective wrap order, or save explicit priority
+ai plugin owners [reset]               # list saved settings owners, or clear choices
 ```
+
+**Session wrapping.** A plugin can also supply an optional data-only `manifest` (`api=1`, `hooks=wrap`) and answer `plugin wrap <claude|codex|gemini> [args...]`. Its tab-separated output adds env, unsets, args, Claude settings fragments or plugin directories for that session only. Enabled hooks run in plugin name order, adjusted by `after`/`before` hints and then `ai plugin order`. Bash and the TUI share the same PATH shims; no declared wrap hook means PATH stays untouched. Claude settings merge into one private temporary file (jq needed for settings); single-owner keys ask once per plugin pair, with choices saved by `ai plugin owners`. Hooks cannot prompt, have a 10 s timeout, and failures never block the agent launch. Team sessions skip hooks unless their manifest has `team=1`. See [the wrap protocol](docs/plugins-v2.md) for details and PATH interception limits.
 
 `add` looks at its argument in this order: a bundled name, then an existing local folder, then a git source. Git sources are HTTPS only: an `https://` URL, or `owner/repo`, which becomes `https://github.com/owner/repo.git`. It never overwrites an installed plugin and refuses a folder without an executable `plugin`. New plugins start on, and `add` runs the plugin's `rows` once right away (macOS scans a new script on its first run, which can take seconds). Git needs `git`. The TUI's `p` form follows the same rules and expands a leading `~/`.
 

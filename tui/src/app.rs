@@ -54,6 +54,8 @@ pub struct Tab {
     session: Option<(String, PathBuf)>,
     /// the pane's exit was already handled (the pane stays for its last screen)
     done: bool,
+    /// Claude team mode: teammates run in-process in this tab, outside failover
+    pub team: bool,
 }
 
 pub enum Modal {
@@ -593,6 +595,13 @@ impl App {
                     config::set_default(&self.paths, new);
                 }
             }
+            KeyCode::Char('t') => {
+                if let Some(id) =
+                    id.filter(|i| self.entry(i).is_some_and(|e| e.kind == Kind::Claude))
+                {
+                    self.open_as(&id, true);
+                }
+            }
             KeyCode::Char('f') => config::set_failover(&self.paths, !self.failover),
             KeyCode::Char('w') => self.toggle_mode(),
             KeyCode::Char('s') => self.toggle_auto_switch(),
@@ -663,9 +672,9 @@ impl App {
                 self.close_tab()
             }
             (Some(Notice::Ended { .. } | Notice::Error(_)), KeyCode::Enter) => {
-                let member = tab.member.clone();
+                let (member, team) = (tab.member.clone(), tab.team);
                 self.tabs.remove(self.current);
-                self.open(&member);
+                self.open_as(&member, team);
             }
             (Some(Notice::Ended { .. } | Notice::Error(_)), KeyCode::Char('x' | 'q')) => {
                 self.close_tab()
@@ -1017,6 +1026,7 @@ impl App {
             split: Split::default(),
             session: None,
             done: false,
+            team: false,
         });
         self.current = self.tabs.len() - 1;
         self.focus = Focus::Pane;
@@ -1494,6 +1504,7 @@ impl App {
             split: Split::default(),
             session: None,
             done: false,
+            team: false,
         });
         self.current = self.tabs.len() - 1;
         self.focus = Focus::Pane;
@@ -1750,6 +1761,11 @@ impl App {
 
     /// Opens a new tab running the entry, with the args `ai-launcher` got the first time.
     pub fn open(&mut self, id: &str) {
+        self.open_as(id, false)
+    }
+
+    /// `open`, in Claude team mode when `team` (a Claude entry only).
+    fn open_as(&mut self, id: &str, team: bool) {
         // the args ai-launcher got are claude args: only a Claude entry takes them
         let is_claude = self.entry(id).is_some_and(|e| e.kind == Kind::Claude);
         let args = if is_claude {
@@ -1777,6 +1793,7 @@ impl App {
             split,
             session: None,
             done: false,
+            team: team && is_claude,
         });
         self.current = self.tabs.len() - 1;
         self.focus = Focus::Pane;
@@ -1792,7 +1809,8 @@ impl App {
             self.tabs[t].notice = Some(Notice::Error(format!("{id} is no longer in the list")));
             return;
         };
-        let failover = self.failover && entry.kind == Kind::Claude;
+        let team = self.tabs[t].team;
+        let failover = self.failover && entry.kind == Kind::Claude && !team;
         let mut env: Vec<(String, Option<String>)> = Vec::new();
         let mut command = entry.command.clone();
         match entry.kind {
@@ -1822,6 +1840,11 @@ impl App {
                     env.push(("AI_FO_MEMBER".into(), Some(self.label(&id))));
                     env.push(("AI_FO_NEXT".into(), next.map(|n| self.label(&n))));
                 }
+                if team {
+                    // same as cla-team, but teammates stay inside this tab: a PTY tab has no tmux to split
+                    env.push(("CLAUDE_MODE".into(), Some("team".into())));
+                    command = format!(r#"{command} --settings '{{"teammateMode":"in-process"}}'"#);
+                }
             }
             Kind::Codex => {
                 // the main login gets codex_home too: an inherited CODEX_HOME may be an account's
@@ -1841,6 +1864,7 @@ impl App {
             }
             Kind::Plugin => {}
         }
+        env.extend(crate::pane::wrap_env(&self.paths, &id, team));
         let (rows, cols) = self.pane_size;
         match Pane::spawn(&command, &args, &env, rows, cols) {
             Ok(p) => {
@@ -1867,10 +1891,11 @@ impl App {
         // Windows has no exec bit: run it through Git Bash
         let run = if cfg!(windows) { "bash" } else { "exec" };
         let command = format!("{run} {exe} launch {}", shell_quote(&eid));
-        let env = vec![(
+        let mut env = vec![(
             "AI_PLUGIN_DIR".to_string(),
             Some(p.dir.to_string_lossy().into_owned()),
         )];
+        env.extend(crate::pane::wrap_env(&self.paths, &id, false));
         let (rows, cols) = self.pane_size;
         match Pane::spawn(&command, &args, &env, rows, cols) {
             Ok(pane) => {
@@ -2519,6 +2544,47 @@ mod tests {
         assert_eq!(a.tabs.len(), 1);
         assert_eq!(a.tabs[0].member, "t1");
         assert!(a.focus == Focus::Pane);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn t_opens_a_claude_row_in_team_mode_outside_failover() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut a = app();
+        let bin = a.paths.home.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("claude");
+        let out = a.paths.home.join("out");
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\necho \"$CLAUDE_MODE $*\" > {}\n",
+                shell_quote(&out.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            &a.paths.providers,
+            format!("claude\t{}\tClaude Code\nt1\ttrue\tT One\n", fake.display()),
+        )
+        .unwrap();
+        config::set_failover(&a.paths, true);
+        a.refresh();
+        select(&mut a, "t1");
+        key(&mut a, KeyCode::Char('t'));
+        assert!(a.tabs.is_empty(), "t does nothing on a non-Claude row");
+        select(&mut a, "claude/w");
+        key(&mut a, KeyCode::Char('t'));
+        assert_eq!(a.tabs.len(), 1);
+        assert!(a.tabs[0].team);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read_to_string(&out).is_ok_and(|s| s.ends_with('\n')) {
+            assert!(Instant::now() < deadline, "fake claude never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let got = fs::read_to_string(&out).unwrap();
+        assert_eq!(got, "team --settings {\"teammateMode\":\"in-process\"}\n");
     }
 
     #[test]
