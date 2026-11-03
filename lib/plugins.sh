@@ -30,7 +30,8 @@ _ai_plugin_call() {
   (
     set -m
     export AI_PLUGIN_DIR=$d
-    if is_windows; then bash "$d/plugin" "$@"; else "$d/plugin" "$@"; fi </dev/null >>"$out" 2>>"$err" &
+    if [ "${1:-}" = wrap ] && is_fn _ai_wrap_plugin_exec; then _ai_wrap_plugin_exec "$d" "$@"
+    elif is_windows; then bash "$d/plugin" "$@"; else "$d/plugin" "$@"; fi </dev/null >>"$out" 2>>"$err" &
     p=$!
     # output goes to a file, so a child that outlives the kill can never hold the caller open
     ( sleep "$secs"; kill -KILL -- -"$p" || kill -KILL "$p" ) </dev/null >/dev/null 2>&1 &
@@ -74,6 +75,7 @@ _ai_plugin_launch() {
   _ai_plugin_ready "$n" && _ai_plugin_ok_id "$id" || { echo "plugin '$n' is not installed or is off (ai plugin ls)" >&2; return 1; }
   d=$(_ai_plugins_dir)/$n
   _ai_trust_share "$PWD"
+  _ai_wrap_enable "plugin:$n/$id" "${AI_TEAM:-0}"
   export AI_PLUGIN_DIR=$d
   if is_windows; then exec bash "$d/plugin" launch "$id" "$@"; else exec "$d/plugin" launch "$id" "$@"; fi
 }
@@ -82,8 +84,8 @@ _ai_plugin_launch() {
 _ai_plugin() {
   local sub=${1:-ls}; [ $# -gt 0 ] && shift
   case $sub in
-    ls|add|new|update|setup|rm|on|off|do) "_ai_plugin_$sub" "$@" ;;
-    *) echo "usage: ai plugin ls | add <folder|git url|owner/repo|cliproxy> [name] | new <name> | update [name] | setup|rm|on|off <name> | do <name> <action>"; return 1 ;;
+    ls|add|new|update|setup|rm|on|off|do|order|owners) "_ai_plugin_$sub" "$@" ;;
+    *) echo "usage: ai plugin ls | add <folder|git url|owner/repo|cliproxy> [name] | new <name> | update [name] | setup|rm|on|off <name> | do <name> <action> | order [names...] | owners [reset]"; return 1 ;;
   esac
 }
 # name must be valid; with "x" it must also be installed (a link counts)
@@ -283,4 +285,96 @@ _ai_plugin_do() {
   _ai_plugin_call "$n" "$t" do "$a"; rc=$?
   [ $rc = 137 ] && echo "plugin $n: stopped after ${t}s"
   return $rc
+}
+# Manifest data is never shell code. Keep the same comments/whitespace rules as cliproxy config.
+_ai_plugin_manifest() {
+  AI_PM_API=0 AI_PM_HOOKS= AI_PM_AFTER= AI_PM_BEFORE= AI_PM_TEAM=0
+  local l k v f; f=$(_ai_plugins_dir)/$1/manifest
+  [ -f "$f" ] || return 0
+  while IFS= read -r l || [ -n "$l" ]; do
+    l=${l%$'\r'}
+    case $l in '#'*) continue ;; *=*) ;; *) continue ;; esac
+    k=${l%%=*}; v=${l#*=}; v=${v%% #*}; v=${v%%"$TAB"#*}
+    while case $v in *' '|*"$TAB") true ;; *) false ;; esac; do v=${v%?}; done
+    case $k in
+      api) AI_PM_API=$v ;; hooks) AI_PM_HOOKS=$v ;; after) AI_PM_AFTER=$v ;;
+      before) AI_PM_BEFORE=$v ;; team) AI_PM_TEAM=$v ;;
+    esac
+  done < "$f"
+}
+_ai_plugin_wraps() {
+  _ai_plugin_ready "$1" || return 1
+  _ai_plugin_manifest "$1"
+  [ "$AI_PM_API" = 1 ] || return 1
+  case ,$AI_PM_HOOKS, in *,wrap,*) return 0 ;; esac
+  return 1
+}
+# No subprocesses or PATH/env changes in the common case with no wrap manifests.
+_ai_wrap_enable() {
+  local f n shim
+  for f in "${AI_PLUGINS:-${AI_PROVIDERS%/*}/plugins}"/*/manifest; do
+    [ -f "$f" ] || continue
+    n=${f%/manifest}; n=${n##*/}
+    _ai_plugin_wraps "$n" || continue
+    shim=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/shim" && pwd) || return 0
+    case :$PATH: in *":$shim:"*) ;; *) PATH=$shim:$PATH ;; esac
+    AI_WRAP_ENTRY=$1 AI_WRAP_TEAM=${2:-0}
+    AI_PLUGINS=$(_ai_plugins_dir)
+    export PATH AI_WRAP_ENTRY AI_WRAP_TEAM AI_PROVIDERS AI_PLUGINS
+    return 0
+  done
+  return 0
+}
+# Stable topological order; any cycle discards all hints, not just the cyclic component.
+_ai_plugin_ordered() (
+  local n other base edges= sorted rc f; base=$(
+    for n in $(_ai_plugin_names); do _ai_plugin_ready "$n" && echo "$n"; done
+  )
+  set -f  # manifest hints are names, never pathname patterns
+  [ -n "$base" ] || return 0
+  for n in $base; do
+    _ai_plugin_manifest "$n"
+    for other in ${AI_PM_AFTER//,/ }; do
+      _ai_plugin_ok_name "$other" && edges="$edges$other$TAB$n$NL"
+    done
+    for other in ${AI_PM_BEFORE//,/ }; do
+      _ai_plugin_ok_name "$other" && edges="$edges$n$TAB$other$NL"
+    done
+  done
+  sorted=$(printf '%s\n%s' "$base" "$edges" | awk -F '\t' '
+    NF == 1 && $1 != "" { names[++count]=$1; on[$1]=1; next }
+    NF == 2 { from[++e]=$1; to[e]=$2 }
+    END {
+      for (j=1;j<=e;j++) if (on[from[j]] && on[to[j]] && !edge[from[j],to[j]]++) degree[to[j]]++
+      for (step=1;step<=count;step++) {
+        pick=""; for (i=1;i<=count;i++) if (!done[names[i]] && !degree[names[i]]) { pick=names[i]; break }
+        if (pick=="") { for(i=1;i<=count;i++) print names[i]; exit 2 }
+        done[pick]=1; result[step]=pick
+        for(i=1;i<=count;i++) if(edge[pick,names[i]]) degree[names[i]]--
+      }
+      for(i=1;i<=count;i++) print result[i]
+    }'); rc=$?
+  [ "$rc" != 2 ] || echo 'warning: plugin order cycle; keeping name order' >&2
+  f=${AI_PROVIDERS%/*}/plugins.order
+  if [ -f "$f" ]; then
+    { cat "$f"; printf '\n--\n%s\n' "$sorted"; } | awk '
+      $0=="--" { rest=1; next } !rest { wanted[++w]=$0; next }
+      NF { names[++n]=$0; on[$0]=1 }
+      END { for(i=1;i<=w;i++) if(on[wanted[i]] && !seen[wanted[i]]++) print wanted[i]
+            for(i=1;i<=n;i++) if(!seen[names[i]]++) print names[i] }'
+  else printf '%s\n' "$sorted"; fi
+)
+_ai_plugin_order() {
+  [ $# -gt 0 ] || { _ai_plugin_ordered; return; }
+  local n f; f=${AI_PROVIDERS%/*}/plugins.order
+  for n in "$@"; do _ai_plugin_arg "$n" x || return 1; done
+  mkdir -p "${f%/*}" && printf '%s\n' "$@" > "$f"
+}
+_ai_plugin_owners() {
+  local f; f=${AI_PROVIDERS%/*}/plugins.owners
+  case ${1:-} in
+    '') [ ! -f "$f" ] || cat "$f" ;;
+    reset) rm -f "$f" ;;
+    *) echo 'usage: ai plugin owners [reset]' >&2; return 1 ;;
+  esac
 }

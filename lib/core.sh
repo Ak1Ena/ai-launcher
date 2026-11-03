@@ -397,6 +397,7 @@ _ai_run() {
       codex) [ -n "${CODEX_HOME:-}" ] && _fo_under "$CODEX_HOME" "$AI_ACCOUNTS" && unset CODEX_HOME ;;
     esac
   fi
+  local AI_WRAP_LAUNCH_ENTRY=$n
   [ "$n" = claude ] || _ai_trust_share "$PWD"  # claude rows go through cla, which shares too
   if is_fn "_ai_${n}_run"; then "_ai_${n}_run" "$id" "$@"
   elif [ "$(_ai_agent "$n")" = claude ] && [ -z "${AI_TEAM:-}" ] && _fo_on; then _fo_run "$n" "$@"
@@ -405,8 +406,9 @@ _ai_run() {
 # Run a saved command string plus extra args. The string is the user's own config (like a
 # shell alias), so a shell parses it: quotes and env prefixes work.
 # On macOS caffeinate keeps the machine awake while the agent runs.
-_ai_exec() {
+_ai_exec() (
   local c=$1; shift
+  _ai_wrap_enable "${AI_WRAP_LAUNCH_ENTRY:-${AI_WRAP_ENTRY:-}}" "${AI_TEAM:-0}"
   if has caffeinate; then caffeinate -i bash -c "$c"' "$@"' ai "$@"
   else bash -c "$c"' "$@"' ai "$@"; fi
-}
+)

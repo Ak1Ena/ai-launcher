@@ -7,6 +7,87 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
+/// Only a cheap declaration check here; the shared bash shim owns manifest semantics/order.
+pub fn wrap_env(
+    paths: &crate::config::Paths,
+    entry: &str,
+    team: bool,
+) -> Vec<(String, Option<String>)> {
+    let any = std::fs::read_dir(&paths.plugins)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|p| {
+            let dir = p.path();
+            crate::plugins::valid_name(&p.file_name().to_string_lossy())
+                && dir.join("plugin").is_file()
+                && !dir.join(".off").exists()
+                && std::fs::read_to_string(dir.join("manifest")).is_ok_and(|text| {
+                    text.lines().any(|line| {
+                        line.strip_prefix("hooks=").is_some_and(|v| {
+                            v.split(" #")
+                                .next()
+                                .unwrap_or("")
+                                .split('\t')
+                                .next()
+                                .unwrap_or("")
+                                .trim_end()
+                                .split(',')
+                                .any(|hook| hook == "wrap")
+                        })
+                    })
+                })
+        });
+    if !any {
+        return Vec::new();
+    }
+    let root = paths.fo_state.join("wrap");
+    let install = || -> std::io::Result<std::ffi::OsString> {
+        for (name, text) in [
+            ("core.sh", include_str!("../../lib/core.sh")),
+            ("plugins.sh", include_str!("../../lib/plugins.sh")),
+            ("wrap.sh", include_str!("../../lib/wrap.sh")),
+            ("shim/claude", include_str!("../../lib/shim/claude")),
+            ("shim/codex", include_str!("../../lib/shim/codex")),
+            ("shim/gemini", include_str!("../../lib/shim/gemini")),
+        ] {
+            let file = root.join(name);
+            if std::fs::read_to_string(&file).ok().as_deref() != Some(text) {
+                std::fs::create_dir_all(file.parent().unwrap())?;
+                std::fs::write(&file, text)?;
+            }
+            #[cfg(unix)]
+            if name.starts_with("shim/") {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        let mut dirs = vec![root.join("shim")];
+        dirs.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::join_paths(dirs).map_err(std::io::Error::other)
+    };
+    let path = match install() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("warning: wrap shim unavailable: {e}; starting without wrap");
+            return Vec::new();
+        }
+    };
+    let bash_path = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
+    vec![
+        ("PATH".into(), Some(path.to_string_lossy().into_owned())),
+        ("AI_PROVIDERS".into(), Some(bash_path(&paths.providers))),
+        ("AI_PLUGINS".into(), Some(bash_path(&paths.plugins))),
+        ("AI_WRAP_ENTRY".into(), Some(entry.into())),
+        (
+            "AI_WRAP_TEAM".into(),
+            Some(if team { "1" } else { "0" }.into()),
+        ),
+    ]
+}
+
 #[derive(Default)]
 pub struct Replies(Vec<u8>);
 
@@ -397,6 +478,60 @@ fn mouse_reported(mode: vt100::MouseProtocolMode, kind: MouseEventKind) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrap_environment_only_exists_for_enabled_declarations() {
+        use crate::config::Paths;
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("ai-wrap-env-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let paths = Paths {
+            home: root.join("home"),
+            providers: root.join("cfg/providers"),
+            cla_root: root.join("accounts"),
+            ai_accounts: root.join("ai-accounts"),
+            fo_order: root.join("cfg/failover"),
+            fo_state: root.join("state"),
+            codex_home: root.join("codex"),
+            cooldown: std::time::Duration::from_secs(60),
+            plugins: root.join("cfg/plugins"),
+        };
+        assert!(wrap_env(&paths, "claude/work", false).is_empty());
+        assert!(!paths.fo_state.exists());
+        let plugin = paths.plugins.join("test");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(plugin.join("plugin"), "#!/bin/bash\nexit 0\n").unwrap();
+        fs::write(plugin.join("manifest"), "api=1\nhooks=rows\n").unwrap();
+        assert!(wrap_env(&paths, "claude/work", false).is_empty());
+        fs::write(
+            plugin.join("manifest"),
+            "api=1\nhooks=rows,wrap # opt in\nteam=1\n",
+        )
+        .unwrap();
+        let env = wrap_env(&paths, "claude/work", true);
+        let value = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap()
+        };
+        assert_eq!(value("AI_WRAP_ENTRY"), "claude/work");
+        assert_eq!(value("AI_WRAP_TEAM"), "1");
+        assert_eq!(
+            std::env::split_paths(value("PATH")).next().unwrap(),
+            paths.fo_state.join("wrap/shim")
+        );
+        assert!(paths.fo_state.join("wrap/shim/claude").is_file());
+        assert_eq!(
+            fs::read_to_string(paths.fo_state.join("wrap/wrap.sh")).unwrap(),
+            include_str!("../../lib/wrap.sh")
+        );
+        fs::write(plugin.join(".off"), "").unwrap();
+        assert!(wrap_env(&paths, "plugin:test/all", false).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn k(code: KeyCode, m: KeyModifiers) -> Vec<u8> {
         encode_key(KeyEvent::new(code, m), false).unwrap()

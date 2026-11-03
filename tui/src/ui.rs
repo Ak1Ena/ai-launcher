@@ -258,7 +258,8 @@ fn title_bar(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
             Some(Notice::Ended { .. } | Notice::Error(_)) => "■ ",
             None => "",
         };
-        let label = format!(" {} {mark}{} ", i + 1, short(app, &t.member));
+        let team = if t.team { " team" } else { "" };
+        let label = format!(" {} {mark}{}{team} ", i + 1, short(app, &t.member));
         let w = label.chars().count() as u16 + 2;
         if x + w >= limit {
             break;
@@ -1867,6 +1868,13 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
                 ),
             ),
         ];
+        if app
+            .rows
+            .get(app.selected)
+            .is_some_and(|r| r.entry.kind == Kind::Claude)
+        {
+            items.insert(1, (2, hint("t", "team")));
+        }
         if app.wrr {
             items.extend([
                 (1, hint("n", "auto")),

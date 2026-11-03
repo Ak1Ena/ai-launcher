@@ -478,6 +478,138 @@ ok "plugin ls: installed bundled leaves available" 'AIcp plugin add cliproxy >/d
 AI_PLUGIN_DIR=$PL/demo "$PL/demo/setup" >/dev/null 2>&1; cp "$PL/demo/config" "$T/demo.cfg"
 ok "template setup is safe to run twice" 'AI_PLUGIN_DIR=$PL/demo "$PL/demo/setup" >/dev/null 2>&1 && cmp -s "$PL/demo/config" "$T/demo.cfg"'
 
+# ── wrap hooks: only fake plugins and fake agent binaries ──
+W=$T/wrap; mkdir -p "$W/bin" "$W/plugins" "$W/cfg"
+cat > "$W/bin/claude" <<'WRAP_AGENT'
+#!/usr/bin/env bash
+printf 'env=<%s> remove=<%s> entry=<%s> team=<%s>\n' "${WRAP_VALUE:-}" "${WRAP_REMOVE-unset}" "${AI_WRAP_ENTRY:-}" "${AI_WRAP_TEAM:-}"
+printf 'arg=<%s>\n' "$@"
+case :$PATH: in *"/lib/shim:"*) echo shim-on-path ;; esac
+while [ $# -gt 0 ]; do
+  if [ "$1" = --settings ] && [ $# -gt 1 ]; then
+    cp "$2" "$WRAP_CAPTURE"; printf 'settings=<%s>\n' "$2"
+    case $2 in */ai-wrap.*/*) [ "$(ls -l "$2" | cut -c2-10)" = rw------- ] || exit 9 ;; esac
+    shift
+  fi
+  shift
+done
+WRAP_AGENT
+chmod +x "$W/bin/claude"; cp "$W/bin/claude" "$W/bin/codex"; cp "$W/bin/claude" "$W/bin/gemini"
+WAI() { AI_PROVIDERS=$W/cfg/providers AI_FO_ORDER=$W/cfg/failover AI_PLUGINS=$W/plugins PATH=$W/bin:$PATH WRAP_CAPTURE=$W/capture WRAP_REMOVE=old "$REPO/bin/ai" "$@"; }
+printf 'fake\n' > "$W/cfg/failover.default"
+mkwrap() {
+  mkdir -p "$W/plugins/$1"
+  printf '%s\n' "$2" > "$W/plugins/$1/manifest"
+  printf '#!/usr/bin/env bash\n%s\n' "$3" > "$W/plugins/$1/plugin"
+  chmod +x "$W/plugins/$1/plugin"
+}
+wrap_manifest=$'api=1\nhooks=wrap'
+printf 'fake\tclaude\tFake\nclaude\tclaude\tClaude\n' > "$W/cfg/providers"
+mkwrap z "$wrap_manifest" 'printf "arg\tz\n"'
+mkwrap a "$wrap_manifest" 'printf "arg\ta\n"'
+mkwrap m "$wrap_manifest" 'printf "arg\tm\n"'
+ok "wrap: base order is plugin name, not creation order" '[ "$(WAI plugin order | tr "\n" " ")" = "a m z " ]'
+printf '%s\nafter=z\nbefore=m\n' "$wrap_manifest" > "$W/plugins/a/manifest"
+ok "wrap: after and before hints reorder enabled plugins" '[ "$(WAI plugin order | tr "\n" " ")" = "z a m " ]'
+WAI plugin order m z a
+ok "wrap: explicit order overrides hints" '[ "$(WAI plugin order | tr "\n" " ")" = "m z a " ]'
+wout=$(WAI 2> "$W/errors")
+ok "wrap: saved order is also the hook execution order" '[ "$(echo "$wout" | sed -n '\''s/^arg=<\(.*\)>$/\1/p'\'' | tr "\n" " ")" = "m z a " ]'
+ok "wrap: order rejects missing or invalid names without overwriting" '! WAI plugin order nope >/dev/null 2>&1 && ! WAI plugin order ../x >/dev/null 2>&1 && [ "$(cat "$W/cfg/plugins.order" | tr "\n" " ")" = "m z a " ]'
+rm "$W/cfg/plugins.order"; printf '%s\nafter=m\n' "$wrap_manifest" > "$W/plugins/z/manifest"
+WAI plugin order > "$W/order" 2> "$W/errors"
+ok "wrap: a hint cycle keeps base order with one warning" '[ "$(tr "\n" " " < "$W/order")" = "a m z " ] && [ "$(grep -c warning "$W/errors")" = 1 ]'
+rm -rf "$W/plugins"; mkdir "$W/plugins"
+cat > "$W/base.json" <<'WRAP_JSON'
+{"env":{"ANTHROPIC_BASE_URL":"http://base","WRAP_REMOVE":"settings-old"},"nested":{"keep":1,"win":"base"},"hooks":{"Stop":[{"hooks":[]}]}}
+WRAP_JSON
+cat > "$W/extra.json" <<'WRAP_JSON'
+{"env":{"ANTHROPIC_BASE_URL":"http://fragment","WRAP_VALUE":"fragment"},"nested":{"win":"plugin"},"hooks":{"Stop":[{"hooks":[]}]}}
+WRAP_JSON
+mkwrap a "$wrap_manifest" 'printf "%s\n" "$AI_WRAP_BASE_URL" > "$AI_PLUGIN_DIR/base"; printf "env\tWRAP_VALUE\tvalue with spaces\nunset\tWRAP_REMOVE\narg\targ with spaces\nenv\tANTHROPIC_BASE_URL\thttp://wrapped\n"'
+mkwrap b "$wrap_manifest" 'printf "%s|%s|%s|%s\n" "$AI_WRAP_BASE_URL" "$WRAP_VALUE" "$AI_WRAP_AGENT" "$AI_WRAP_ENTRY" > "$AI_PLUGIN_DIR/base"; printf "settings\t%s\nplugin-dir\t%s\n" "$AI_PLUGIN_DIR/../../extra.json" "$AI_PLUGIN_DIR/mod dir"'
+printf 'fake\tclaude --settings "%s/base.json"\tFake\nclaude\tclaude\tClaude\n' "$W" > "$W/cfg/providers"
+wout=$(WAI hello 2> "$W/errors")
+ok "wrap: env, unset and one-argument boundaries reach the real agent" 'echo "$wout" | grep -q "env=<value with spaces> remove=<unset> entry=<fake> team=<0>" && echo "$wout" | grep -qx "arg=<arg with spaces>" && echo "$wout" | grep -qx "arg=<hello>"'
+ok "wrap: existing settings deep merge, env overlays fragments, hooks stack" '[ "$(echo "$wout" | grep -c "arg=<--settings>")" = 1 ] && jq -e '\''.nested == {"keep":1,"win":"plugin"} and .env.ANTHROPIC_BASE_URL == "http://wrapped" and .env.WRAP_VALUE == "value with spaces" and (.env | has("WRAP_REMOVE") | not) and (.hooks.Stop | length) == 2'\'' "$W/capture" >/dev/null'
+ok "wrap: the real agent runs without the shim on PATH" '! echo "$wout" | grep -q shim-on-path'
+ok "wrap: base URL reflects existing settings then earlier layers" '[ "$(cat "$W/plugins/a/base")" = http://base ] && [ "$(cat "$W/plugins/b/base")" = "http://wrapped|value with spaces|claude|fake" ]'
+ok "wrap: plugin-dir keeps its path as one argument" 'echo "$wout" | grep -qx "arg=<--plugin-dir>" && echo "$wout" | grep -qx "arg=<$(native_path "$W/plugins/b/mod dir")>"'
+wtemp=$(echo "$wout" | sed -n 's/^settings=<\(.*\)>$/\1/p')
+ok "wrap: merged settings are temporary and original config is untouched" '[ ! -e "$wtemp" ] && jq -e '\''.nested.win == "base" and .env.WRAP_REMOVE == "settings-old"'\'' "$W/base.json" >/dev/null'
+# Test the interactive branch with a terminal predicate stub; read still consumes the launch stdin.
+WSH() (
+  export AI_PROVIDERS=$W/cfg/providers AI_PLUGINS=$W/plugins PATH=$REPO/lib/shim:$W/bin:$PATH WRAP_CAPTURE=$W/capture
+  . "$REPO/lib/wrap.sh"
+  _ai_wrap_terminal() { return 0; }
+  _ai_wrap_main claude "$@"
+)
+rm -rf "$W/plugins"; mkdir "$W/plugins"
+printf '{"theme":"alpha"}\n' > "$W/alpha.json"; printf '{"theme":"beta"}\n' > "$W/beta.json"
+mkwrap a "$wrap_manifest" 'printf "settings\t%s\n" "$AI_PLUGIN_DIR/../../alpha.json"'
+mkwrap b "$wrap_manifest" 'printf "settings\t%s\n" "$AI_PLUGIN_DIR/../../beta.json"'
+WSH <<< n > "$W/out" 2> "$W/errors"
+ok "wrap: owner prompt reads stdin, no preserves earlier value" 'grep -q "Use b.*Y/n" "$W/errors" && [ "$(jq -r .theme "$W/capture")" = alpha ] && WAI plugin owners | grep -qx "theme${TAB}a${TAB}a${TAB}b"'
+WSH </dev/null > "$W/out" 2> "$W/errors"
+ok "wrap: saved owner choice prevents repeat prompts" '[ ! -s "$W/errors" ] && [ "$(jq -r .theme "$W/capture")" = alpha ]'
+wout=$(WSH --settings '{"nested":{"keep":1,"win":"inline"}}' '--settings={"nested":{"win":"equals"}}' 2> "$W/errors")
+ok "wrap: inline and equals settings flags become one merged file" '[ "$(echo "$wout" | grep -c "arg=<--settings>")" = 1 ] && jq -e '\''.nested == {"keep":1,"win":"equals"}'\'' "$W/capture" >/dev/null'
+WAI plugin owners reset
+AI_YES=1 WSH <<< n > "$W/out" 2> "$W/errors"
+ok "wrap: AI_YES picks later owner with one warning, never reads response" '[ "$(jq -r .theme "$W/capture")" = beta ] && [ "$(grep -c warning "$W/errors")" = 1 ] && ! grep -q Y/n "$W/errors"'
+WAI plugin owners reset
+WSH <<< y > "$W/out" 2> "$W/errors"
+ok "wrap: accepting owner saves later choice" '[ "$(jq -r .theme "$W/capture")" = beta ] && WAI plugin owners | grep -qx "theme${TAB}b${TAB}a${TAB}b"'
+WAI plugin owners reset
+WAI > "$W/out" 2> "$W/errors"
+ok "wrap: no terminal picks later owner with one warning" '[ "$(jq -r .theme "$W/capture")" = beta ] && [ "$(grep -c warning "$W/errors")" = 1 ]'
+printf '{"theme":"gamma"}\n' > "$W/gamma.json"
+mkwrap c "$wrap_manifest" 'printf "settings\t%s\n" "$AI_PLUGIN_DIR/../../gamma.json"'
+WSH <<< n > "$W/out" 2> "$W/errors"
+ok "wrap: a new owner pair asks even when a previous pair was saved" 'grep -q "Use c.*Y/n" "$W/errors" && [ "$(jq -r .theme "$W/capture")" = beta ]'
+: > "$W/plugins/a/.off"; : > "$W/plugins/c/.off"; WAI plugin owners reset
+AI_WRAP_ENTRY=plugin:entry/start WSH --settings "$W/alpha.json" <<< n > "$W/out" 2> "$W/errors"
+ok "wrap: plugin entry settings count as their plugin owner" 'grep -q "set by entry and by b" "$W/errors" && [ "$(jq -r .theme "$W/capture")" = alpha ]'
+printf '{"statusLine":{"type":"command","command":"old","padding":5}}\n' > "$W/alpha.json"
+printf '{"statusLine":{"type":"command","command":"new"}}\n' > "$W/beta.json"
+WSH --settings "$W/alpha.json" > "$W/out" 2> "$W/errors"
+ok "wrap: single-owner values replace whole objects, not just their fields" 'jq -e '\''.statusLine == {"type":"command","command":"new"}'\'' "$W/capture" >/dev/null'
+rm -rf "$W/plugins"; mkdir "$W/plugins"
+mkwrap a "$wrap_manifest" 'printf "arg\tsolo\n"'
+mkwrap b "$wrap_manifest
+team=1" 'printf "arg\tteam-safe\n"'
+wout=$(AI_WRAP_TEAM=1 WSH 2> "$W/errors")
+ok "wrap: team mode skips plugins without team=1" 'echo "$wout" | grep -qx "arg=<team-safe>" && ! echo "$wout" | grep -q "arg=<solo>"'
+mkwrap bad "$wrap_manifest" 'printf "env\tWRAP_VALUE\tbad\ngarbage\n"'
+mkwrap fail "$wrap_manifest" 'printf "env\tWRAP_VALUE\tbad\n"; exit 4'
+mkwrap slow "$wrap_manifest" 'printf "env\tWRAP_VALUE\tbad\n"; sleep 30'
+mkwrap readonly "$wrap_manifest" 'printf "arg\tbad-arg\nenv\tUID\t0\n"'
+mkwrap badjson "$wrap_manifest" 'printf "env\tWRAP_VALUE\tbad\nsettings\t/missing-fragment.json\n"'
+wout=$(WAI hello 2> "$W/errors")
+ok "wrap: bad, failing and timing-out plugins are skipped atomically" 'echo "$wout" | grep -qx "arg=<hello>" && echo "$wout" | grep -q "env=<>" && ! echo "$wout" | grep -q bad-arg && [ "$(grep -c warning "$W/errors")" = 5 ]'
+rm -rf "$W/plugins"; mkdir "$W/plugins"
+mkwrap old 'hooks=wrap' 'touch "$AI_PLUGIN_DIR/ran"'
+mkwrap off "$wrap_manifest" 'touch "$AI_PLUGIN_DIR/ran"'; : > "$W/plugins/off/.off"
+ok "wrap: missing api, disabled plugins are never called" 'WAI >/dev/null 2> "$W/errors" && [ ! -e "$W/plugins/old/ran" ] && [ ! -e "$W/plugins/off/ran" ]'
+ok "wrap: no enabled declaration leaves PATH and wrap env untouched" '( AI_PROVIDERS=$W/cfg/providers AI_PLUGINS=$W/plugins; before=$PATH; unset AI_WRAP_ENTRY AI_WRAP_TEAM; _ai_wrap_enable fake 0; [ "$before" = "$PATH" ] && [ "${AI_WRAP_ENTRY-unset}" = unset ] && [ "${AI_WRAP_TEAM-unset}" = unset ] )'
+mkwrap nojq "$wrap_manifest" 'printf "settings\t/missing.json\nenv\tWRAP_VALUE\tno-jq\narg\tno-jq-arg\nplugin-dir\t/tmp/mod\n"'
+wout=$( (
+  export AI_PROVIDERS=$W/cfg/providers AI_PLUGINS=$W/plugins PATH=$REPO/lib/shim:$W/bin:$PATH WRAP_CAPTURE=$W/capture
+  . "$REPO/lib/wrap.sh"
+  has() { [ "$1" != jq ] && command -v "$1" >/dev/null 2>&1; }
+  _ai_wrap_main claude --settings "$W/base.json"
+) 2> "$W/errors")
+ok "wrap: without jq env, args and plugin dirs work; existing settings survive" 'echo "$wout" | grep -q "env=<no-jq>" && echo "$wout" | grep -qx "arg=<no-jq-arg>" && echo "$wout" | grep -qx "arg=<--plugin-dir>" && [ "$(grep -c "jq is missing" "$W/errors")" = 1 ] && cmp -s "$W/base.json" "$W/capture"'
+rm -rf "$W/plugins"; mkdir "$W/plugins"
+mkwrap a "$wrap_manifest" 'printf "env\tWRAP_VALUE\tplugin-entry\n"'
+mkwrap entry '' 'case $1 in launch) shift 2; claude "$@" ;; esac'
+printf 'plugin:entry/start\n' > "$W/cfg/failover.default"
+wout=$(WAI hello 2> "$W/errors")
+ok "wrap: plugin launch keeps entry metadata and intercepts its agent" 'echo "$wout" | grep -q "env=<plugin-entry>.*entry=<plugin:entry/start>"'
+rm "$W/cfg/failover.default"
+wout=$(WAI cla one hello 2> "$W/errors")
+ok "wrap: cla account launch sets account entry metadata" 'echo "$wout" | grep -q "entry=<claude/one>"'
+
 # ── release version from the merged branch's prefix ──
 nv() { bash "$REPO/scripts/next-version.sh" "$@" 2>/dev/null; }
 ok "release: fix/ and enhance/ bump patch" '[ "$(nv fix/x v0.1.14)" = 0.1.15 ] && [ "$(nv enhance/x 0.1.14)" = 0.1.15 ]'
