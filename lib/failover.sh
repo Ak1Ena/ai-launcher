@@ -229,6 +229,7 @@ _fo_launch_claude() {
        if [ -n "${FO_BASE_CFG:-}" ]; then CLAUDE_CONFIG_DIR=$FO_BASE_CFG; export CLAUDE_CONFIG_DIR; else unset CLAUDE_CONFIG_DIR; fi
        c=$(_ai_cmd "$m" claude) ;;
   esac
+  local AI_WRAP_LAUNCH_ENTRY=$m
   AI_FO_MEMBER=$(_fo_label "$m") _ai_exec "$c --plugin-dir $(printf %q "$(native_path "$AI_FO_MOD")")" "$@"
 }
 _fo_launch_codex() {
@@ -236,6 +237,7 @@ _fo_launch_codex() {
   if d=$(_ai_account_dir "$m"); then CODEX_HOME=$(native_path "$d"); export CODEX_HOME
   # a CODEX_HOME inherited from an ai codex account is not the main login
   elif [ -n "${CODEX_HOME:-}" ] && _fo_under "$CODEX_HOME" "$AI_ACCOUNTS"; then unset CODEX_HOME; fi
+  local AI_WRAP_LAUNCH_ENTRY=$m
   _ai_exec "$(_ai_cmd "$m" codex)" "$@"
 }
 # markdown of a Claude transcript's main conversation, its last 60 KB (one argument must fit)

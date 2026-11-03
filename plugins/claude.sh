@@ -63,6 +63,7 @@ cla_main() {
     *)
       [ -d "$root/$1" ] || { echo "no account '$1'. run: cla add $1"; return 1; }
       dir=$root/$1; shift
+      local AI_WRAP_LAUNCH_ENTRY=claude/${dir##*/}
       _ai_trust_share "$PWD"; _cla_trust_sync "$dir"
       # before CLAUDE_CONFIG_DIR is set: failover keeps the folder ai started with for other providers
       if [ "${1:-}" != team ] && _fo_on; then _fo_run "claude/${dir##*/}" "$@"; return; fi
@@ -81,7 +82,11 @@ cla_team_main() {
 _cla_team() {
   has tmux || { echo "team mode needs tmux (brew install tmux / apt install tmux)"; return 1; }
   local cmd s
+  _ai_wrap_enable "${AI_WRAP_LAUNCH_ENTRY:-}" 1
   cmd="CLAUDE_MODE=team CLAUDE_CONFIG_DIR=$(printf %q "$CLAUDE_CONFIG_DIR") "
+  if [ "${AI_WRAP_TEAM:-}" = 1 ]; then
+    cmd="$cmd PATH=$(printf %q "$PATH") AI_WRAP_ENTRY=$(printf %q "$AI_WRAP_ENTRY") AI_WRAP_TEAM=1 AI_PROVIDERS=$(printf %q "$AI_PROVIDERS") AI_PLUGINS=$(printf %q "$AI_PLUGINS") "
+  fi
   has caffeinate && cmd="${cmd}caffeinate -i "
   cmd="$cmd$(_ai_cmd claude claude) --settings '{\"teammateMode\":\"tmux\"}'"
   [ $# -gt 0 ] && cmd="$cmd$(printf ' %q' "$@")"

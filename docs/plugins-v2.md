@@ -1,6 +1,6 @@
 # Plugins v2 proposal
 
-Status: proposal, not built. Today's protocol (`rows`, `actions`, `menu`, `do`, `launch`) keeps working unchanged.
+Status: manifest, order and `wrap` implemented on `feature/plugin-wrap`. Subdirectory installs and named slots below remain future work. Today's protocol (`rows`, `actions`, `menu`, `do`, `launch`) keeps working unchanged.
 
 ## Goal
 
@@ -45,19 +45,19 @@ team=0
 
 ## Order
 
-1. Start from install order.
-2. Apply `after` / `before` hints. A cycle keeps install order and prints one warning.
-3. `<providers dir>/plugins.order` (one plugin name per line), if present, wins over both. `ai plugin order a b c` writes it.
+1. Start from plugin name order (bytewise, `LC_ALL=C`), not install order. Only enabled, runnable plugins participate.
+2. Apply comma-separated `after` / `before` hints with a stable topological sort. Missing or disabled names are ignored. A cycle discards all hints, keeps name order and prints one warning.
+3. `<providers dir>/plugins.order` (one plugin name per line), if present, wins over both. Named enabled plugins come first in the saved order; remaining plugins follow the hinted order. `ai plugin order a b c` writes it after validating every name; no args prints the effective order.
 
-`wrap` runs in this order. The first plugin is the outermost layer, so it is closest to the agent: with `headroom, logger` the traffic is `claude → headroom → logger → upstream`.
+`wrap` runs in this order, and each layer sees the base URL produced by earlier layers. Therefore the **last** URL-changing plugin is closest to the agent: with `headroom, logger` the traffic is `claude → logger → headroom → upstream`. This follows the later-wins rule for env/settings rather than reversing hook execution.
 
 ## `wrap`
 
 ### When it runs
 
-The launcher puts a shim folder first on `PATH` with `claude`, `codex` and `gemini` shims. Every way of starting an agent goes through it: a cla account, a provider, or a plugin entry that runs `claude` itself (cliproxy). Both the bash tool and the TUI start agents through `bash -c` (`tui/src/pane.rs`), so the shim is found on macOS, Linux and Git Bash.
+Only when an enabled plugin declares `wrap`, the launcher puts a shim folder first on `PATH` with `claude`, `codex` and `gemini` shims and sets `AI_WRAP_ENTRY` / `AI_WRAP_TEAM`. With no declarations it leaves PATH and those variables alone. A cla account, provider, or plugin entry that invokes an agent by name (such as cliproxy) reaches the shim. Absolute agent paths, shell functions and commands that replace PATH bypass it; PATH interposition cannot intercept those. Authentication and setup commands are not wrapped. Both front ends launch sessions through bash, including the TUI's `tui/src/pane.rs`.
 
-The shim runs each `wrap` plugin, applies what they print, then runs the real binary (found by searching `PATH` without the shim folder).
+The shim runs each `wrap` plugin, applies what they print, then runs the real binary (found by searching `PATH` without the shim folder). Hooks and the agent run with that cleaned `PATH`, so a `claude` started inside the session or by a hook is not wrapped again.
 
 ### Call
 
@@ -83,7 +83,7 @@ plugin-dir<TAB>/path            claude only: adds --plugin-dir
 
 Tested with Claude Code 2.1.312: when `--settings` is given twice, **only the last file counts** and the earlier one is dropped, not merged. cliproxy already passes its own `--settings`, so a plugin adding a second one would silently undo it.
 
-So the shim collects every settings source in order (a `--settings` already in the args, such as cliproxy's, then each plugin's `settings` fragments, then each `env` line), deep-merges them with jq into one temp file (mode 600), and passes a single `--settings`. A later layer wins on the same key. Without jq, `settings` lines are skipped with a warning, and `env` / `arg` / `plugin-dir` still apply.
+So the shim collects settings sources in order (existing `--settings path`, `--settings=path` or inline JSON, such as cliproxy's, then each plugin's `settings` fragments). It deep-merges objects with jq; arrays concatenate so hook/command lists stack, and later scalar values win. All `env` / `unset` instructions form the final settings env overlay in hook order (`unset` also removes a value inherited from settings). The result is one temp file (mode 600, removed when the agent exits) and a single `--settings` flag. Original files are never edited. Without jq, `settings` lines are skipped with one warning per plugin, existing `--settings` args are preserved, and `env` / `arg` / `plugin-dir` still apply.
 
 ### Single-owner keys
 
@@ -93,7 +93,7 @@ Keys that hold one value, such as `statusLine`, `outputStyle` and `theme`, can o
 statusLine is set by cliproxy and by fancy-status. Use fancy-status's? [Y/n]
 ```
 
-The answer is saved in `<providers dir>/plugins.owners` (`key<TAB>plugin`), so the question is not asked again until that pair changes. The shim asks on the launch's own terminal (stdin and stderr, never `/dev/tty`, the same as the pickers). Plugins still never prompt. With no terminal, or with `AI_YES=1`, the later one wins and a one-line warning is printed. `ai plugin owners` lists the saved choices, and `ai plugin owners reset` clears them.
+The answer is saved in `<providers dir>/plugins.owners` (`key<TAB>chosen-plugin<TAB>earlier-plugin<TAB>later-plugin`). The extra pair columns make both accepted and declined choices durable while ensuring a different competing pair asks again. Settings supplied by a `plugin:<name>/<id>` entry count as that plugin's settings; ordinary provider/account settings have no plugin owner. The shim asks on the launch's own terminal (stdin and stderr, never `/dev/tty`, the same as the pickers). Plugins still never prompt. With no terminal, or with `AI_YES=1`, the later one wins and a one-line warning is printed. `ai plugin owners` lists the saved choices, and `ai plugin owners reset` clears them.
 
 Keys Claude Code already merges, such as plugin dirs, hooks and commands, stack without asking.
 
@@ -133,7 +133,7 @@ Install: `ai plugin add Ak1Ena/ai-launcher-plugins/headroom`. This needs `add` t
 
 ## Bash and TUI
 
-The shim is a bash script, so the bash tool and the TUI share it. The manifest, order and `add` parsing must match in `lib/plugins.sh` and `tui/src/plugins.rs`, like today's rules. New files (`manifest`, `plugins.order`) sit beside the existing ones. No new columns are added to shared files.
+The bash tool and the TUI share `lib/shim/{claude,codex,gemini}`, `lib/wrap.sh` and `lib/plugins.sh`. The standalone TUI embeds these scripts (and their `lib/core.sh` helpers) and materializes them under its failover state directory only when needed. It only checks whether an enabled plugin declares `hooks=...,wrap,...`, prepends the shim to PATH and supplies launch metadata/config paths. It does **not** interpret API versions, team opt-in, dependency hints, order, output or owner policy: the shim does that. The TUI's team flag is currently false because it has no team launch action; bash `cla-team` sets it to 1. Manifest files live inside each plugin; `plugins.order` and `plugins.owners` live beside providers. No columns are added to existing provider/failover formats. Future `add` subdirectory parsing must still match in bash and Rust.
 
 ## Work plan
 
