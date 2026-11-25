@@ -3,7 +3,9 @@
 #   bash tests/check.sh        exit 0 = all passed   (also run it with /bin/bash on macOS: bash 3.2)
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 # box widths count characters, not bytes: needs a UTF-8 locale (a bare ssh shell is often plain C)
-[ "$(locale charmap 2>/dev/null)" = UTF-8 ] || export LC_ALL=en_US.UTF-8
+if [ "$(locale charmap 2>/dev/null)" != UTF-8 ]; then
+  for l in C.UTF-8 en_US.UTF-8; do [ "$(LC_ALL=$l locale charmap 2>/dev/null)" = UTF-8 ] && { export LC_ALL=$l; break; }; done
+fi
 T=$(cd "$(mktemp -d)" && pwd -P); trap 'rm -rf "$T"' EXIT   # resolved path: agents store getcwd()
 export HOME=$T/home CLA_ROOT=$T/home/acc CODEX_HOME=$T/home/.codex AI_PROVIDERS=$T/cfg/providers AI_ACCOUNTS=$T/home/.ai-accounts
 mkdir -p "$HOME" "$CLA_ROOT/one/usage" "$CLA_ROOT/two/usage" "$CODEX_HOME/sessions/2026/01/01" \
@@ -236,6 +238,11 @@ ok "missing CLI: order screen says so" '_fo_rows | grep "^gone" | plain | grep -
 ok "missing CLI: launch stops with a message" '_ai_run gone gone >/dev/null 2>"$T/e"; [ $? = 127 ] && grep -q "codex is not installed" "$T/e"'
 ok "missing CLI: codex row stays, marked" '_ai_codex_rows gone | cut -f3 | plain | grep -q "Gone.*codex not installed"'
 ok "installed: by path, and by name on PATH" '_ai_installed cx && _fo_installed claude/one && ! _ai_installed other'
+# saved commands run through bash -c: what the shell expands is left to the launch (same rule as the TUI)
+cp "$AI_PROVIDERS" "$T/prov.keep"
+_ai_put tl "~/.nowhere/codex" "T"; _ai_put dl '$HOME/.nowhere/codex' "D"; _ai_put ql 'FOO="a b" no-such-cli' "Q"; _ai_put xl "exec no-such-cli" "X"
+ok "installed: ~, \$VAR, quoted values and built-ins are left to the launch" '_ai_installed tl && _ai_installed dl && _ai_installed ql && _ai_installed xl'
+mv "$T/prov.keep" "$AI_PROVIDERS"
 _ai_put gone
 _ai_failover off >/dev/null 2>&1
 

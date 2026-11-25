@@ -798,6 +798,17 @@ ok "one signed out: named, status unchanged" 'has_line "$out" "⚠ signed out in
 echo "{\"files\":[$(cred c1 claude "$SO,\"email\":\"a@example.com\""),$(cred c2 claude '"cooldowns":[{"scope":"auth","reason":"quota","remaining_seconds":5400}]')]}" > "$T/creds.json"
 fresh
 ok "signed out + limited: both said" 'has_line "$out" "⚠ all Claude accounts limited or signed out · next reset ↻1h" && has_line "$out" "⚠ signed out in the proxy: a@example.com" && has_line "$out" "proxy up · Claude limited"'
+# a 401 the proxy retries is not a sign-out; the proxy's own requires_sign_in wins over the message
+U401='"status":"error","status_message":"unauthorized","unavailable":true'
+echo "{\"files\":[$(cred c1 claude "$U401"),$(cred c2 claude "$U401")]}" > "$T/creds.json"
+fresh
+ok "401 unauthorized: limited, not signed out" 'has_line "$out" "⚠ all Claude accounts limited" && ! has_line "$out" "signed out"'
+echo "{\"files\":[$(cred c1 claude "$U401,\"requires_sign_in\":true,\"email\":\"a@example.com\""),$(cred c2 claude "$SO,\"requires_sign_in\":false")]}" > "$T/creds.json"
+fresh
+ok "requires_sign_in decides when the proxy sends it" 'has_line "$out" "⚠ signed out in the proxy: a@example.com" && ! has_line "$out" "⚠ all Claude accounts signed out"'
+echo "{\"files\":[$(cred c1 claude "\"status\":\"error\",\"recovery_stage\":\"sign_in_required\",\"email\":\"a@example.com\""),$(cred c2 claude)]}" > "$T/creds.json"
+fresh
+ok "recovery_stage sign_in_required counts" 'has_line "$out" "⚠ signed out in the proxy: a@example.com"'
 rm -f "$T/creds.json" "$T/quota.json"; rm -rf "$D/cache"
 
 # ── usage: last good body kept per login, one Anthropic call per claude login per 5 min, the launcher's usage.json ──

@@ -214,8 +214,11 @@ refresh() {
       ([$q[] | .p as $p | .ai as $ai | .q | {p: $p, ai: $ai, ws: [if $p == "claude" then claude elif $p == "antigravity" then agy else codex end]}]) as $quota
       # signed out: the proxy failed to refresh the login (an expired or revoked refresh token). Waiting
       # will not bring it back, so it is told apart from a limit: it needs a new sign-in.
-      | def signedout: .status == "error" and ((.status_message // "") | tostring
-          | test("invalid.?grant|unauthori[sz]ed|\\b401\\b|invalid.?token|revoked"; "i"));
+      | def signedout:   # newer proxies say so; older ones (8.0.x) only leave the refresh error. A bare 401 is
+          # retried and recovers, so it stays a plain limit/cooldown.
+          if has("requires_sign_in") and .requires_sign_in != null then .requires_sign_in == true
+          elif (.recovery_stage // null) != null then .recovery_stage == "sign_in_required"
+          else .status == "error" and ((.status_message // "") | tostring | test("invalid.?grant|invalid.?refresh.?token|revoked"; "i")) end;
       def login($p): (if $p == "codex" then "-codex-device-login" else "-\($p)-login" end);
       # every enabled login of a provider limited (5h/weekly at 100%, or cooling down / unavailable) -> one warning line;
       # all of them signed out -> a sign-in line instead, and any signed-out login is named on its own line

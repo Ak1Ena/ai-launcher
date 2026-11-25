@@ -183,12 +183,23 @@ fn runnable(path: &Path) -> bool {
             .any(|e| path.with_extension(e.trim_start_matches('.')).is_file())
 }
 
+/// Words a saved command may start with that the shell runs itself, so there is no program to look for.
+const SHELL_WORDS: &[&str] = &[
+    "exec", "command", "builtin", "eval", "source", ".", "time", "cd", "export", "env", "nohup",
+    "if", "case", "for", "while", "until",
+];
+
 /// Whether the CLI a saved command runs can be found: its first word after any VAR=value,
 /// as a path when it has a `/`, else on PATH. An empty command counts as installed (nothing
-/// to check), so only a command that names a missing program is reported.
+/// to check), so only a command that names a missing program is reported. Saved commands run
+/// through `bash -c`, so a word the shell would expand (`~`, `$`, quotes, globs) or a shell
+/// built-in can't be judged here: it counts as installed and the launch says if it fails.
+/// Same rule as `_ai_installed` in lib/core.sh.
 pub fn installed(command: &str) -> bool {
     match command.split_whitespace().find(|w| !is_assignment(w)) {
         None => true,
+        Some(w) if w.contains(|c| "~$`\"'\\(){};&|<>*?[".contains(c)) => true,
+        Some(w) if SHELL_WORDS.contains(&w) => true,
         Some(w) if w.contains('/') => runnable(Path::new(w)),
         Some(w) => on_path(w),
     }
@@ -983,5 +994,20 @@ mod tests {
         assert!(!installed("FOO=1 /nowhere/codex"));
         assert!(!installed("no-such-cli-ai-launcher --flag"));
         assert!(installed("sh"), "found on PATH");
+    }
+
+    #[test]
+    fn installed_leaves_what_the_shell_expands_to_the_launch() {
+        assert!(installed("~/.local/bin/no-such-cli"), "~ is the shell's");
+        assert!(installed("$HOME/bin/no-such-cli"));
+        assert!(
+            installed("FOO=\"a b\" no-such-cli"),
+            "a quoted value splits oddly"
+        );
+        assert!(
+            installed("exec no-such-cli"),
+            "a shell built-in comes first"
+        );
+        assert!(!installed("X=1 no-such-cli-ai-launcher"));
     }
 }
