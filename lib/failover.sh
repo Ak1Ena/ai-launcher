@@ -162,6 +162,7 @@ _fo_rows() {
     i=$((i + 1)); t=
     case $m in claude/*) l="claude account" ;; *) l=$(_ai_get "$m" 3) ;; esac
     left=$(_fo_limited "$m") && t=$(printf '\033[33mlimited · %dh%02dm left\033[0m' $((left / 3600)) $((left % 3600 / 60)))
+    _fo_installed "$m" || t=$(printf '\033[33m%s not installed · skipped\033[0m' "$k")
     if [ "$s" = on ]; then s=$'\033[32mon \033[0m'; else s=$'\033[2moff\033[0m'; fi
     printf '%s\t%s\t\033[2m%2d\033[0m  \033[1;36m%s\033[0m %s %s %s  %s\n' \
       "$m" "$m" $i "$(pad "$m" 16)" "$(pad "$l" 18)" "$(pad "$k" 6)" "$s" "$t"
@@ -258,9 +259,12 @@ _fo_next() {
       [ "$s" = on ] || continue
       case $1 in *" $m "*) continue ;; esac
       _fo_limited "$m" >/dev/null && continue
+      _fo_installed "$m" || continue
       echo "$m"; exit 0
     done; exit 1; }
 }
+# whether a member's CLI is installed (a cla account runs the `claude` provider's command)
+_fo_installed() { case $1 in claude/*) _ai_installed claude ;; *) _ai_installed "$1" ;; esac; }
 _fo_kind() { _fo_list | awk -F'\t' -v m="$1" '$1 == m { print $2; exit }'; }
 
 # _fo_run <member> [claude args]: start on <member>, move on at each limit.

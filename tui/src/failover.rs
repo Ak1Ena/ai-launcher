@@ -155,17 +155,19 @@ pub fn read_handoff(path: &Path) -> Option<Handoff> {
     })
 }
 
-/// Next member to try: on, not tried in this run, not cooling down.
+/// Next member to try: on, not tried in this run, not cooling down, its CLI installed.
 pub fn next_member(paths: &Paths, entries: &[Entry], tried: &[String]) -> Option<String> {
     let order = config::order(paths, entries);
-    let members = order
-        .iter()
-        .map(|(m, on)| (m.as_str(), *on, config::limited_left(paths, m).is_some()));
+    let installed = |m: &str| entries.iter().any(|e| e.id == m && e.installed());
+    let members = order.iter().map(|(m, on)| {
+        let skip = config::limited_left(paths, m).is_some() || !installed(m);
+        (m.as_str(), *on, skip)
+    });
     pick(members, tried).map(String::from)
 }
 
-/// The failover rule over `(member, on, limited)` in priority order: the first that is on,
-/// not limited and not tried in this run. Shared by the real switch and the `next:` hint.
+/// The failover rule over `(member, on, unavailable)` in priority order: the first that is on,
+/// not limited or missing its CLI, and not tried in this run. Shared by the real switch and the `next:` hint.
 pub fn pick<'a>(
     members: impl IntoIterator<Item = (&'a str, bool, bool)>,
     tried: &[String],

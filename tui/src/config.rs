@@ -166,8 +166,32 @@ pub fn providers(paths: &Paths) -> Vec<Provider> {
 
 pub fn on_path(cmd: &str) -> bool {
     std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
+        .map(|p| std::env::split_paths(&p).any(|d| runnable(&d.join(cmd))))
         .unwrap_or(false)
+}
+
+/// A file at `path`, or on Windows the same name with a PATHEXT ending (`codex.cmd`).
+fn runnable(path: &Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+    cfg!(windows)
+        && std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE;.CMD;.BAT".into())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .any(|e| path.with_extension(e.trim_start_matches('.')).is_file())
+}
+
+/// Whether the CLI a saved command runs can be found: its first word after any VAR=value,
+/// as a path when it has a `/`, else on PATH. An empty command counts as installed (nothing
+/// to check), so only a command that names a missing program is reported.
+pub fn installed(command: &str) -> bool {
+    match command.split_whitespace().find(|w| !is_assignment(w)) {
+        None => true,
+        Some(w) if w.contains('/') => runnable(Path::new(w)),
+        Some(w) => on_path(w),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -192,6 +216,12 @@ pub struct Entry {
 impl Entry {
     pub fn in_failover(&self) -> bool {
         matches!(self.kind, Kind::Claude | Kind::Codex)
+    }
+
+    /// False when the CLI it runs is not on PATH: failover and Auto skip it, home says so.
+    /// Plugin entries launch through their plugin, so they always count as installed.
+    pub fn installed(&self) -> bool {
+        self.kind == Kind::Plugin || installed(&self.command)
     }
 }
 
@@ -944,5 +974,14 @@ mod tests {
         assert!(
             !valid_name("..") && !valid_name("a/b") && !valid_name(".hidden") && !valid_name("")
         );
+    }
+
+    #[test]
+    fn installed_checks_the_first_word_after_assignments() {
+        assert!(installed(""), "nothing to check");
+        assert!(installed("FOO=1 /bin/sh -c x"));
+        assert!(!installed("FOO=1 /nowhere/codex"));
+        assert!(!installed("no-such-cli-ai-launcher --flag"));
+        assert!(installed("sh"), "found on PATH");
     }
 }

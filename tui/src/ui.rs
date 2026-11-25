@@ -4,7 +4,7 @@
 //! everything clickable landed, for the mouse.
 
 use crate::app::{App, Item, Modal, Notice, PluginsWin, Review, SetupTarget};
-use crate::config::Kind;
+use crate::config::{self, Kind};
 use crate::form::{Confirm, Form, Input};
 use crate::menu::{Kind as MKind, Menu};
 use crate::usage;
@@ -546,6 +546,16 @@ fn home(f: &mut Frame, app: &App, area: Rect, hits: &mut Hits) {
             sp.push(Span::styled(format!("{}  ", pad(&who[i], who_w)), style));
         }
         if !c.usage {
+            return sp;
+        }
+        if r.missing {
+            let cli = config::agent(&r.entry.command);
+            let note = if r.priority.is_some() {
+                format!("{cli} not installed · failover skips it")
+            } else {
+                format!("{cli} not installed")
+            };
+            sp.push(Span::styled(note, s(WARN)));
             return sp;
         }
         if let Some(left) = r.limited {

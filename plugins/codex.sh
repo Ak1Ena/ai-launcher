@@ -3,8 +3,11 @@
 # so it is as fresh as your last codex run. Also used for every provider that runs codex,
 # reading its own login folder if it has one.
 _ai_codex_rows() {
-  has codex || return 0
   local n=${1:-codex} home f rl= a ap ar b bp br plan
+  # not installed: still listed (it may sit in the failover order), saying why it can't start
+  if ! _ai_installed "$n"; then
+    _ai_row "$n" "$n" "$n" "$(_ai_get "$n" 3)" "$(printf '\033[33mcodex not installed\033[0m')"; return 0
+  fi
   home=$(_ai_account_dir "$n") || home=${CODEX_HOME:-$HOME/.codex}
   # session files live in YYYY/MM/DD/rollout-<time>.jsonl, so name order = time order
   f=$(find "$home/sessions" -name '*.jsonl' -type f 2>/dev/null | sort | tail -1)
