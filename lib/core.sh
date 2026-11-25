@@ -27,6 +27,20 @@ _ai_account_env() { case $1 in codex) echo CODEX_HOME ;; gemini) echo GEMINI_CLI
 _ai_agent() {
   _ai_get "$1" 2 | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {n = split($i, p, "/"); print p[n]; exit}}'
 }
+# whether the CLI a provider runs is there: its first word after any VAR=value, checked as a path
+# when it has a `/`, else on PATH. No saved command (cla's `claude` default) means the bare name.
+# A word the shell would expand (~ $ quotes ...) or a shell built-in can't be judged here: it counts
+# as installed and the launch itself says if it fails. tui/src/config.rs `installed` keeps the same rule.
+AI_SHELL_WORDS=" exec command builtin eval source . time cd export env nohup if case for while until "
+_ai_installed() {
+  local w
+  w=$(_ai_cmd "$1" "$1" | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {print $i; exit}}')
+  case $w in
+    ''|*[\~\$\`\"\'\\\(\)\{\}\;\&\|\<\>\*\?\[]*) return 0 ;;
+  esac
+  case $AI_SHELL_WORDS in *" $w "*) return 0 ;; esac
+  case $w in */*) [ -f "$w" ] && [ -x "$w" ] ;; *) has "$w" ;; esac
+}
 # a provider's own login folder, if it has one. `ai add` makes it for the 2nd+ provider of the same CLI.
 _ai_account_dir() {
   local a; a=$(_ai_agent "$1")
@@ -389,6 +403,10 @@ _fo_under() {
 # ── launch ─────────────────────────────────────────────────
 _ai_run() {
   local n=$1 id=$2 d; shift 2
+  if [ -n "$(_ai_get "$n" 2)" ] && ! _ai_installed "$n"; then
+    printf '%s is not installed: install it, or change the command with `ai edit %s`.\n' "$(_ai_agent "$n")" "$n" >&2
+    return 127
+  fi
   d=$(_ai_account_dir "$n") && export "$(_ai_account_env "$(_ai_agent "$n")")=$(native_path "$d")"
   # a plain launch outside any account means the main login, not one inherited from a cla / ai-account session
   if [ -z "$d" ]; then

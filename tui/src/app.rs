@@ -71,6 +71,8 @@ pub struct Row {
     pub priority: Option<usize>,
     pub on: bool,
     pub limited: Option<Duration>,
+    /// the CLI it runs is not installed (not on PATH)
+    pub missing: bool,
     pub usage: Usage,
     /// round-robin weight, for members
     pub weight: u32,
@@ -468,11 +470,13 @@ impl App {
             Kind::Other | Kind::Plugin => Usage::default(),
         };
         let limited = priority.and_then(|_| config::limited_left(&self.paths, &entry.id));
+        let missing = !entry.installed();
         Row {
             entry,
             priority,
             on,
             limited,
+            missing,
             usage,
             weight: 1,
             status: String::new(),
@@ -1232,7 +1236,7 @@ impl App {
             .rows
             .iter()
             .filter(|r| r.priority.is_some())
-            .map(|r| (r.entry.id.as_str(), r.on, r.limited.is_some()));
+            .map(|r| (r.entry.id.as_str(), r.on, r.limited.is_some() || r.missing));
         failover::pick(members, &self.tabs.get(t)?.tried)
     }
 
@@ -1688,11 +1692,14 @@ impl App {
 
     // ── running CLIs ──────────────────────────────────────
 
-    /// Members an Auto launch may pick, in priority order: on, weight above 0, not limited.
+    /// Members an Auto launch may pick, in priority order: on, weight above 0, not limited,
+    /// installed.
     fn auto_candidates(&self) -> Vec<(String, u32)> {
         self.rows
             .iter()
-            .filter(|r| r.priority.is_some() && r.on && r.weight > 0 && r.limited.is_none())
+            .filter(|r| {
+                r.priority.is_some() && r.on && r.weight > 0 && r.limited.is_none() && !r.missing
+            })
             .map(|r| (r.entry.id.clone(), r.weight))
             .collect()
     }
@@ -1766,6 +1773,12 @@ impl App {
 
     /// `open`, in Claude team mode when `team` (a Claude entry only).
     fn open_as(&mut self, id: &str, team: bool) {
+        if let Some(e) = self.entry(id).filter(|e| !e.installed()) {
+            let cli = config::agent(&e.command);
+            return self.say(format!(
+                "{cli} is not installed: install it, or edit {id} (e)."
+            ));
+        }
         // the args ai-launcher got are claude args: only a Claude entry takes them
         let is_claude = self.entry(id).is_some_and(|e| e.kind == Kind::Claude);
         let args = if is_claude {
@@ -2131,6 +2144,7 @@ fn plugin_rows(s: &PluginState) -> Vec<Row> {
         priority: None,
         on: false,
         limited: None,
+        missing: false,
         usage: Usage::default(),
         weight: 1,
         status,
@@ -2226,9 +2240,19 @@ mod tests {
         fs::create_dir_all(cla_root.join("w")).unwrap();
         let providers = home.join("cfg/providers");
         fs::create_dir_all(providers.parent().unwrap()).unwrap();
+        // stand-in CLIs by absolute path, so entries count as installed on any machine
+        // (a test can't change PATH: tests run in parallel)
+        for cli in ["claude", "codex"] {
+            fs::create_dir_all(home.join("bin")).unwrap();
+            fs::write(home.join("bin").join(cli), "#!/bin/sh\n").unwrap();
+        }
+        let claude = home.join("bin/claude");
         fs::write(
             &providers,
-            "claude\tclaude\tClaude Code\nt1\ttrue\tT One\nt2\ttrue\tT Two\n",
+            format!(
+                "claude\t{}\tClaude Code\nt1\ttrue\tT One\nt2\ttrue\tT Two\n",
+                claude.display()
+            ),
         )
         .unwrap();
         let paths = Paths {
@@ -2245,6 +2269,36 @@ mod tests {
         let mut a = App::with_paths(paths, vec![]);
         a.value_flags = Some(vec![]); // don't run `claude --help`
         a
+    }
+
+    /// The test home's stand-in `codex`, as a provider command.
+    fn codex(a: &App) -> String {
+        a.paths.home.join("bin/codex").display().to_string()
+    }
+
+    #[test]
+    fn failover_and_auto_skip_a_member_whose_cli_is_missing() {
+        let mut a = app();
+        let mut p = fs::read_to_string(&a.paths.providers).unwrap();
+        // `gone` runs codex from a folder that does not exist: a codex member that is missing
+        p.push_str(&format!(
+            "gone\tX=1 /nowhere/codex\tGone\ncx\t{}\tCodex\n",
+            codex(&a)
+        ));
+        fs::write(&a.paths.providers, p).unwrap();
+        fs::write(&a.paths.fo_order, "gone\ton\nclaude/w\ton\ncx\ton\n").unwrap();
+        a.refresh();
+        let gone = a.rows.iter().find(|r| r.entry.id == "gone").unwrap();
+        assert!(gone.missing && gone.priority == Some(1));
+        let tried: Vec<String> = vec!["claude/w".into()];
+        assert_eq!(
+            failover::next_member(&a.paths, &a.entries(), &tried).as_deref(),
+            Some("cx"),
+            "the first member is skipped: its codex is not installed"
+        );
+        assert!(!a.auto_candidates().iter().any(|(m, _)| m == "gone"));
+        a.open("gone");
+        assert!(a.tabs.is_empty(), "no tab for a CLI that is not there");
     }
 
     #[test]
@@ -2724,7 +2778,7 @@ mod tests {
     fn switch_to_codex_is_flagged() {
         let mut a = app();
         let mut p = fs::read_to_string(&a.paths.providers).unwrap();
-        p.push_str("cx\tcodex\tCodex\n");
+        p.push_str(&format!("cx\t{}\tCodex\n", codex(&a)));
         fs::write(&a.paths.providers, p).unwrap();
         a.refresh();
         config::set_auto_switch(&a.paths, true);

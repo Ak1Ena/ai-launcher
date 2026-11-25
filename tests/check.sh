@@ -2,6 +2,10 @@
 # Self-check: runs every feature against a throwaway fake HOME. Never touches your real configs.
 #   bash tests/check.sh        exit 0 = all passed   (also run it with /bin/bash on macOS: bash 3.2)
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+# box widths count characters, not bytes: needs a UTF-8 locale (a bare ssh shell is often plain C)
+if [ "$(locale charmap 2>/dev/null)" != UTF-8 ]; then
+  for l in C.UTF-8 en_US.UTF-8; do [ "$(LC_ALL=$l locale charmap 2>/dev/null)" = UTF-8 ] && { export LC_ALL=$l; break; }; done
+fi
 T=$(cd "$(mktemp -d)" && pwd -P); trap 'rm -rf "$T"' EXIT   # resolved path: agents store getcwd()
 export HOME=$T/home CLA_ROOT=$T/home/acc CODEX_HOME=$T/home/.codex AI_PROVIDERS=$T/cfg/providers AI_ACCOUNTS=$T/home/.ai-accounts
 mkdir -p "$HOME" "$CLA_ROOT/one/usage" "$CLA_ROOT/two/usage" "$CODEX_HOME/sessions/2026/01/01" \
@@ -226,6 +230,20 @@ ok "menu keys: u 2 fails"         '! _ai_menu t "" keys "$mrows" <<<"u 2" >/dev/
 mkdir -p "$AI_FO_STATE/limited/claude"; touch "$AI_FO_STATE/keep" "$AI_FO_STATE/limited/claude/one"
 ok "clear rejects path tricks" '! _ai_failover clear ../.. >/dev/null 2>&1 && ! _ai_failover clear claude/../.. >/dev/null 2>&1 && ! _ai_failover clear "a\\b" >/dev/null 2>&1 && ! _ai_failover clear .x >/dev/null 2>&1 && [ -e "$AI_FO_STATE/keep" ] && [ -e "$AI_FO_STATE/limited/claude/one" ]'
 ok "clear claude/<account> still works" '_ai_failover clear claude/one >/dev/null 2>&1 && [ ! -e "$AI_FO_STATE/limited/claude/one" ] && [ -d "$AI_FO_STATE/limited/claude" ]'
+# a member whose CLI is not installed: listed and marked, skipped by failover, launch says why
+_ai_put gone "X=1 /nowhere/codex" "Gone"
+{ printf 'gone\ton\n'; cat "$AI_FO_ORDER"; } > "$T/o" && mv "$T/o" "$AI_FO_ORDER"
+ok "missing CLI: failover skips it" '[ "$(_fo_list | head -1 | cut -f1)" = gone ] && ! _fo_installed gone && n=$(_fo_next " ") && [ "$n" != gone ]'
+ok "missing CLI: order screen says so" '_fo_rows | grep "^gone" | plain | grep -q "codex not installed"'
+ok "missing CLI: launch stops with a message" '_ai_run gone gone >/dev/null 2>"$T/e"; [ $? = 127 ] && grep -q "codex is not installed" "$T/e"'
+ok "missing CLI: codex row stays, marked" '_ai_codex_rows gone | cut -f3 | plain | grep -q "Gone.*codex not installed"'
+ok "installed: by path, and by name on PATH" '_ai_installed cx && _fo_installed claude/one && ! _ai_installed other'
+# saved commands run through bash -c: what the shell expands is left to the launch (same rule as the TUI)
+cp "$AI_PROVIDERS" "$T/prov.keep"
+_ai_put tl "~/.nowhere/codex" "T"; _ai_put dl '$HOME/.nowhere/codex' "D"; _ai_put ql 'FOO="a b" no-such-cli' "Q"; _ai_put xl "exec no-such-cli" "X"
+ok "installed: ~, \$VAR, quoted values and built-ins are left to the launch" '_ai_installed tl && _ai_installed dl && _ai_installed ql && _ai_installed xl'
+mv "$T/prov.keep" "$AI_PROVIDERS"
+_ai_put gone
 _ai_failover off >/dev/null 2>&1
 
 # ── failover: screens ──

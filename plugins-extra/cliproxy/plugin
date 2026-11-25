@@ -212,11 +212,25 @@ refresh() {
           | select(.w != null and .f != null)]
         | group_by(.w)[] | (if all(.f <= 0) then {out: (map(.r | left) | map(select(. != null)) | min)} else {} end) + (min_by(.f) | {w, pct: ((1 - .f) * 100 | round), left: (.r | left)});
       ([$q[] | .p as $p | .ai as $ai | .q | {p: $p, ai: $ai, ws: [if $p == "claude" then claude elif $p == "antigravity" then agy else codex end]}]) as $quota
-      # every enabled login of a provider limited (5h/weekly at 100%, or cooling down / unavailable) -> one warning line
-      | def allout($p; $label):
+      # signed out: the proxy failed to refresh the login (an expired or revoked refresh token). Waiting
+      # will not bring it back, so it is told apart from a limit: it needs a new sign-in.
+      | def signedout:   # newer proxies say so; older ones (8.0.x) only leave the refresh error. A bare 401 is
+          # retried and recovers, so it stays a plain limit/cooldown.
+          if has("requires_sign_in") and .requires_sign_in != null then .requires_sign_in == true
+          elif (.recovery_stage // null) != null then .recovery_stage == "sign_in_required"
+          else .status == "error" and ((.status_message // "") | tostring | test("invalid.?grant|invalid.?refresh.?token|revoked"; "i")) end;
+      def login($p): (if $p == "codex" then "-codex-device-login" else "-\($p)-login" end);
+      # every enabled login of a provider limited (5h/weekly at 100%, or cooling down / unavailable) -> one warning line;
+      # all of them signed out -> a sign-in line instead, and any signed-out login is named on its own line
+      def allout($p; $label):
           [$c[0].files[] | select((.disabled != true) and ((.provider // .type // "") | ascii_downcase) == $p)] as $fs
-          | if ($fs | length) == 0 then empty else
-            [$fs[] | . as $f
+          | [$fs[] | select(signedout) | .email // .name // "?" | clean] as $so
+          | if ($fs | length) == 0 then empty
+            elif ($so | length) == ($fs | length) then
+              "  \t⚠ all \($label) accounts signed out in the proxy · sign in again: cliproxyapi \(login($p))"
+            else
+            (if ($so | length) > 0 then "  \t⚠ signed out in the proxy: \($so | join(", ")) · sign in again: cliproxyapi \(login($p))" else empty end),
+            ([$fs[] | . as $f
               | [$quota[] | select(.p == $p and .ai == ($f.auth_index | tostring)) | .ws] as $W
               # antigravity: limited only when every model group is out (each group has its own quota)
               | (if $p == "antigravity" then [$W[] | select(length > 0 and all(has("out"))) | map(.out) | min]
@@ -225,8 +239,9 @@ refresh() {
               | if $f.unavailable == true or ($cl | length) > 0 or ($ql | length) > 0
                 then {r: (($ql + $cl) | map(select(. != null)) | max)} else empty end] as $L
             | if ($L | length) == ($fs | length) then "  \t⚠ all \($label) accounts limited"
+                + (if ($so | length) > 0 then " or signed out" else "" end)
                 + ([$L[].r | select(. != null and . > 0)] | min | if . == null then "" else " · next reset " + (in_ | ltrimstr(" ")) end)
-              else empty end end;
+              else empty end) end;
       allout("claude"; "Claude"), allout("codex"; "Codex"), allout("antigravity"; "Antigravity"),
       ($c[0].files | map(. + {p: ((.provider // .type // "?") | clean | ascii_downcase)}) | group_by(.p)[]
       | .[0].p as $p | length as $n
@@ -571,8 +586,12 @@ case ${1:-} in
     printf 'all\tClaude Code · all accounts\t'
     if [ -z "$key" ]; then nokey; exit 0; fi
     up || { echo "$DOWN"; exit 0; }
-    warn=; [ -f "$CACHE/usage" ] && warn=$(tail -n +2 "$CACHE/usage" | grep -F '⚠ all ')
-    case $warn in *'all Claude accounts limited'*) echo 'proxy up · Claude limited' ;; *) echo 'proxy up' ;; esac
+    warn=; [ -f "$CACHE/usage" ] && warn=$(tail -n +2 "$CACHE/usage" | grep -F -e '⚠ all ' -e '⚠ signed out')
+    case $warn in
+      *'all Claude accounts signed out'*) echo 'proxy up · Claude signed out' ;;
+      *'all Claude accounts limited'*) echo 'proxy up · Claude limited' ;;
+      *) echo 'proxy up' ;;
+    esac
     [ -z "$warn" ] || printf '%s\n' "$warn"
     case $aff_state in
       off) printf '  \t⚠ session affinity off: a chat can move between accounts and re-send its whole context — TUI: a, or ai plugin do cliproxy affinity\n' ;;
@@ -585,7 +604,10 @@ case ${1:-} in
       printf '  \t⚠ proxy uses %s — apply: TUI a, or ai plugin do cliproxy apply\n' "$s"
     fi
     if [ -n "$mgmt_key" ] && [ -f "$CACHE/accts" ]; then
-      awk -F "$TAB" '{ if ($5 == "true" || $4 + 0 <= 0) printf "  \t%s  off\n", $3; else printf "  \t%s  ×%d\n", $3, $4 }' "$CACHE/accts"
+      # an email the proxy holds for more than one provider gets the provider, so the lines tell them apart
+      awk -F "$TAB" 'NR == FNR { n[tolower($3)]++; next }
+        { e = $3; if (n[tolower($3)] > 1) e = e " (" $6 ")"
+          if ($5 == "true" || $4 + 0 <= 0) printf "  \t%s  off\n", e; else printf "  \t%s  ×%d\n", e, $4 }' "$CACHE/accts" "$CACHE/accts"
       iu=$(awk -F "$TAB" '{ printf "%s%s %s", (NR > 1 ? " · " : ""), $1, $2 }' "$CACHE/inuse" 2>/dev/null)
       [ -z "$iu" ] || printf '  \tin use: %s\n' "$iu"
       nl=$(unlinked | cut -f3)
