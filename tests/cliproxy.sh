@@ -412,6 +412,14 @@ ok "rows: ×N by name, off for unused (old order= ignored)" '[ "$(dlines)" = "  
   ${TAB}wb@example.com  ×1
   ${TAB}wd@example.com  off
   ${TAB}wc@example.com  ×1" ]'
+# the same email for two providers: each line names its provider (an email used once stays plain)
+cp "$T/creds.json" "$T/creds.keep"
+echo "{\"files\":[$(acc c1 claude wa@example.com),$(acc x1 codex WA@example.com),$(acc c2 claude wb@example.com)]}" > "$T/creds.json"
+fresh
+ok "rows: same email twice shows the provider" '[ "$(printf "%s\n" "$out" | grep -iE "^  ${TAB}w[a-z]@")" = "  ${TAB}wa@example.com (claude)  ×1
+  ${TAB}wb@example.com  ×1
+  ${TAB}WA@example.com (codex)  ×1" ]'
+mv "$T/creds.keep" "$T/creds.json"; fresh
 acts=$(run actions)
 ok "actions: apply, no mode or move ones" 'has_line "$acts" "apply${TAB}Apply weighted round-robin to the proxy" && ! printf "%s\n" "$acts" | grep -qE "^(mode-|up\.|down\.)" && ! has_line "$acts" failover'
 menu=$(run menu)
@@ -779,6 +787,17 @@ ok "no claude creds: nothing about Claude" '! has_line "$out" "Claude accounts" 
 echo "{\"files\":[$(cred c1 claude '"cooldowns":[{"scope":"auth","reason":"quota","remaining_seconds":5400}]'),$(cred c2 claude '"unavailable":true')]}" > "$T/creds.json"; echo '{"c1":'"$FREE"',"c2":'"$FREE"'}' > "$T/quota.json"
 fresh
 ok "cooldown/unavailable alone counts"    'has_line "$out" "⚠ all Claude accounts limited · next reset ↻1h" && has_line "$out" "proxy up · Claude limited"'
+# signed out (the proxy's refresh failed): told apart from a limit, named, with the sign-in command
+SO='"status":"error","status_message":"invalid grant (retrying)","unavailable":true'
+echo "{\"files\":[$(cred c1 claude "$SO,\"email\":\"a@example.com\""),$(cred c2 claude "$SO,\"email\":\"b@example.com\"")]}" > "$T/creds.json"; echo '{"c1":'"$FREE"',"c2":'"$FREE"'}' > "$T/quota.json"
+fresh
+ok "all signed out: sign-in line, not limited" 'has_line "$out" "⚠ all Claude accounts signed out in the proxy · sign in again: cliproxyapi -claude-login" && has_line "$out" "proxy up · Claude signed out" && ! has_line "$out" "limited"'
+echo "{\"files\":[$(cred c1 claude "$SO,\"email\":\"a@example.com\""),$(cred c2 claude)]}" > "$T/creds.json"
+fresh
+ok "one signed out: named, status unchanged" 'has_line "$out" "⚠ signed out in the proxy: a@example.com · sign in again: cliproxyapi -claude-login" && has_line "$out" "${TAB}proxy up" && ! has_line "$out" "⚠ all"'
+echo "{\"files\":[$(cred c1 claude "$SO,\"email\":\"a@example.com\""),$(cred c2 claude '"cooldowns":[{"scope":"auth","reason":"quota","remaining_seconds":5400}]')]}" > "$T/creds.json"
+fresh
+ok "signed out + limited: both said" 'has_line "$out" "⚠ all Claude accounts limited or signed out · next reset ↻1h" && has_line "$out" "⚠ signed out in the proxy: a@example.com" && has_line "$out" "proxy up · Claude limited"'
 rm -f "$T/creds.json" "$T/quota.json"; rm -rf "$D/cache"
 
 # ── usage: last good body kept per login, one Anthropic call per claude login per 5 min, the launcher's usage.json ──
