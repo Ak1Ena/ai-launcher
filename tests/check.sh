@@ -2,6 +2,8 @@
 # Self-check: runs every feature against a throwaway fake HOME. Never touches your real configs.
 #   bash tests/check.sh        exit 0 = all passed   (also run it with /bin/bash on macOS: bash 3.2)
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+# box widths count characters, not bytes: needs a UTF-8 locale (a bare ssh shell is often plain C)
+[ "$(locale charmap 2>/dev/null)" = UTF-8 ] || export LC_ALL=en_US.UTF-8
 T=$(cd "$(mktemp -d)" && pwd -P); trap 'rm -rf "$T"' EXIT   # resolved path: agents store getcwd()
 export HOME=$T/home CLA_ROOT=$T/home/acc CODEX_HOME=$T/home/.codex AI_PROVIDERS=$T/cfg/providers AI_ACCOUNTS=$T/home/.ai-accounts
 mkdir -p "$HOME" "$CLA_ROOT/one/usage" "$CLA_ROOT/two/usage" "$CODEX_HOME/sessions/2026/01/01" \
